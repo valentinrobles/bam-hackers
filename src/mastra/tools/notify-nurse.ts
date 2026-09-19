@@ -57,7 +57,7 @@ function urgentMessage(p: {
 
 export const notifyNurseTool = createTool({
   id: 'notify_nurse',
-  description: 'Send a patient ticket to the nurse Telegram chat with Approve/Deny buttons.',
+  description: 'Notify the nurse chat. Clinical: informs the nurse a patient is waiting for a reply. Urgent: sends a call ticket with Accept/Bounce buttons.',
   inputSchema: z.object({
     ticketId: z.string(),
     tier: z.enum(['clinical', 'urgent']),
@@ -76,10 +76,16 @@ export const notifyNurseTool = createTool({
     const protocolInfo = input.protocolInfo ?? '';
 
     if (tier === 'urgent') {
-      // Urgent = direct action, no approval needed. Just notify the nurse.
+      // Urgent: nurse decides whether to take the call or redirect it.
       const text = urgentMessage({ ticketId, patientName, cycleInfo, patientMessage, videoCallUrl });
-      await sendToNurseChat(text, { remove_keyboard: true });
+      await sendToNurseChat(text, {
+        inline_keyboard: [[
+          { text: '📹 Aceptar llamada', callback_data: `videocall:${ticketId}` },
+          { text: '↩️ Rebotar llamada', callback_data: `bounce:${ticketId}` },
+        ]],
+      });
     } else {
+      // Clinical: bot can't answer, nurse replies when available. No decision buttons.
       const text = clinicalMessage({
         ticketId,
         patientName,

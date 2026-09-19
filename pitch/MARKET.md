@@ -15,7 +15,7 @@ checks.
 | 2 | **They quit despite live-birth odds as high as 72% — and 45% of studies had treatment subsidised** | Kills the "just make it free" objection |
 | 3 | **Spain runs 15% of all European IVF cycles — more than any other country** | You are pitching in the biggest IVF market on the continent |
 | 4 | **~1 in 10 babies born in Spain come from assisted reproduction** | Room resonance |
-| 5 | **42% live birth after 3 complete cycles — conservative; 82% after 8** | Early dropout is the single biggest destroyer of outcomes — and it's emotional |
+| 5 | **42% live birth after 3 complete cycles — about €20,000 — conservative; 82% after 8** | Early dropout is the single biggest destroyer of outcomes — and it's emotional |
 
 **Pitch line:** *"The biggest predictor of IVF failure isn't biology or money. It's quitting — and
 people quit because of the emotional burden, not the bill."*
@@ -129,7 +129,7 @@ the 42.3% assumes she went through.
 | IVF own eggs | from €5,725 | [Eugin](https://www.eugin.es/precios/) |
 | IVF + PGT-A | €8,730–9,060 | Eugin / Institut Marquès |
 | Egg donation | €5,945–12,900 | same |
-| **Medication per stim cycle — excluded from quotes** | **€1,000–1,300** | [IVI](https://ivi.es/precios-y-financiacion/) |
+| **Medication per stim cycle — excluded from quotes** | **€1,000–1,300 typical, €800–2,200 range** | [IVI](https://ivi.es/precios-y-financiacion/), [nomenclator](https://nomenclator.org/med/gonal-f-900-ui-1) |
 | Frozen embryo transfer (FET) | €800–1,500 + €300–400 meds | [reproduccionasistida.org](https://www.reproduccionasistida.org/transferencia-de-embriones-congelados/precio-transferencia-embriones-congelados/) |
 | Embryo storage, annual (from yr 2) | €300–650 | same |
 | **Egg freezing (vitrificación)** — *a different product* | **€2,695** incl. 2yr storage | Institut Marquès |
@@ -148,13 +148,65 @@ Egg freezing is cheaper because it stops halfway — stimulation, retrieval, vit
 and no further. Devitrification, fertilisation and transfer cost €1,500–3,000 more when she
 returns. That gap is what made the old range look plausible.
 
+### Where €20,000 and €9,000 come from
+
+Both figures circulate and both are real — they are just different units from a clinic cycle price.
+
+| Figure | What it actually is |
+|---|---|
+| **~€9,000** | One cycle **with PGT-A genetic testing**. Institut Marquès ADVANCED PGT €9,060; Eugin PGT-A from €8,730. Not "one successful cycle" |
+| **~€13,400–20,000** | A **guarantee programme**. Eugin Promise FIV is €13,400 — baby or 100% refund, minimum 3 embryo transfers — and lands near €16,000–20,000 once medication across its cycles is added |
+| **€19,500–27,000** | **Three complete cycles**, which is the unit behind the 42.3% figure. Derived arithmetic, not a citable price |
+
+Other refund programmes exist but do not publish prices: Ginefiv Maternity, Access Fertility
+Spain, Institut Marquès IM BabyBorn.
+
+### Patients report paying roughly double the clinic headline
+
+UK patients self-report **£11,950 per cycle** privately funded (£12,977 at private clinics, £6,990
+NHS self-funded), including add-ons — n=304, Queen Mary University of London with Fertility
+Network UK, *Human Fertility* 2025.
+[Source](https://www.qmul.ac.uk/news/latest-news/2025/humanities-and-social-sciences/hss/new-study-reveals-significant-cost-disparities-and-information-gaps-in-uk-fertility-treatments.html)
+
+That is roughly twice the headline tariff, and it is peer-reviewed. **When someone says a cycle
+cost them far more than the list price, the evidence is on their side.** Different health system,
+so use it as corroboration rather than as a Spanish figure.
+
+For contrast, a French study (n=556) found **€6,996 average total expenditure per woman over 3.5
+years** — but France reimburses at 100%, so that is societal cost, not out-of-pocket.
+[Source](https://pmc.ncbi.nlm.nih.gov/articles/PMC9013027/)
+
+### Medication — verified against the official pharmacy nomenclator
+
+Our €1,000–1,300 holds. Range **€800–2,200**, driven by ovarian reserve and dose.
+
+| Item | Price |
+|---|---|
+| Real patient receipt, one full cycle, itemised | **€1,220.42** ([source](https://diariodeunamadreingeniera.com/precio-medicacion-fiv/)) |
+| Gonal-F 900 IU pen, official PVP | €304.54 |
+| Menopur 600 IU | €187.69 |
+| Cetrotide 0.25mg ×7 | €248.70 |
+| Ovitrelle trigger | ~€51 |
+| FET endometrial prep | €200–300 |
+
+**Reimbursement: private patients pay full price.** Gonadotropins carry *visado* restrictions and
+are only subsidised when the whole treatment runs through the public system, where patients pay
+roughly €4 per item at the hospital pharmacy. So the choice in Spain is near-free drugs with a
+long public wait, or immediate private treatment at full cost.
+
+Do **not** cite the €6,387 FSH figure from a 2016 *Int J Women's Health* model — it is a
+cost-effectiveness pathway figure, not a per-cycle cost.
+
 ### Open items
 
 - **Medication inclusion conflicts.** Institut Marquès lists it inside stimulation; IVI excludes it
   explicitly. Unresolved — assume excluded, the conservative read. If challenged: "clinics differ
   on whether drugs are in the quoted price."
 - **Average transfers per retrieval: not found.** Do not use a conversion factor, and treat any
-  three-cycle total as derived arithmetic (~€20,000–30,000), not a citable figure.
+  three-cycle total as derived arithmetic (~€19,500–27,000), not a citable figure.
+- **Average cycles per patient over a lifetime: not found.** No registry publishes it. HFEA data
+  divides out to ~1.27–1.48 cycles per patient *per year*, which is not the same thing — do not
+  present it as an average.
 - **ESHRE/HFEA formal wording for "complete cycle": not confirmed.** The paper's own definition is
   what we cite.
 - **"65–70% after 6" was wrong** and has been removed. That figure traces to [NEJM

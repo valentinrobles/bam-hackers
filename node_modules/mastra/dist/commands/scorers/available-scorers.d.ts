@@ -1,0 +1,3 @@
+import type { ScorerTemplate } from './types.js';
+export declare const AVAILABLE_SCORERS: ScorerTemplate[];
+//# sourceMappingURL=available-scorers.d.ts.map

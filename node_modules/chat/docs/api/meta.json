@@ -1,0 +1,16 @@
+{
+  "title": "API Reference",
+  "pages": [
+    "index",
+    "chat",
+    "thread",
+    "channel",
+    "message",
+    "postable-message",
+    "transcripts",
+    "history",
+    "cards",
+    "markdown",
+    "modals"
+  ]
+}

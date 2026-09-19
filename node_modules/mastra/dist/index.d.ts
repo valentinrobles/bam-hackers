@@ -1,0 +1,9 @@
+#! /usr/bin/env node
+import type { CLI_ORIGIN } from './analytics/index.js';
+import { PosthogAnalytics } from './analytics/index.js';
+export declare const version: string | undefined;
+export declare const analytics: PosthogAnalytics;
+export declare const origin: CLI_ORIGIN;
+export { PosthogAnalytics } from './analytics/index.js';
+export { create } from './commands/create/create.js';
+//# sourceMappingURL=index.d.ts.map

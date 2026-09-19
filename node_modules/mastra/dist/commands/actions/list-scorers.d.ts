@@ -1,0 +1,2 @@
+export declare const listScorers: (args: {}) => Promise<void>;
+//# sourceMappingURL=list-scorers.d.ts.map

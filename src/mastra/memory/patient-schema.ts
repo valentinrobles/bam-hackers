@@ -24,11 +24,13 @@ export const patientSchema = z.object({
     .object({ type: z.string(), datetime: z.string() })
     .optional()
     .describe(`Next clinic appointment. ${ONLY_IF_STATED}`),
+  nurseName: z.string().optional().describe('Name of the assigned nurse. Use in escalation messages.'),
   symptoms: z
     .array(z.object({ date: z.string(), text: z.string(), tier: z.enum(symptomTiers) }))
     .default([])
     .describe('Symptoms the patient reported, appended over time.'),
   openTicketId: z.string().nullable().default(null),
+  treatmentSummary: z.string().optional().describe('Free-text summary of past treatment attempts. Read-only context for the agent.'),
 });
 
 export type Patient = z.infer<typeof patientSchema>;

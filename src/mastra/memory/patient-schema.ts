@@ -28,6 +28,7 @@ export const patientSchema = z.object({
     .array(z.object({ date: z.string(), text: z.string(), tier: z.enum(symptomTiers) }))
     .default([])
     .describe('Symptoms the patient reported, appended over time.'),
+  nurseName: z.string().optional().describe('First name of the nurse assigned to this patient.'),
   openTicketId: z.string().nullable().default(null),
   treatmentSummary: z
     .string()

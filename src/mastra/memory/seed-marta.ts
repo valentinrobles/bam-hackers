@@ -23,6 +23,7 @@ export function martaPatient(now = new Date()): Patient {
     cycle: { day: 6, phase: 'stimulation', startDate: isoDate(cycleStart) },
     protocol: [{ drug: 'Gonal-f', dose: '225 UI', time: '21:00' }],
     nextAppointment: { type: 'ecografía de control', datetime: `jueves ${isoDate(thursday)} 10:00` },
+    nurseName: 'Laura',
     symptoms: [],
     openTicketId: null,
     treatmentSummary: [

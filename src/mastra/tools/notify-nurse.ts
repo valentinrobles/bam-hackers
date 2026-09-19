@@ -45,14 +45,17 @@ function urgentMessage(p: {
   patientName: string;
   cycleInfo: string;
   patientMessage: string;
+  problemSummary?: string;
+  suggestedAction?: string;
   videoCallUrl?: string;
 }): string {
   const header = `Aviso · <code>${p.ticketId}</code>`;
   const who = `👤 <b>${p.patientName}</b>${p.cycleInfo ? ` · ${p.cycleInfo}` : ''}`;
   const quote = `💬 <b>Mensaje recibido</b>\n"${p.patientMessage}"`;
-  const note = `Ya le he dado el número de la clínica y le digo que estáis avisadas.`;
+  const problem = p.problemSummary ? `📋 <b>Situación</b>\n${p.problemSummary}` : '';
+  const action = p.suggestedAction ? `📝 <b>Posible respuesta</b>\n${p.suggestedAction}` : '';
   const call = p.videoCallUrl ? `📹 Videollamada lista: ${p.videoCallUrl}` : '';
-  return [header, '', who, '', quote, '', note, call].filter(Boolean).join('\n');
+  return [header, '', who, '', quote, problem, action, call].filter(Boolean).join('\n');
 }
 
 export const notifyNurseTool = createTool({
@@ -66,6 +69,8 @@ export const notifyNurseTool = createTool({
     protocolInfo: z.string().optional().describe('e.g. "Gonal-f 225 UI · 21:00"'),
     patientMessage: z.string().describe('Verbatim patient message'),
     suggestedReply: z.string().optional().describe('Required for clinical tier'),
+    problemSummary: z.string().optional().describe('For urgent tier: 2-line summary of the situation'),
+    suggestedAction: z.string().optional().describe('For urgent tier: 2-line suggested response or action'),
     videoCallUrl: z.string().optional().describe('For urgent tier: video call URL already sent to patient'),
   }),
   outputSchema: z.object({ sent: z.boolean(), nurseChat: z.string() }),
@@ -77,7 +82,15 @@ export const notifyNurseTool = createTool({
 
     if (tier === 'urgent') {
       // Urgent: nurse decides whether to take the call or redirect it.
-      const text = urgentMessage({ ticketId, patientName, cycleInfo, patientMessage, videoCallUrl });
+      const text = urgentMessage({
+        ticketId,
+        patientName,
+        cycleInfo,
+        patientMessage,
+        problemSummary: input.problemSummary,
+        suggestedAction: input.suggestedAction,
+        videoCallUrl,
+      });
       await sendToNurseChat(text, {
         inline_keyboard: [[
           { text: '📹 Aceptar llamada', callback_data: `videocall:${ticketId}` },

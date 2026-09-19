@@ -14,6 +14,16 @@ export const memory = new Memory({
   },
 });
 
+const clinicStamp = new Intl.DateTimeFormat('sv-SE', {
+  timeZone: process.env.REMINDER_TIMEZONE || 'Europe/Madrid',
+  year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+
+// "2026-09-19 17:54" in clinic time, the format the record uses for dates.
+export function nowStamp(): string {
+  return clinicStamp.format(new Date());
+}
+
 export function chatIdFromThreadId(threadId: string): string {
   return threadId.replace(/^telegram:/, '').split(':')[0] ?? threadId;
 }
@@ -51,9 +61,16 @@ export async function patchPatient(chatId: string, patch: (current: Patient) => 
 export async function appendSymptom(chatId: string, text: string, tier: Patient['symptoms'][number]['tier']): Promise<number> {
   const next = await patchPatient(chatId, (p) => ({
     ...p,
-    symptoms: [...p.symptoms, { date: new Date().toISOString().slice(0, 16).replace('T', ' '), text, tier }],
+    symptoms: [...p.symptoms, { date: nowStamp(), text, tier }],
   }));
   return next.symptoms.length;
+}
+
+export async function addNurseNote(chatId: string, note: { ticketId: string; question: string; reply: string }): Promise<void> {
+  await patchPatient(chatId, (p) => ({
+    ...p,
+    nurseNotes: [...p.nurseNotes, { date: nowStamp(), ...note }],
+  }));
 }
 
 export async function resetChat(chatId: string): Promise<void> {
@@ -72,6 +89,7 @@ export function summarizePatient(p: Patient | null): string {
     p.protocol.length ? `Pauta: ${p.protocol.map((m) => `${m.drug} ${m.dose} a las ${m.time}`).join('; ')}` : 'Pauta: sin datos',
     p.nextAppointment ? `Próxima cita: ${p.nextAppointment.type}, ${p.nextAppointment.datetime}` : 'Próxima cita: sin datos',
     p.symptoms.length ? `Síntomas: ${p.symptoms.slice(-3).map((s) => `${s.date} ${s.text} (${s.tier})`).join('; ')}` : 'Síntomas: ninguno registrado',
+    p.nurseNotes.length ? `Última respuesta de la enfermera: ${p.nurseNotes[p.nurseNotes.length - 1]?.reply}` : 'Respuestas de la enfermera: ninguna todavía',
   ];
   return parts.join('\n');
 }

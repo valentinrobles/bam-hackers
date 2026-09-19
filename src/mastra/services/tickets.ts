@@ -17,6 +17,9 @@ export interface Ticket {
   runId: string | null;
   toolCallId: string | null;
   suggestedReply: string | null;
+  followUpSentAt: string | null;
+  sessionId: string | null;
+  callEndedAt: string | null;
 }
 
 let client: Client | undefined;
@@ -38,8 +41,19 @@ async function db(): Promise<Client> {
           createdAt TEXT NOT NULL,
           runId TEXT,
           toolCallId TEXT,
-          suggestedReply TEXT
+          suggestedReply TEXT,
+          followUpSentAt TEXT,
+          sessionId TEXT,
+          callEndedAt TEXT
         )`,
+      )
+      .then(() => client!.execute('ALTER TABLE tickets ADD COLUMN followUpSentAt TEXT').catch(() => undefined))
+      .then(() => client!.execute('ALTER TABLE tickets ADD COLUMN sessionId TEXT').catch(() => undefined))
+      .then(() => client!.execute('ALTER TABLE tickets ADD COLUMN callEndedAt TEXT').catch(() => undefined))
+      .then(() =>
+        client!.execute(
+          'CREATE TABLE IF NOT EXISTS reminders_sent (chatId TEXT NOT NULL, day TEXT NOT NULL, slot TEXT NOT NULL, sentAt TEXT NOT NULL, PRIMARY KEY (chatId, day, slot))',
+        ),
       )
       .then(() => undefined);
   }
@@ -60,6 +74,9 @@ function rowToTicket(row: Record<string, unknown>): Ticket {
     runId: row.runId == null ? null : String(row.runId),
     toolCallId: row.toolCallId == null ? null : String(row.toolCallId),
     suggestedReply: row.suggestedReply == null ? null : String(row.suggestedReply),
+    followUpSentAt: row.followUpSentAt == null ? null : String(row.followUpSentAt),
+    sessionId: row.sessionId == null ? null : String(row.sessionId),
+    callEndedAt: row.callEndedAt == null ? null : String(row.callEndedAt),
   };
 }
 
@@ -82,6 +99,9 @@ export async function createTicket(input: {
     runId: null,
     toolCallId: null,
     suggestedReply: null,
+    followUpSentAt: null,
+    sessionId: null,
+    callEndedAt: null,
   };
   await (await db()).execute({
     sql: `INSERT INTO tickets (id, chatId, patientName, tier, message, contextSummary, status, createdAt)
@@ -99,7 +119,7 @@ export async function getTicket(id: string): Promise<Ticket | null> {
 
 export async function updateTicket(
   id: string,
-  patch: Partial<Pick<Ticket, 'status' | 'runId' | 'toolCallId' | 'suggestedReply'>>,
+  patch: Partial<Pick<Ticket, 'status' | 'runId' | 'toolCallId' | 'suggestedReply' | 'followUpSentAt' | 'sessionId' | 'callEndedAt'>>,
 ): Promise<void> {
   const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
   if (!entries.length) return;
@@ -116,4 +136,40 @@ export async function latestTicketByStatus(status: TicketStatus): Promise<Ticket
   });
   const row = res.rows[0];
   return row ? rowToTicket(row as unknown as Record<string, unknown>) : null;
+}
+
+export async function urgentTicketsDueForFollowUp(before: Date): Promise<Ticket[]> {
+  const res = await (await db()).execute({
+    sql: "SELECT * FROM tickets WHERE tier = 'urgent' AND followUpSentAt IS NULL AND createdAt <= ? ORDER BY createdAt ASC",
+    args: [before.toISOString()],
+  });
+  return res.rows.map((row) => rowToTicket(row as unknown as Record<string, unknown>));
+}
+
+export async function latestUrgentTicketForChat(chatId: string): Promise<Ticket | null> {
+  const res = await (await db()).execute({
+    sql: "SELECT * FROM tickets WHERE tier = 'urgent' AND chatId = ? ORDER BY createdAt DESC LIMIT 1",
+    args: [chatId],
+  });
+  const row = res.rows[0];
+  return row ? rowToTicket(row as unknown as Record<string, unknown>) : null;
+}
+
+// Returns false when this reminder slot was already sent today.
+export async function claimReminderSlot(chatId: string, day: string, slot: string): Promise<boolean> {
+  try {
+    await (await db()).execute({
+      sql: 'INSERT INTO reminders_sent (chatId, day, slot, sentAt) VALUES (?, ?, ?, ?)',
+      args: [chatId, day, slot, new Date().toISOString()],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Patients are Mastra memory resources; the record is the working memory JSON.
+export async function listPatientRecords(): Promise<{ chatId: string; workingMemory: string }[]> {
+  const res = await (await db()).execute('SELECT id, workingMemory FROM mastra_resources WHERE workingMemory IS NOT NULL');
+  return res.rows.map((row) => ({ chatId: String(row.id), workingMemory: String(row.workingMemory) }));
 }

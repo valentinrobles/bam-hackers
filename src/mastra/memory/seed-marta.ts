@@ -30,6 +30,7 @@ export function martaPatient(now = new Date()): Patient {
     nextAppointment: { type: 'ecografía de control', datetime: `${spanishDate(nextWeekday(now, 4))}, 10:00` },
     symptoms: [],
     openTicketId: null,
+    nurseNotes: [],
     treatmentSummary: [
       'Intento 1 (mar–dic 2025): estimulación ovárica con Omifin y Bemfola. Respuesta folicular limitada. Ciclo cancelado el 1 dic 2025. Sin punción.',
       'Intento 2 (ene–feb 2026): Meriestra, Menopur, Decapeptyl, Puregon, progesterona y ácido fólico. Punción el 4 feb. Transferencia el 9 feb. Sangrado urgente el 17 feb. Pérdida gestacional bioquímica confirmada.',

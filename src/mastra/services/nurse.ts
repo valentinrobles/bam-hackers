@@ -4,8 +4,9 @@ import { PinoLogger } from '@mastra/loggers';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 import { Actions, Button, Card, type TextElement, type Thread } from 'chat';
-import { clinicalThreadId, patchPatient, readPatient, summarizePatient } from '../memory/patient-memory';
+import { addNurseNote, clinicalThreadId, patchPatient, readPatient, summarizePatient } from '../memory/patient-memory';
 import { getTicket, latestTicketByStatus, updateTicket, type Ticket } from './tickets';
+import { startVideoCall } from './vonage';
 
 // Same string as CHAT_CHANNEL_RENDER_CONTEXT_KEY in @mastra/core 1.67
 // (channels/output-processor). Not exported from the package entry point.
@@ -13,6 +14,7 @@ const RENDER_CONTEXT_KEY = '__mastra_chat_channel_render';
 
 export const NURSE_APPROVE = 'nurse_approve';
 export const NURSE_DENY = 'nurse_deny';
+export const NURSE_VIDEO = 'nurse_video';
 export const NOTIFY_NURSE_TOOL = 'notify_nurse';
 
 export function nurseChatId(): string | undefined {
@@ -132,6 +134,7 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
             Actions([
               Button({ id: NURSE_APPROVE, label: 'Aprobar y enviar', value: ticket.id, style: 'primary' }),
               Button({ id: NURSE_DENY, label: 'Rechazar y escribir', value: ticket.id, style: 'danger' }),
+              Button({ id: NURSE_VIDEO, label: '📹 Videollamada', value: ticket.id }),
             ]),
           ],
         }),
@@ -143,6 +146,7 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
             { text: 'Aprobar y enviar', callback_data: callbackData(NURSE_APPROVE, ticket.id) },
             { text: 'Rechazar y escribir', callback_data: callbackData(NURSE_DENY, ticket.id) },
           ],
+          [{ text: '📹 Videollamada', callback_data: callbackData(NURSE_VIDEO, ticket.id) }],
         ],
       }),
   );
@@ -243,6 +247,9 @@ export async function handleNurseDecision(
     const text = await stream.text;
     if (approved) {
       await updateTicket(ticket.id, { status: 'answered' });
+      await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: ticket.suggestedReply ?? '' }).catch((error: unknown) =>
+        logger.warn('could not write nurse note', { ticketId: ticket.id, error: String(error) }),
+      );
       await clearOpenTicket(ticket);
     }
     return { outcome: 'resumed', ticket, text, delivered };
@@ -265,9 +272,20 @@ async function clearOpenTicket(ticket: Ticket): Promise<void> {
 
 // Posts into the patient's private chat. Bounded so a slow Telegram call
 // cannot delay the rest of the flow.
-async function postToPatient(agent: AnyAgent, chatId: string, text: string): Promise<boolean> {
+export async function postToPatient(agent: AnyAgent, chatId: string, text: string): Promise<boolean> {
   const outcome = await postWithFallback(agent, chatId, 'patient post', (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
   return outcome.posted;
+}
+
+// Nurse tapped 📹 on a clinical ticket: open the room, send the patient her
+// link, give the nurse hers.
+export async function startNurseVideoCall(agent: AnyAgent, ticketId: string): Promise<{ ticket: Ticket | null; nurseUrl?: string; patientNotified?: boolean }> {
+  const ticket = await getTicket(ticketId);
+  if (!ticket) return { ticket: null };
+  const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+  const name = ticket.patientName ? `${ticket.patientName}, tu` : 'Tu';
+  const patientNotified = await postToPatient(agent, ticket.chatId, `${name} enfermera quiere verte por videollamada ahora. Entra aquí desde el móvil o el ordenador: ${patientUrl}`);
+  return { ticket, nurseUrl, patientNotified };
 }
 
 // After a denial, the nurse's next plain message is forwarded to the patient.
@@ -277,6 +295,9 @@ export async function forwardNurseReply(agent: AnyAgent, text: string): Promise<
   const delivered = await postToPatient(agent, ticket.chatId, `${nurseReplyPrefix} ${text}`);
   if (!delivered) return { ticket, delivered: false };
   await updateTicket(ticket.id, { status: 'answered', suggestedReply: text });
+  await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: text }).catch((error: unknown) =>
+    logger.warn('could not write nurse note', { ticketId: ticket.id, error: String(error) }),
+  );
   await clearOpenTicket(ticket);
   return { ticket, delivered: true };
 }

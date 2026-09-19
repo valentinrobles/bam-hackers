@@ -1,11 +1,14 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
-import { createVideoCall } from '../services/video';
+import { startVideoCall } from '../services/vonage';
 
 export const startVideoCallTool = createTool({
   id: 'start_video_call',
-  description: 'Create a video call room between the nurse and the patient for an urgent case. Returns the link to send to the patient.',
+  description: 'Open the nurse ↔ patient video room for a ticket. Returns the two join links; send patientUrl to the patient.',
   inputSchema: z.object({ ticketId: z.string() }),
-  outputSchema: z.object({ url: z.string() }),
-  execute: async ({ ticketId }) => createVideoCall(ticketId),
+  outputSchema: z.object({ patientUrl: z.string(), nurseUrl: z.string() }),
+  execute: async ({ ticketId }) => {
+    const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+    return { patientUrl, nurseUrl };
+  },
 });

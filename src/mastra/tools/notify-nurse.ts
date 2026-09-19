@@ -45,12 +45,14 @@ function urgentMessage(p: {
   patientName: string;
   cycleInfo: string;
   patientMessage: string;
+  videoCallUrl?: string;
 }): string {
   const header = `Aviso · <code>${p.ticketId}</code>`;
   const who = `👤 <b>${p.patientName}</b>${p.cycleInfo ? ` · ${p.cycleInfo}` : ''}`;
   const quote = `💬 <b>Mensaje recibido</b>\n"${p.patientMessage}"`;
   const note = `Ya le he dado el número de la clínica y le digo que estáis avisadas.`;
-  return [header, '', who, '', quote, '', note].join('\n');
+  const call = p.videoCallUrl ? `📹 Videollamada lista: ${p.videoCallUrl}` : '';
+  return [header, '', who, '', quote, '', note, call].filter(Boolean).join('\n');
 }
 
 export const notifyNurseTool = createTool({
@@ -64,22 +66,19 @@ export const notifyNurseTool = createTool({
     protocolInfo: z.string().optional().describe('e.g. "Gonal-f 225 UI · 21:00"'),
     patientMessage: z.string().describe('Verbatim patient message'),
     suggestedReply: z.string().optional().describe('Required for clinical tier'),
+    videoCallUrl: z.string().optional().describe('For urgent tier: video call URL already sent to patient'),
   }),
   outputSchema: z.object({ sent: z.boolean(), nurseChat: z.string() }),
   execute: async (input) => {
-    const { ticketId, tier, patientMessage, suggestedReply } = input;
+    const { ticketId, tier, patientMessage, suggestedReply, videoCallUrl } = input;
     const patientName = input.patientName ?? 'la paciente';
     const cycleInfo = input.cycleInfo ?? '';
     const protocolInfo = input.protocolInfo ?? '';
 
     if (tier === 'urgent') {
-      const text = urgentMessage({ ticketId, patientName, cycleInfo, patientMessage });
-      await sendToNurseChat(text, {
-        inline_keyboard: [[
-          { text: '📹 Iniciar videollamada', callback_data: `videocall:${ticketId}` },
-          { text: '💬 Responder por texto', callback_data: `deny:${ticketId}` },
-        ]],
-      });
+      // Urgent = direct action, no approval needed. Just notify the nurse.
+      const text = urgentMessage({ ticketId, patientName, cycleInfo, patientMessage, videoCallUrl });
+      await sendToNurseChat(text, { remove_keyboard: true });
     } else {
       const text = clinicalMessage({
         ticketId,

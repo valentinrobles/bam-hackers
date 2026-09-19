@@ -15,7 +15,7 @@ checks.
 | 2 | **They quit despite live-birth odds as high as 72% — and 45% of studies had treatment subsidised** | Kills the "just make it free" objection |
 | 3 | **Spain runs 15% of all European IVF cycles — more than any other country** | You are pitching in the biggest IVF market on the continent |
 | 4 | **~1 in 10 babies born in Spain come from assisted reproduction** | Room resonance |
-| 5 | **42% cumulative live birth after 3 cycles, ~65–70% after 6** | Early dropout is the single biggest destroyer of outcomes — and it's emotional |
+| 5 | **42% live birth after 3 complete cycles — conservative; 82% after 8** | Early dropout is the single biggest destroyer of outcomes — and it's emotional |
 
 **Pitch line:** *"The biggest predictor of IVF failure isn't biology or money. It's quitting — and
 people quit because of the emotional burden, not the bill."*
@@ -64,7 +64,7 @@ anxiety; that range is too wide to quote.
 | Infertility lifetime prevalence | **17.5% of adults, ~1 in 6** | [WHO 2023](https://www.who.int/news/item/04-04-2023-1-in-6-people-globally-affected-by-infertility) | High |
 | Spanish births from ART | **~10% (2023)** | [SEF registry](https://www.sefertilidad.net/documentos/lyOlT-rkPKvRdGKY_wA1sINHS7Btlw189LVFTlHd5eE.pdf) | High |
 | European births from ART | ~3%; >5% in BE/CZ/DK/EE/GR/IS; US ~1% | [ESHRE Fact Sheet 2025](https://www.eshre.eu/-/media/sitecore-files/Press-room/ESHRE_ARTFactSheet_v10_2025.pdf) | High |
-| Cumulative live birth by cycle | **42.3% after 3 cycles; ~65–70% after 6** | [Hum Reprod 2016, n=178,898](https://academic.oup.com/humrep/article-pdf/31/3/572/17372668/dev336.pdf) | High |
+| Cumulative live birth by cycle | **42.3% after 3 complete cycles (conservative estimate; 57.1% optimal); 82.4% after 8** | [Hum Reprod 2016, n=178,898](https://academic.oup.com/humrep/article-pdf/31/3/572/17372668/dev336.pdf) | High |
 | OHSS incidence | <0.2% | ESHRE | High |
 
 **Two precision warnings for stage:**
@@ -89,7 +89,7 @@ argument for why escalation design matters even though most messages are routine
 | Europe ART cycles/yr | **960,347** (2022), 1,371 clinics, 39 countries | [ESHRE EIM 2025](https://www.focusonreproduction.eu/press-releases/ivf-and-iui-pregnancy-rates-remain-stable-across-europedespite-an-increasing-uptake-of-single-embryo-transfer/) | High |
 | Europe cumulative | ~14M treatments, 2.8M children since 1997 | ESHRE EIM | High |
 | Worldwide cycles/yr | **>3M reported, ~4M actual** (registries ≈75% coverage), ~1M babies | [ICMART world report](https://academic.oup.com/humrep/article/40/6/1110/8114747) | High |
-| Cost per cycle, Spain | €4,300–6,700 own eggs (pre-meds); €5,900–8,500 donor | Clinic sites | Low–Med |
+| Cost per cycle, Spain | **€6,500–9,000 all-in** — see section 3b | Clinic tariffs | High |
 | Cost per cycle, US | $15–20K base, ~$22K all-in; only ~25% have coverage | Aggregators | Medium |
 | Global IVF market | $28–32B (2025) → $37.4B by 2030 @ 5.5% CAGR | Market-research firms | **Soft** |
 
@@ -104,6 +104,62 @@ Cite Spain's #1 position as **SEF (Registro Nacional)**, not the clinic news pag
   commercial insurance guide**. Verify against a regional health service page or say "over a year."
 
 ---
+
+## 3b. What a cycle actually costs — and what "cycle" means
+
+Two corrections, both raised by the team and both confirmed.
+
+### A "complete cycle" = one egg retrieval plus every transfer arising from it
+
+That is the unit the 42.3% figure uses — the paper measures "three fresh IVF treatments, including
+replacement of any surplus frozen-thawed embryos." **42.3% is after 3 egg retrievals, not 3
+transfers.** It is also the paper's *conservative* estimate; the optimal estimate is 57.1%. Say
+"conservative" on stage.
+
+Our cost unit must match that. A headline clinic price covers stimulation, retrieval, lab and the
+first fresh transfer — it does **not** cover medication or any later frozen transfer, both of which
+the 42.3% assumes she went through.
+
+### Itemised, from clinics' own published tariffs
+
+| Item | Price (EUR, 2026) | Source |
+|---|---|---|
+| **IVF own eggs — Essential** (IVF + ICSI, first transfer) | **€5,495** | [Institut Marquès](https://institutomarques.com/en/es/prices-and-financing/treatment-prices/) |
+| IVF own eggs — Plus / Advanced | €6,575 / €7,625 | same |
+| IVF own eggs | from €5,725 | [Eugin](https://www.eugin.es/precios/) |
+| IVF + PGT-A | €8,730–9,060 | Eugin / Institut Marquès |
+| Egg donation | €5,945–12,900 | same |
+| **Medication per stim cycle — excluded from quotes** | **€1,000–1,300** | [IVI](https://ivi.es/precios-y-financiacion/) |
+| Frozen embryo transfer (FET) | €800–1,500 + €300–400 meds | [reproduccionasistida.org](https://www.reproduccionasistida.org/transferencia-de-embriones-congelados/precio-transferencia-embriones-congelados/) |
+| Embryo storage, annual (from yr 2) | €300–650 | same |
+| **Egg freezing (vitrificación)** — *a different product* | **€2,695** incl. 2yr storage | Institut Marquès |
+
+**Use: ~€6,500–9,000 all-in for one complete cycle with own eggs** (base €5,495–7,625 + meds
+€1,000–1,300), plus roughly €1,100–1,900 for each frozen transfer after the first.
+
+### Why the old €4,300–6,700 was wrong
+
+No clinic-published tariff found starts below €5,495, and none include medication. The €4,300 low
+end came from comparison sites (easyfiv, ClinicPoint, Bookimed, Fertility Road, OVU) which
+undercut clinics' own tariffs by 30–50% because they are lead-generation. **Use clinics' own
+*precios* pages only.**
+
+Egg freezing is cheaper because it stops halfway — stimulation, retrieval, vitrification, storage,
+and no further. Devitrification, fertilisation and transfer cost €1,500–3,000 more when she
+returns. That gap is what made the old range look plausible.
+
+### Open items
+
+- **Medication inclusion conflicts.** Institut Marquès lists it inside stimulation; IVI excludes it
+  explicitly. Unresolved — assume excluded, the conservative read. If challenged: "clinics differ
+  on whether drugs are in the quoted price."
+- **Average transfers per retrieval: not found.** Do not use a conversion factor, and treat any
+  three-cycle total as derived arithmetic (~€20,000–30,000), not a citable figure.
+- **ESHRE/HFEA formal wording for "complete cycle": not confirmed.** The paper's own definition is
+  what we cite.
+- **"65–70% after 6" was wrong** and has been removed. That figure traces to [NEJM
+  2009](https://www.nejm.org/doi/full/10.1056/NEJMoa0803072) (72% after 6, different cohort and
+  era), not to the 2016 paper, which reports 82.4% after 8. Cite one paper or attribute both.
 
 ## 4. Clinic burden
 
@@ -135,7 +191,7 @@ The "digital triage reduces clinic workload" claim has real evidence against it:
 **Therefore: do not pitch call deflection. Pitch retention.**
 
 > People quit for emotional reasons. Quitting destroys outcomes — 42% live birth after three cycles
-> versus far less after one. A cycle costs €4,300–6,700 in Spain. Keeping one patient in treatment
+> versus far less after one. A complete cycle costs €6,500–9,000 all-in in Spain. Keeping one patient in treatment
 > for one more cycle is worth more to a clinic than a year of saved nurse minutes.
 
 State the assumptions openly on the slide. A modelled retention case with visible assumptions is

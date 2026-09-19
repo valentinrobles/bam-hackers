@@ -5,6 +5,7 @@ import type { RequestContext } from '@mastra/core/request-context';
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 import type { Author } from 'chat';
 import {
+  addNurseNote,
   appendSymptom,
   chatIdFromThreadId,
   clinicalThreadId,
@@ -21,7 +22,9 @@ import { NebiusCallProcessor, classifyMessage, nebiusProviderOptions, resolvedNe
 import {
   NURSE_APPROVE,
   NURSE_DENY,
+  NURSE_VIDEO,
   NurseCardProcessor,
+  startNurseVideoCall,
   forwardNurseReply,
   handleNurseDecision,
   nurseChatId,
@@ -35,7 +38,7 @@ import { createTicketTool, openTicket } from '../tools/create-ticket';
 import { logSymptomTool } from '../tools/log-symptom';
 import { notifyNurseTool } from '../tools/notify-nurse';
 import { startVideoCallTool } from '../tools/start-video-call';
-import { createVideoCall } from '../services/video';
+import { startVideoCall } from '../services/vonage';
 
 const BOT_NAME = process.env.BOT_NAME ?? 'Lumi';
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
@@ -64,6 +67,8 @@ const baseInstructions = `You are ${BOT_NAME}, a companion for patients going th
 - Update the record ONLY when the patient states a fact about their treatment in their own words (an appointment, their medication schedule, a symptom). Write exactly what they said.
 - Never fill in cycle, protocol or nextAppointment on your own. A new patient's record has only name and onboarded, and that is correct. Leave every other field absent until the patient states it or /demo loads it.
 - On greetings and small talk, do not touch the record at all.
+- nurseNotes holds what the nurse answered earlier (question, reply, date). When the patient asks what the nurse said, quote the latest matching reply as written, with its date. Never invent a nurse answer.
+- When the patient confirms a dose ("hecho", "ya me la he puesto"), acknowledge in one sentence; do not change the protocol.
 - If the record has openTicketId set, a nurse is already reviewing an open question. For thanks or small talk, reply briefly and say the nurse will answer soon; do not revisit the question yourself.
 
 ## The patient's name
@@ -226,13 +231,18 @@ export async function prepareTurn(chatId: string, text: string, requestContext: 
   requestContext.set('ticketId', ticketId);
   const ticket = await getTicket(ticketId);
   if (tier === 'urgent') {
-    const { url } = await createVideoCall(ticketId);
+    const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+    await addNurseNote(chatId, {
+      ticketId,
+      question: text,
+      reply: `Caso urgente: se avisó a la enfermera, se abrió videollamada (${patientUrl}) y se dio el teléfono de la clínica ${CLINIC_EMERGENCY_PHONE}.`,
+    }).catch(() => undefined);
     if (ticket) {
-      void postNurseAlert(companion, ticket)
+      void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`)
         .then((o) => console.info('[companion] nurse alert', { ticketId, ...o }))
         .catch((error: unknown) => console.warn('[companion] nurse alert not posted', { ticketId, error: String(error) }));
     }
-    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, url) };
+    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, patientUrl) };
   }
   return { tier, reason, ticketId, ticket, ack: clinicalAck(patient?.name) };
 }
@@ -368,11 +378,12 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
 
 // Accepts both encodings: actionId + value (Chat SDK card / our keyboard)
 // and a bare "nurse_approve:<ticketId>" string.
-function parseNurseAction(actionId: string, value: string | undefined): { approved: boolean; ticketId: string } | null {
+function parseNurseAction(actionId: string, value: string | undefined): { kind: 'approve' | 'deny' | 'video'; ticketId: string } | null {
   const [id, rest] = actionId.includes(':') ? [actionId.slice(0, actionId.indexOf(':')), actionId.slice(actionId.indexOf(':') + 1)] : [actionId, undefined];
-  if (id !== NURSE_APPROVE && id !== NURSE_DENY) return null;
+  const kind = id === NURSE_APPROVE ? 'approve' : id === NURSE_DENY ? 'deny' : id === NURSE_VIDEO ? 'video' : null;
+  if (!kind) return null;
   const ticketId = (value && value !== actionId ? value : rest) ?? '';
-  return { approved: id === NURSE_APPROVE, ticketId };
+  return { kind, ticketId };
 }
 
 const onAction: ActionChannelHandler = async (event, defaultHandler, ctx) => {
@@ -383,8 +394,20 @@ const onAction: ActionChannelHandler = async (event, defaultHandler, ctx) => {
     await defaultHandler();
     return;
   }
-  const { approved, ticketId } = parsed;
+  const { kind, ticketId } = parsed;
+  const approved = kind === 'approve';
   const reply = (t: string) => event.thread?.post(t).catch(() => undefined);
+  if (kind === 'video') {
+    try {
+      const { ticket, nurseUrl, patientNotified } = await startNurseVideoCall(companion, ticketId);
+      if (!ticket) await reply(`No encuentro el ticket ${ticketId}.`);
+      else await reply(`${patientNotified ? 'Le he enviado el enlace a' : 'No he podido avisar a'} ${ticket.patientName ?? 'la paciente'}. Tu enlace: ${nurseUrl}`);
+    } catch (error) {
+      logger?.error('video call start failed', { ticketId, error });
+      await reply(`No he podido abrir la videollamada del ticket ${ticketId}.`);
+    }
+    return;
+  }
   try {
     const result = await handleNurseDecision(companion, ticketId, approved, ctx.requestContext);
     switch (result.outcome) {

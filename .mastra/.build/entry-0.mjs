@@ -3,16 +3,18 @@ import { PinoLogger } from '@mastra/loggers';
 import { Agent } from '@mastra/core/agent';
 import { createTelegramAdapter } from '@chat-adapter/telegram';
 import { Memory } from '@mastra/memory';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { LibSQLStore } from '@mastra/libsql';
 import { z } from 'zod';
 import { Card, Actions, Button } from 'chat';
 import { createClient } from '@libsql/client';
 import { randomBytes } from 'node:crypto';
+import { Video, MediaMode } from '@vonage/video';
 import { createTool } from '@mastra/core/tools';
-import { RequestContext } from '@mastra/core/request-context';
 import { registerApiRoute } from '@mastra/core/server';
+import { RequestContext } from '@mastra/core/request-context';
+import { createStep, createWorkflow } from '@mastra/core/workflows';
 
 "use strict";
 function projectRoot() {
@@ -47,7 +49,8 @@ const patientSchema = z.object({
   protocol: z.array(z.object({ drug: z.string(), dose: z.string(), time: z.string() })).default([]).describe(`Medication protocol. ${ONLY_IF_STATED}`),
   nextAppointment: z.object({ type: z.string(), datetime: z.string() }).optional().describe(`Next clinic appointment. ${ONLY_IF_STATED}`),
   symptoms: z.array(z.object({ date: z.string(), text: z.string(), tier: z.enum(symptomTiers) })).default([]).describe("Symptoms the patient reported, appended over time."),
-  openTicketId: z.string().nullable().default(null)
+  openTicketId: z.string().nullable().default(null),
+  nurseNotes: z.array(z.object({ date: z.string(), ticketId: z.string(), question: z.string(), reply: z.string() })).default([]).describe("What the nurse answered to earlier questions, newest last. Written by the system, never by you.")
 });
 const emptyPatient = patientSchema.parse({});
 function parsePatient(raw) {
@@ -71,6 +74,18 @@ const memory = new Memory({
     }
   }
 });
+const clinicStamp = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: process.env.REMINDER_TIMEZONE || "Europe/Madrid",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23"
+});
+function nowStamp() {
+  return clinicStamp.format(/* @__PURE__ */ new Date());
+}
 function chatIdFromThreadId(threadId) {
   return threadId.replace(/^telegram:/, "").split(":")[0] ?? threadId;
 }
@@ -98,9 +113,15 @@ async function patchPatient(chatId, patch) {
 async function appendSymptom(chatId, text, tier) {
   const next = await patchPatient(chatId, (p) => ({
     ...p,
-    symptoms: [...p.symptoms, { date: (/* @__PURE__ */ new Date()).toISOString().slice(0, 16).replace("T", " "), text, tier }]
+    symptoms: [...p.symptoms, { date: nowStamp(), text, tier }]
   }));
   return next.symptoms.length;
+}
+async function addNurseNote(chatId, note) {
+  await patchPatient(chatId, (p) => ({
+    ...p,
+    nurseNotes: [...p.nurseNotes, { date: nowStamp(), ...note }]
+  }));
 }
 async function resetChat(chatId) {
   await writePatient(chatId, emptyPatient);
@@ -116,7 +137,8 @@ function summarizePatient(p) {
     p.cycle ? `Ciclo: d\xEDa ${p.cycle.day}, fase ${p.cycle.phase}, inicio ${p.cycle.startDate}` : "Ciclo: sin datos",
     p.protocol.length ? `Pauta: ${p.protocol.map((m) => `${m.drug} ${m.dose} a las ${m.time}`).join("; ")}` : "Pauta: sin datos",
     p.nextAppointment ? `Pr\xF3xima cita: ${p.nextAppointment.type}, ${p.nextAppointment.datetime}` : "Pr\xF3xima cita: sin datos",
-    p.symptoms.length ? `S\xEDntomas: ${p.symptoms.slice(-3).map((s) => `${s.date} ${s.text} (${s.tier})`).join("; ")}` : "S\xEDntomas: ninguno registrado"
+    p.symptoms.length ? `S\xEDntomas: ${p.symptoms.slice(-3).map((s) => `${s.date} ${s.text} (${s.tier})`).join("; ")}` : "S\xEDntomas: ninguno registrado",
+    p.nurseNotes.length ? `\xDAltima respuesta de la enfermera: ${p.nurseNotes[p.nurseNotes.length - 1]?.reply}` : "Respuestas de la enfermera: ninguna todav\xEDa"
   ];
   return parts.join("\n");
 }
@@ -142,7 +164,8 @@ function martaPatient(now = /* @__PURE__ */ new Date()) {
     protocol: [{ drug: "Gonal-f", dose: "225 UI", time: "21:00" }],
     nextAppointment: { type: "ecograf\xEDa de control", datetime: `${spanishDate(nextWeekday(now, 4))}, 10:00` },
     symptoms: [],
-    openTicketId: null
+    openTicketId: null,
+    nurseNotes: []
   };
 }
 
@@ -155,7 +178,7 @@ const DEFAULT_MODEL = {
 function noThinkingBody(modelId) {
   return /glm/i.test(modelId) ? { thinking: { type: "disabled" } } : { chat_template_kwargs: { enable_thinking: false } };
 }
-const logger$2 = new PinoLogger({ name: "nebius", level: "info" });
+const logger$3 = new PinoLogger({ name: "nebius", level: "info" });
 function nebiusModelId(role) {
   return process.env[ENV_VAR[role]] || DEFAULT_MODEL[role];
 }
@@ -176,7 +199,7 @@ async function listServedModelIds() {
       const body = await res.json();
       return (body.data ?? []).map((m) => m.id).filter((id) => typeof id === "string");
     })().catch((error) => {
-      logger$2.warn("nebius: could not list models, using configured ids as-is", { error: String(error) });
+      logger$3.warn("nebius: could not list models, using configured ids as-is", { error: String(error) });
       servedModelIds = void 0;
       return [];
     });
@@ -191,10 +214,10 @@ async function resolveNebiusModelId(role) {
   const served = await listServedModelIds();
   const match = served.find((id) => id.toLowerCase() === configured.toLowerCase());
   if (!match) {
-    if (served.length) logger$2.warn("nebius: configured model id is not in /models", { role, configured });
+    if (served.length) logger$3.warn("nebius: configured model id is not in /models", { role, configured });
     return configured;
   }
-  if (match !== configured) logger$2.warn("nebius: corrected model id case", { role, configured, served: match });
+  if (match !== configured) logger$3.warn("nebius: corrected model id case", { role, configured, served: match });
   resolvedIds.set(role, match);
   return match;
 }
@@ -220,7 +243,7 @@ function stripThinking(text) {
   return text.slice(idx + THINK_CLOSE.length).trimStart();
 }
 function logModelCall(stats) {
-  logger$2.info(`nebius ${stats.role} call`, stats);
+  logger$3.info(`nebius ${stats.role} call`, stats);
 }
 function thinkState(state) {
   if (!state.think) state.think = { phase: "undecided", buffer: "" };
@@ -353,7 +376,7 @@ async function classifyMessage(text) {
     try {
       result = await callTriageModel(trimmed);
     } catch (error) {
-      logger$2.warn("triage attempt failed", { attempt, error: String(error) });
+      logger$3.warn("triage attempt failed", { attempt, error: String(error) });
     }
   }
   if (!result) {
@@ -383,8 +406,15 @@ async function db() {
           createdAt TEXT NOT NULL,
           runId TEXT,
           toolCallId TEXT,
-          suggestedReply TEXT
+          suggestedReply TEXT,
+          followUpSentAt TEXT,
+          sessionId TEXT,
+          callEndedAt TEXT
         )`
+    ).then(() => client.execute("ALTER TABLE tickets ADD COLUMN followUpSentAt TEXT").catch(() => void 0)).then(() => client.execute("ALTER TABLE tickets ADD COLUMN sessionId TEXT").catch(() => void 0)).then(() => client.execute("ALTER TABLE tickets ADD COLUMN callEndedAt TEXT").catch(() => void 0)).then(
+      () => client.execute(
+        "CREATE TABLE IF NOT EXISTS reminders_sent (chatId TEXT NOT NULL, day TEXT NOT NULL, slot TEXT NOT NULL, sentAt TEXT NOT NULL, PRIMARY KEY (chatId, day, slot))"
+      )
     ).then(() => void 0);
   }
   await ready;
@@ -402,7 +432,10 @@ function rowToTicket(row) {
     createdAt: String(row.createdAt),
     runId: row.runId == null ? null : String(row.runId),
     toolCallId: row.toolCallId == null ? null : String(row.toolCallId),
-    suggestedReply: row.suggestedReply == null ? null : String(row.suggestedReply)
+    suggestedReply: row.suggestedReply == null ? null : String(row.suggestedReply),
+    followUpSentAt: row.followUpSentAt == null ? null : String(row.followUpSentAt),
+    sessionId: row.sessionId == null ? null : String(row.sessionId),
+    callEndedAt: row.callEndedAt == null ? null : String(row.callEndedAt)
   };
 }
 async function createTicket(input) {
@@ -417,7 +450,10 @@ async function createTicket(input) {
     createdAt: (/* @__PURE__ */ new Date()).toISOString(),
     runId: null,
     toolCallId: null,
-    suggestedReply: null
+    suggestedReply: null,
+    followUpSentAt: null,
+    sessionId: null,
+    callEndedAt: null
   };
   await (await db()).execute({
     sql: `INSERT INTO tickets (id, chatId, patientName, tier, message, contextSummary, status, createdAt)
@@ -447,11 +483,131 @@ async function latestTicketByStatus(status) {
   const row = res.rows[0];
   return row ? rowToTicket(row) : null;
 }
+async function urgentTicketsDueForFollowUp(before) {
+  const res = await (await db()).execute({
+    sql: "SELECT * FROM tickets WHERE tier = 'urgent' AND followUpSentAt IS NULL AND createdAt <= ? ORDER BY createdAt ASC",
+    args: [before.toISOString()]
+  });
+  return res.rows.map((row) => rowToTicket(row));
+}
+async function latestUrgentTicketForChat(chatId) {
+  const res = await (await db()).execute({
+    sql: "SELECT * FROM tickets WHERE tier = 'urgent' AND chatId = ? ORDER BY createdAt DESC LIMIT 1",
+    args: [chatId]
+  });
+  const row = res.rows[0];
+  return row ? rowToTicket(row) : null;
+}
+async function claimReminderSlot(chatId, day, slot) {
+  try {
+    await (await db()).execute({
+      sql: "INSERT INTO reminders_sent (chatId, day, slot, sentAt) VALUES (?, ?, ?, ?)",
+      args: [chatId, day, slot, (/* @__PURE__ */ new Date()).toISOString()]
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function listPatientRecords() {
+  const res = await (await db()).execute("SELECT id, workingMemory FROM mastra_resources WHERE workingMemory IS NOT NULL");
+  return res.rows.map((row) => ({ chatId: String(row.id), workingMemory: String(row.workingMemory) }));
+}
+
+"use strict";
+const logger$2 = new PinoLogger({ name: "vonage", level: "info" });
+function publicBaseUrl() {
+  return (process.env.PUBLIC_BASE_URL || "http://localhost:4111").replace(/\/+$/, "");
+}
+function callUrls(ticketId) {
+  const base = `${publicBaseUrl()}/call/${encodeURIComponent(ticketId)}`;
+  return { patientUrl: `${base}?role=patient`, nurseUrl: `${base}?role=nurse` };
+}
+function loadPrivateKey() {
+  const path = process.env.VONAGE_PRIVATE_KEY_PATH?.trim();
+  if (path) {
+    try {
+      return readFileSync(path, "utf8");
+    } catch (error) {
+      logger$2.error("cannot read VONAGE_PRIVATE_KEY_PATH", { path, error: String(error) });
+    }
+  }
+  const inline = process.env.VONAGE_PRIVATE_KEY?.trim();
+  if (inline) return inline.replace(/\\n/g, "\n");
+  return void 0;
+}
+let video;
+function getVideo() {
+  if (video !== void 0) return video;
+  const applicationId = process.env.VONAGE_APPLICATION_ID?.trim();
+  const privateKey = loadPrivateKey();
+  if (!applicationId || !privateKey) {
+    logger$2.warn("Vonage not configured (VONAGE_APPLICATION_ID / private key missing): video calls will show an unavailable page");
+    video = null;
+    return video;
+  }
+  video = new Video({ applicationId, privateKey });
+  return video;
+}
+function vonageConfigured() {
+  return getVideo() !== null;
+}
+async function startVideoCall(ticketId) {
+  const urls = callUrls(ticketId);
+  const client = getVideo();
+  const ticket = await getTicket(ticketId);
+  if (!client || !ticket) {
+    if (!ticket) logger$2.warn("start_video_call for unknown ticket", { ticketId });
+    return { ...urls, sessionId: ticket?.sessionId ?? null };
+  }
+  try {
+    let sessionId = ticket.sessionId;
+    if (!sessionId) {
+      const session = await client.createSession({ mediaMode: MediaMode.ROUTED });
+      sessionId = session.sessionId;
+      await updateTicket(ticketId, { sessionId });
+      logger$2.info("video session created", { ticketId, sessionId });
+    }
+    return {
+      ...urls,
+      sessionId,
+      patientToken: tokenFor(client, sessionId, "patient"),
+      nurseToken: tokenFor(client, sessionId, "nurse")
+    };
+  } catch (error) {
+    logger$2.error("could not create the video session", { ticketId, error: String(error) });
+    return { ...urls, sessionId: null };
+  }
+}
+function tokenFor(client, sessionId, role) {
+  return client.generateClientToken(sessionId, {
+    role: "publisher",
+    data: `role=${role}`,
+    expireTime: Math.floor(Date.now() / 1e3) + 2 * 60 * 60
+  });
+}
+async function callCredentials(ticketId, role) {
+  const client = getVideo();
+  if (!client) return { ok: false, reason: "La videollamada no est\xE1 configurada en este servidor." };
+  const ticket = await getTicket(ticketId);
+  if (!ticket) return { ok: false, reason: "Este enlace de videollamada no existe." };
+  let sessionId = ticket.sessionId;
+  if (!sessionId) {
+    const started = await startVideoCall(ticketId);
+    sessionId = started.sessionId;
+  }
+  if (!sessionId) return { ok: false, reason: "No se ha podido crear la sala de videollamada. Llama a la cl\xEDnica." };
+  return { ok: true, applicationId: process.env.VONAGE_APPLICATION_ID.trim(), sessionId, token: tokenFor(client, sessionId, role), role };
+}
+async function summarizeCall(_ticket) {
+  return null;
+}
 
 "use strict";
 const RENDER_CONTEXT_KEY = "__mastra_chat_channel_render";
 const NURSE_APPROVE = "nurse_approve";
 const NURSE_DENY = "nurse_deny";
+const NURSE_VIDEO = "nurse_video";
 const NOTIFY_NURSE_TOOL = "notify_nurse";
 function nurseChatId() {
   return process.env.NURSE_TELEGRAM_CHAT_ID?.trim() || void 0;
@@ -536,7 +692,8 @@ ${ticket.message}`),
 ${suggestedReply}`),
           Actions([
             Button({ id: NURSE_APPROVE, label: "Aprobar y enviar", value: ticket.id, style: "primary" }),
-            Button({ id: NURSE_DENY, label: "Rechazar y escribir", value: ticket.id, style: "danger" })
+            Button({ id: NURSE_DENY, label: "Rechazar y escribir", value: ticket.id, style: "danger" }),
+            Button({ id: NURSE_VIDEO, label: "\u{1F4F9} Videollamada", value: ticket.id })
           ])
         ]
       })
@@ -546,7 +703,8 @@ ${suggestedReply}`),
         [
           { text: "Aprobar y enviar", callback_data: callbackData(NURSE_APPROVE, ticket.id) },
           { text: "Rechazar y escribir", callback_data: callbackData(NURSE_DENY, ticket.id) }
-        ]
+        ],
+        [{ text: "\u{1F4F9} Videollamada", callback_data: callbackData(NURSE_VIDEO, ticket.id) }]
       ]
     })
   );
@@ -612,6 +770,9 @@ async function handleNurseDecision(agent, ticketId, approved, requestContext) {
     const text = await stream.text;
     if (approved) {
       await updateTicket(ticket.id, { status: "answered" });
+      await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: ticket.suggestedReply ?? "" }).catch(
+        (error) => logger$1.warn("could not write nurse note", { ticketId: ticket.id, error: String(error) })
+      );
       await clearOpenTicket(ticket);
     }
     return { outcome: "resumed", ticket, text, delivered };
@@ -634,12 +795,23 @@ async function postToPatient(agent, chatId, text) {
   const outcome = await postWithFallback(agent, chatId, "patient post", (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
   return outcome.posted;
 }
+async function startNurseVideoCall(agent, ticketId) {
+  const ticket = await getTicket(ticketId);
+  if (!ticket) return { ticket: null };
+  const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+  const name = ticket.patientName ? `${ticket.patientName}, tu` : "Tu";
+  const patientNotified = await postToPatient(agent, ticket.chatId, `${name} enfermera quiere verte por videollamada ahora. Entra aqu\xED desde el m\xF3vil o el ordenador: ${patientUrl}`);
+  return { ticket, nurseUrl, patientNotified };
+}
 async function forwardNurseReply(agent, text) {
   const ticket = await latestTicketByStatus("awaiting_nurse_reply");
   if (!ticket) return { ticket: null, delivered: false };
   const delivered = await postToPatient(agent, ticket.chatId, `${nurseReplyPrefix} ${text}`);
   if (!delivered) return { ticket, delivered: false };
   await updateTicket(ticket.id, { status: "answered", suggestedReply: text });
+  await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: text }).catch(
+    (error) => logger$1.warn("could not write nurse note", { ticketId: ticket.id, error: String(error) })
+  );
   await clearOpenTicket(ticket);
   return { ticket, delivered: true };
 }
@@ -772,28 +944,26 @@ const notifyNurseTool = createTool({
 });
 
 "use strict";
-async function createVideoCall(ticketId) {
-  return { url: `https://example.com/call/${encodeURIComponent(ticketId)}` };
-}
-
-"use strict";
 const startVideoCallTool = createTool({
   id: "start_video_call",
-  description: "Create a video call room between the nurse and the patient for an urgent case. Returns the link to send to the patient.",
+  description: "Open the nurse \u2194 patient video room for a ticket. Returns the two join links; send patientUrl to the patient.",
   inputSchema: z.object({ ticketId: z.string() }),
-  outputSchema: z.object({ url: z.string() }),
-  execute: async ({ ticketId }) => createVideoCall(ticketId)
+  outputSchema: z.object({ patientUrl: z.string(), nurseUrl: z.string() }),
+  execute: async ({ ticketId }) => {
+    const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+    return { patientUrl, nurseUrl };
+  }
 });
 
 "use strict";
-const BOT_NAME = process.env.BOT_NAME ?? "Lumi";
-const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
+const BOT_NAME$1 = process.env.BOT_NAME ?? "Lumi";
+const CLINIC_EMERGENCY_PHONE$2 = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
 const onboardingMessage = [
-  `\xA1Hola! Soy ${BOT_NAME}, una acompa\xF1ante para pacientes en tratamiento de FIV. Te ayudo con recordatorios de medicaci\xF3n, citas y dudas pr\xE1cticas, y paso cualquier consulta m\xE9dica a tu enfermera.`,
+  `\xA1Hola! Soy ${BOT_NAME$1}, una acompa\xF1ante para pacientes en tratamiento de FIV. Te ayudo con recordatorios de medicaci\xF3n, citas y dudas pr\xE1cticas, y paso cualquier consulta m\xE9dica a tu enfermera.`,
   `No sustituyo a tu equipo m\xE9dico. Si quieres probar con un caso de ejemplo, env\xEDa /demo.`
 ].join("\n\n");
-const fallbackReply = `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la cl\xEDnica: ${CLINIC_EMERGENCY_PHONE}.`;
-const baseInstructions = `You are ${BOT_NAME}, a companion for patients going through IVF treatment. You sit between the patient and the clinic on Telegram.
+const fallbackReply = `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la cl\xEDnica: ${CLINIC_EMERGENCY_PHONE$2}.`;
+const baseInstructions = `You are ${BOT_NAME$1}, a companion for patients going through IVF treatment. You sit between the patient and the clinic on Telegram.
 
 ## What you do
 - Answer routine and logistic questions (appointments, schedules, what to bring, how the process works in general terms) warmly and briefly.
@@ -809,6 +979,8 @@ const baseInstructions = `You are ${BOT_NAME}, a companion for patients going th
 - Update the record ONLY when the patient states a fact about their treatment in their own words (an appointment, their medication schedule, a symptom). Write exactly what they said.
 - Never fill in cycle, protocol or nextAppointment on your own. A new patient's record has only name and onboarded, and that is correct. Leave every other field absent until the patient states it or /demo loads it.
 - On greetings and small talk, do not touch the record at all.
+- nurseNotes holds what the nurse answered earlier (question, reply, date). When the patient asks what the nurse said, quote the latest matching reply as written, with its date. Never invent a nurse answer.
+- When the patient confirms a dose ("hecho", "ya me la he puesto"), acknowledge in one sentence; do not change the protocol.
 - If the record has openTicketId set, a nurse is already reviewing an open question. For thanks or small talk, reply briefly and say the nurse will answer soon; do not revisit the question yourself.
 
 ## The patient's name
@@ -846,7 +1018,7 @@ Call notify_nurse exactly once, with ticketId "${ticketId ?? ""}" and a suggeste
 After notify_nurse returns (approved or declined), the patient has already been told the outcome in a separate message. Reply with a single short sentence and no advice, for example "Aqu\xED sigo para lo que necesites."`;
     case "urgent":
       return `## This message
-Triage tier: URGENT. Ticket ${ticketId ?? "(already open)"} exists and the nurse has been alerted. Call start_video_call with ticketId "${ticketId ?? ""}" first, then reply. The reply must contain, in this order: the patient's name if known, one warm sentence acknowledging what they wrote, the sentence "Estoy avisando a tu enfermera ahora mismo", the video call link from the tool as the place where the nurse will see them now, and the clinic phone with its condition, for example "si el sangrado es abundante o no para, llama ya al ${CLINIC_EMERGENCY_PHONE}" (adapt the condition to the symptom). Four or five short sentences. No emojis. Do not ask the patient to describe more before giving the phone.`;
+Triage tier: URGENT. Ticket ${ticketId ?? "(already open)"} exists and the nurse has been alerted. Call start_video_call with ticketId "${ticketId ?? ""}" first, then reply. The reply must contain, in this order: the patient's name if known, one warm sentence acknowledging what they wrote, the sentence "Estoy avisando a tu enfermera ahora mismo", the video call link from the tool as the place where the nurse will see them now, and the clinic phone with its condition, for example "si el sangrado es abundante o no para, llama ya al ${CLINIC_EMERGENCY_PHONE$2}" (adapt the condition to the symptom). Four or five short sentences. No emojis. Do not ask the patient to describe more before giving the phone.`;
     case "logistic":
       return `## This message
 Triage tier: LOGISTIC. Answer from the record. If a field is missing, say you will check with the clinic.`;
@@ -855,7 +1027,7 @@ Triage tier: LOGISTIC. Answer from the record. If a field is missing, say you wi
 Triage tier: ROUTINE. Reply briefly and warmly. If the patient mentions a symptom in passing, call log_symptom.`;
     default:
       return `## This message
-No triage tier is attached. Classify it yourself with classify_message before answering. If the tier is clinical, open a ticket with create_ticket and then call notify_nurse. If it is urgent, open a ticket, call start_video_call and give the clinic phone ${CLINIC_EMERGENCY_PHONE} in the first sentence.`;
+No triage tier is attached. Classify it yourself with classify_message before answering. If the tier is clinical, open a ticket with create_ticket and then call notify_nurse. If it is urgent, open a ticket, call start_video_call and give the clinic phone ${CLINIC_EMERGENCY_PHONE$2} in the first sentence.`;
   }
 }
 const allTools = {
@@ -936,11 +1108,16 @@ async function prepareTurn(chatId, text, requestContext) {
   requestContext.set("ticketId", ticketId);
   const ticket = await getTicket(ticketId);
   if (tier === "urgent") {
-    const { url } = await createVideoCall(ticketId);
+    const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
+    await addNurseNote(chatId, {
+      ticketId,
+      question: text,
+      reply: `Caso urgente: se avis\xF3 a la enfermera, se abri\xF3 videollamada (${patientUrl}) y se dio el tel\xE9fono de la cl\xEDnica ${CLINIC_EMERGENCY_PHONE$2}.`
+    }).catch(() => void 0);
     if (ticket) {
-      void postNurseAlert(companion, ticket).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
+      void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
     }
-    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, url) };
+    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, patientUrl) };
   }
   return { tier, reason, ticketId, ticket, ack: clinicalAck(patient?.name) };
 }
@@ -948,7 +1125,7 @@ function urgentReply(name, videoUrl) {
   return [
     `${name ? `${name}, gracias` : "Gracias"} por cont\xE1rmelo; te leo y no est\xE1s sola en esto.`,
     `Estoy avisando a tu enfermera ahora mismo y te va a atender por videollamada en este enlace: ${videoUrl}`,
-    `Si empeora, no mejora o no puedes esperar, llama ya a la cl\xEDnica al ${CLINIC_EMERGENCY_PHONE}.`
+    `Si empeora, no mejora o no puedes esperar, llama ya a la cl\xEDnica al ${CLINIC_EMERGENCY_PHONE$2}.`
   ].join("\n");
 }
 class TierToolChoiceProcessor {
@@ -1051,9 +1228,10 @@ const onDirectMessage = async (thread, message, defaultHandler, ctx) => {
 };
 function parseNurseAction(actionId, value) {
   const [id, rest] = actionId.includes(":") ? [actionId.slice(0, actionId.indexOf(":")), actionId.slice(actionId.indexOf(":") + 1)] : [actionId, void 0];
-  if (id !== NURSE_APPROVE && id !== NURSE_DENY) return null;
+  const kind = id === NURSE_APPROVE ? "approve" : id === NURSE_DENY ? "deny" : id === NURSE_VIDEO ? "video" : null;
+  if (!kind) return null;
   const ticketId = (value && value !== actionId ? value : rest) ?? "";
-  return { approved: id === NURSE_APPROVE, ticketId };
+  return { kind, ticketId };
 }
 const onAction = async (event, defaultHandler, ctx) => {
   const logger = ctx.mastra?.getLogger();
@@ -1063,8 +1241,20 @@ const onAction = async (event, defaultHandler, ctx) => {
     await defaultHandler();
     return;
   }
-  const { approved, ticketId } = parsed;
+  const { kind, ticketId } = parsed;
+  const approved = kind === "approve";
   const reply = (t) => event.thread?.post(t).catch(() => void 0);
+  if (kind === "video") {
+    try {
+      const { ticket, nurseUrl, patientNotified } = await startNurseVideoCall(companion, ticketId);
+      if (!ticket) await reply(`No encuentro el ticket ${ticketId}.`);
+      else await reply(`${patientNotified ? "Le he enviado el enlace a" : "No he podido avisar a"} ${ticket.patientName ?? "la paciente"}. Tu enlace: ${nurseUrl}`);
+    } catch (error) {
+      logger?.error("video call start failed", { ticketId, error });
+      await reply(`No he podido abrir la videollamada del ticket ${ticketId}.`);
+    }
+    return;
+  }
   try {
     const result = await handleNurseDecision(companion, ticketId, approved, ctx.requestContext);
     switch (result.outcome) {
@@ -1093,7 +1283,7 @@ function telegramMode() {
 const mainCallProcessor = new NebiusCallProcessor("main");
 const companion = new Agent({
   id: "companion",
-  name: BOT_NAME,
+  name: BOT_NAME$1,
   instructions: ({ requestContext }) => `${baseInstructions}
 
 ${tierInstructions(readTier(requestContext), readTicketId(requestContext), readNurseDecision(requestContext))}`,
@@ -1125,6 +1315,198 @@ ${tierInstructions(readTier(requestContext), readTicketId(requestContext), readN
 setNurseAgent(companion);
 
 "use strict";
+const BOT_NAME = process.env.BOT_NAME ?? "Lumi";
+const CLINIC_EMERGENCY_PHONE$1 = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
+function roleFrom(value) {
+  return value === "nurse" ? "nurse" : "patient";
+}
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c);
+}
+function callPage(ticketId, role) {
+  const you = role === "nurse" ? "Enfermera" : "Paciente";
+  const other = role === "nurse" ? "la paciente" : "tu enfermera";
+  return `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Videollamada \xB7 ${escapeHtml(BOT_NAME)}</title>
+<script src="https://video.standard.vonage.com/v2/js/opentok.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0f1418; color: #eef2f4; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0); }
+  header { padding: 12px 16px; font-size: 14px; color: #a9b4bb; display: flex; justify-content: space-between; align-items: center; }
+  header strong { color: #eef2f4; }
+  main { position: relative; flex: 1; min-height: 0; margin: 0 12px; border-radius: 14px; overflow: hidden; background: #000; }
+  #remote, #remote > * { width: 100%; height: 100%; }
+  #local { position: absolute; right: 12px; top: 12px; width: 30%; max-width: 160px; aspect-ratio: 3 / 4; border-radius: 10px; overflow: hidden; background: #1c2429; border: 2px solid rgba(255,255,255,.25); }
+  #local > * { width: 100% !important; height: 100% !important; }
+  #status { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 16px; font-size: 15px; text-align: center; background: linear-gradient(transparent, rgba(0,0,0,.75)); }
+  #status.error { background: #7a1f1f; font-weight: 600; }
+  footer { padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0)); display: flex; gap: 12px; justify-content: center; }
+  button { font: inherit; font-size: 18px; font-weight: 700; padding: 16px 28px; border: 0; border-radius: 999px; cursor: pointer; min-width: 44%; }
+  #hangup { background: #d63a3a; color: #fff; }
+  #retry { background: #2b3a44; color: #fff; display: none; }
+  .ended main { display: none; }
+  .ended #done { display: block; }
+  #done { display: none; flex: 1; align-items: center; justify-content: center; text-align: center; padding: 24px; font-size: 20px; line-height: 1.4; }
+  .ended #done { display: flex; }
+</style>
+</head>
+<body>
+<header><span>${you} \xB7 ticket <strong>${escapeHtml(ticketId)}</strong></span><span id="peer">Esperando a ${other}\u2026</span></header>
+<main>
+  <div id="remote"></div>
+  <div id="local"></div>
+  <div id="status">Conectando\u2026</div>
+</main>
+<div id="done">Llamada finalizada.<br>Puedes cerrar esta pesta\xF1a.</div>
+<footer>
+  <button id="retry">Reintentar</button>
+  <button id="hangup">Colgar</button>
+</footer>
+<script>
+(function () {
+  var ticketId = ${JSON.stringify(ticketId)};
+  var role = ${JSON.stringify(role)};
+  var statusEl = document.getElementById('status');
+  var peerEl = document.getElementById('peer');
+  var hangupBtn = document.getElementById('hangup');
+  var retryBtn = document.getElementById('retry');
+  var session = null, publisher = null, ended = false;
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+    retryBtn.style.display = isError ? 'inline-block' : 'none';
+  }
+
+  function explain(err) {
+    var name = (err && err.name) || '';
+    if (/NotAllowed|Permission|OT_USER_MEDIA_ACCESS_DENIED/i.test(name) || /denied|permission/i.test(String(err && err.message)))
+      return 'No tenemos permiso para usar la c\xE1mara y el micr\xF3fono. Acepta el permiso en el navegador y pulsa Reintentar.';
+    if (/NotFound|OT_NO_DEVICES_FOUND/i.test(name)) return 'No se ha encontrado c\xE1mara o micr\xF3fono en este dispositivo.';
+    if (/NotReadable|OT_HARDWARE_UNAVAILABLE/i.test(name)) return 'Otra aplicaci\xF3n est\xE1 usando la c\xE1mara. Ci\xE9rrala y pulsa Reintentar.';
+    return 'No se ha podido conectar: ' + ((err && err.message) || String(err)) + '. Si no funciona, llama a la cl\xEDnica al ${CLINIC_EMERGENCY_PHONE$1}.';
+  }
+
+  async function start() {
+    setStatus('Conectando\u2026', false);
+    if (!window.OT) { setStatus('No se ha podido cargar el m\xF3dulo de v\xEDdeo. Comprueba la conexi\xF3n y pulsa Reintentar.', true); return; }
+    var creds;
+    try {
+      var res = await fetch('/call/' + encodeURIComponent(ticketId) + '/credentials?role=' + role);
+      creds = await res.json();
+      if (!res.ok || !creds.ok) { setStatus(creds.reason || 'Videollamada no disponible.', true); return; }
+    } catch (e) { setStatus(explain(e), true); return; }
+
+    session = OT.initSession(creds.applicationId, creds.sessionId);
+    session.on('streamCreated', function (event) {
+      session.subscribe(event.stream, 'remote', { insertMode: 'replace', width: '100%', height: '100%' }, function (err) {
+        if (err) setStatus(explain(err), true);
+      });
+      peerEl.textContent = 'En llamada';
+      setStatus('', false);
+    });
+    session.on('streamDestroyed', function () { peerEl.textContent = 'Esperando a ${other}\u2026'; });
+    session.on('sessionDisconnected', function () { if (!ended) setStatus('Desconectado de la llamada.', true); });
+
+    publisher = OT.initPublisher('local', { insertMode: 'replace', width: '100%', height: '100%', publishAudio: true, publishVideo: true, name: role }, function (err) {
+      if (err) setStatus(explain(err), true);
+    });
+    publisher.on('accessDenied', function () { setStatus(explain({ name: 'NotAllowedError' }), true); });
+
+    session.connect(creds.token, function (err) {
+      if (err) { setStatus(explain(err), true); return; }
+      session.publish(publisher, function (pubErr) {
+        if (pubErr) setStatus(explain(pubErr), true);
+        else setStatus('Conectado. Esperando a ${other}\u2026', false);
+      });
+    });
+  }
+
+  async function hangup() {
+    if (ended) return;
+    ended = true;
+    try { if (publisher) publisher.destroy(); } catch (e) {}
+    try { if (session) session.disconnect(); } catch (e) {}
+    document.body.classList.add('ended');
+    try {
+      await fetch('/call/' + encodeURIComponent(ticketId) + '/ended', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ role: role }), keepalive: true });
+    } catch (e) {}
+  }
+
+  hangupBtn.addEventListener('click', hangup);
+  retryBtn.addEventListener('click', function () { try { if (session) session.disconnect(); } catch (e) {} start(); });
+  window.addEventListener('pagehide', function () {
+    if (ended) return;
+    try { navigator.sendBeacon('/call/' + encodeURIComponent(ticketId) + '/ended', new Blob([JSON.stringify({ role: role, reason: 'pagehide' })], { type: 'application/json' })); } catch (e) {}
+  });
+  start();
+})();
+</script>
+</body>
+</html>`;
+}
+const callPageRoute = registerApiRoute("/call/:ticketId", {
+  method: "GET",
+  handler: async (c) => {
+    const ticketId = c.req.param("ticketId");
+    const role = roleFrom(c.req.query("role"));
+    return c.html(callPage(ticketId, role));
+  }
+});
+const callCredentialsRoute = registerApiRoute("/call/:ticketId/credentials", {
+  method: "GET",
+  handler: async (c) => {
+    const ticketId = c.req.param("ticketId");
+    const role = roleFrom(c.req.query("role"));
+    try {
+      const creds = await callCredentials(ticketId, role);
+      return c.json(creds, creds.ok ? 200 : 503);
+    } catch (error) {
+      c.get("mastra").getLogger().error("call credentials failed", { ticketId, role, error });
+      return c.json({ ok: false, reason: "No se ha podido preparar la videollamada." }, 500);
+    }
+  }
+});
+const callEndedRoute = registerApiRoute("/call/:ticketId/ended", {
+  method: "POST",
+  handler: async (c) => {
+    const ticketId = c.req.param("ticketId");
+    const logger = c.get("mastra").getLogger();
+    const ticket = await getTicket(ticketId);
+    if (!ticket) return c.json({ ok: false, reason: "ticket not found" }, 404);
+    if (ticket.callEndedAt) return c.json({ ok: true, already: true });
+    const endedAt = /* @__PURE__ */ new Date();
+    await updateTicket(ticketId, { callEndedAt: endedAt.toISOString(), status: "closed" });
+    const when = new Intl.DateTimeFormat("es-ES", { timeZone: process.env.REMINDER_TIMEZONE || "Europe/Madrid", dateStyle: "long", timeStyle: "short" }).format(endedAt);
+    const summary = await summarizeCall(ticket).catch(() => null);
+    await addNurseNote(ticket.chatId, {
+      ticketId,
+      question: ticket.message,
+      reply: summary ? `Videollamada con tu enfermera el ${when}. Resumen: ${summary}` : `Videollamada con tu enfermera el ${when}.`
+    }).catch((error) => logger.warn("could not write call note", { ticketId, error: String(error) }));
+    const agent = c.get("mastra").getAgent("companion");
+    const notified = await postToPatient(agent, ticket.chatId, "Llamada finalizada. Si necesitas algo m\xE1s, aqu\xED estoy.");
+    await notifyMake("call.ended", {
+      ticketId: ticket.id,
+      chatId: ticket.chatId,
+      patientName: ticket.patientName ?? "",
+      tier: ticket.tier,
+      message: ticket.message,
+      contextSummary: summary ?? ticket.contextSummary ?? "",
+      createdAt: ticket.createdAt
+    });
+    logger.info("video call ended", { ticketId, notified });
+    return c.json({ ok: true, notified });
+  }
+});
+
+"use strict";
 const nurseDecisionRoute = registerApiRoute("/demo/nurse-decision", {
   method: "POST",
   handler: async (c) => {
@@ -1154,6 +1536,111 @@ const nurseCardRoute = registerApiRoute("/demo/nurse-card", {
     return c.json({ ticketId: ticket.id, ...outcome });
   }
 });
+const reminderRoute = registerApiRoute("/demo/reminder", {
+  method: "POST",
+  handler: async (c) => {
+    const chatId = c.req.query("chatId")?.trim();
+    const kindParam = c.req.query("kind") ?? "medication";
+    const kind = kindParam === "followup" || kindParam === "tick" ? kindParam : "medication";
+    if (kind !== "tick" && !chatId) return c.json({ error: "chatId query parameter is required" }, 400);
+    const run = await c.get("mastra").getWorkflow("reminders").createRun();
+    const result = await run.start({ inputData: { kind, chatId } });
+    return c.json(result.status === "success" ? { kind, chatId: chatId ?? null, ...result.result } : { kind, chatId: chatId ?? null, status: result.status });
+  }
+});
+
+"use strict";
+const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
+const TIMEZONE = process.env.REMINDER_TIMEZONE || "Europe/Madrid";
+const FOLLOW_UP_AFTER_MS = 24 * 60 * 60 * 1e3;
+const reminderInput = z.object({
+  // 'tick' is what the schedule sends every minute; the other two are manual triggers.
+  kind: z.enum(["tick", "medication", "followup"]).default("tick"),
+  chatId: z.string().optional()
+});
+const reminderOutput = z.object({
+  sent: z.number(),
+  details: z.array(z.string())
+});
+function clinicClock(now) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(now);
+  const get = (type) => parts.find((p) => p.type === type)?.value ?? "";
+  return { day: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
+}
+function medicationText(patient, item) {
+  return `\u{1F489} ${patient.name ? `${patient.name}, r` : "R"}ecordatorio: ${item.drug} ${item.dose} a las ${item.time}. Cuando te la pongas, escr\xEDbeme \xABhecho\xBB y lo anoto.`;
+}
+function followUpText(patient, ticket) {
+  const name = patient?.name ? `${patient.name}, ` : "";
+  const about = ticket ? ` Ayer avisamos a tu enfermera por lo que me contaste (\xAB${ticket.message.slice(0, 80)}\xBB).` : "";
+  return `\u{1F469}\u200D\u2695\uFE0F ${name}\xBFc\xF3mo est\xE1s hoy?${about} Si algo ha empeorado o no mejora, llama a la cl\xEDnica al ${CLINIC_EMERGENCY_PHONE}.`;
+}
+async function loadPatients() {
+  const rows = await listPatientRecords();
+  return rows.flatMap(({ chatId, workingMemory }) => {
+    const patient = parsePatient(workingMemory);
+    return patient ? [{ chatId, patient }] : [];
+  });
+}
+const dispatch = createStep({
+  id: "dispatch-reminders",
+  inputSchema: reminderInput,
+  outputSchema: reminderOutput,
+  execute: async ({ inputData, mastra }) => {
+    const logger = mastra?.getLogger();
+    const details = [];
+    const now = /* @__PURE__ */ new Date();
+    const { day, hhmm } = clinicClock(now);
+    const send = async (chatId, text, label) => {
+      const posted = await postToPatient(companion, chatId, text);
+      details.push(`${label} \u2192 ${chatId}: ${posted ? "sent" : "NOT sent"}`);
+      logger?.info("reminder", { label, chatId, posted });
+      return posted ? 1 : 0;
+    };
+    let sent = 0;
+    if (inputData.kind === "medication" && inputData.chatId) {
+      const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient;
+      if (!patient?.protocol.length) return { sent, details: [`no protocol on record for ${inputData.chatId}`] };
+      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`);
+      return { sent, details };
+    }
+    if (inputData.kind === "followup" && inputData.chatId) {
+      const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient ?? null;
+      const ticket = await latestUrgentTicketForChat(inputData.chatId);
+      sent += await send(inputData.chatId, followUpText(patient, ticket), "follow-up");
+      if (ticket) await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
+      return { sent, details };
+    }
+    for (const { chatId, patient } of await loadPatients()) {
+      for (const item of patient.protocol) {
+        if (item.time !== hhmm) continue;
+        if (!await claimReminderSlot(chatId, day, item.time)) continue;
+        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`);
+      }
+    }
+    const patients = await loadPatients();
+    for (const ticket of await urgentTicketsDueForFollowUp(new Date(now.getTime() - FOLLOW_UP_AFTER_MS))) {
+      const patient = patients.find((p) => p.chatId === ticket.chatId)?.patient ?? null;
+      await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
+      sent += await send(ticket.chatId, followUpText(patient, ticket), `follow-up ${ticket.id}`);
+    }
+    return { sent, details };
+  }
+});
+const remindersWorkflow = createWorkflow({
+  id: "reminders",
+  inputSchema: reminderInput,
+  outputSchema: reminderOutput,
+  schedule: { cron: "* * * * *", timezone: TIMEZONE, inputData: { kind: "tick" } }
+}).then(dispatch).commit();
 
 "use strict";
 const evalMessageRoute = registerApiRoute("/eval/message", {
@@ -1199,13 +1686,16 @@ const mastra = new Mastra({
   agents: {
     companion
   },
+  workflows: {
+    reminders: remindersWorkflow
+  },
   storage,
   logger: new PinoLogger({
     name: "ivf-companion",
     level: "info"
   }),
   server: {
-    apiRoutes: [evalMessageRoute, nurseDecisionRoute, nurseCardRoute]
+    apiRoutes: [evalMessageRoute, nurseDecisionRoute, nurseCardRoute, reminderRoute, callPageRoute, callCredentialsRoute, callEndedRoute]
   }
 });
 

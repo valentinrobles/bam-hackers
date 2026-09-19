@@ -36,3 +36,17 @@ export const nurseCardRoute = registerApiRoute('/demo/nurse-card', {
     return c.json({ ticketId: ticket.id, ...outcome });
   },
 });
+
+// POST /demo/reminder?chatId=…&kind=medication|followup|tick
+export const reminderRoute = registerApiRoute('/demo/reminder', {
+  method: 'POST',
+  handler: async (c) => {
+    const chatId = c.req.query('chatId')?.trim();
+    const kindParam = c.req.query('kind') ?? 'medication';
+    const kind = kindParam === 'followup' || kindParam === 'tick' ? kindParam : 'medication';
+    if (kind !== 'tick' && !chatId) return c.json({ error: 'chatId query parameter is required' }, 400);
+    const run = await c.get('mastra').getWorkflow('reminders').createRun();
+    const result = await run.start({ inputData: { kind, chatId } });
+    return c.json(result.status === 'success' ? { kind, chatId: chatId ?? null, ...result.result } : { kind, chatId: chatId ?? null, status: result.status });
+  },
+});

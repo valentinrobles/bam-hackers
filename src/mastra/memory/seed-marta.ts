@@ -29,5 +29,6 @@ export function martaPatient(now = new Date()): Patient {
     nextAppointment: { type: 'ecografía de control', datetime: `${spanishDate(nextWeekday(now, 4))}, 10:00` },
     symptoms: [],
     openTicketId: null,
+    nurseNotes: [],
   };
 }

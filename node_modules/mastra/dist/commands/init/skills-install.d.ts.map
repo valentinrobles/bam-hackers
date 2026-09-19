@@ -1,0 +1,1 @@
+{"version":3,"file":"skills-install.d.ts","sourceRoot":"","sources":["../../../src/commands/init/skills-install.ts"],"names":[],"mappings":"AAEA,wBAAsB,mBAAmB,CAAC,EACxC,SAAS,EACT,MAAM,GACP,EAAE;IACD,SAAS,EAAE,MAAM,CAAC;IAClB,MAAM,EAAE,MAAM,EAAE,CAAC;CAClB,GAAG,OAAO,CAAC;IAAE,OAAO,EAAE,OAAO,CAAC;IAAC,KAAK,CAAC,EAAE,MAAM,CAAC;IAAC,MAAM,EAAE,MAAM,EAAE,CAAA;CAAE,CAAC,CAkBlE"}

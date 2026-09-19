@@ -1,0 +1,2 @@
+export declare function listAllScorers(): void;
+//# sourceMappingURL=list-all-scorers.d.ts.map

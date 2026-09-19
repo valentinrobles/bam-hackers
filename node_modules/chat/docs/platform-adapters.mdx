@@ -1,0 +1,101 @@
+---
+title: Platform Adapters
+description: Platform-specific adapters that connect your bot to any messaging platform.
+type: overview
+prerequisites:
+  - /docs/getting-started
+  - /docs/adapters
+---
+
+Platform adapters handle webhook verification, message parsing, and API calls for each messaging platform. Install only the adapters you need. Browse all available adapters, including community-built ones, on the [Adapters](/adapters) page.
+
+Need a browser chat UI? See the [Web adapter](/adapters/official/web). It speaks the AI SDK UI stream protocol and works with React (`@ai-sdk/react`), Vue (`@ai-sdk/vue`), and Svelte (`@ai-sdk/svelte`), so the same bot serves Slack, Teams, and any browser framework out of the box.
+
+## Feature matrix
+
+This matrix covers Vercel-maintained [official adapters](/adapters) only. For vendor-official and community adapters, see each adapter's page.
+
+<GlobalFeatureMatrix type="platform" />
+
+<Callout type="info">
+  Partial support means the feature works with limitations. See individual adapter pages for details.
+</Callout>
+
+## How adapters work
+
+Each adapter implements a standard interface that the `Chat` class uses to route events and send messages. When a webhook arrives:
+
+1. The adapter verifies the request signature
+2. Parses the platform-specific payload into a normalized `Message`
+3. Routes to your handlers via the `Chat` class
+4. Converts outgoing messages from markdown/AST/cards to the platform's native format
+
+## Using multiple adapters
+
+Register multiple [adapters](/adapters) and your event handlers work across all of them:
+
+```typescript title="lib/bot.ts" lineNumbers
+import { Chat } from "chat";
+import { createSlackAdapter } from "@chat-adapter/slack";
+import { createTeamsAdapter } from "@chat-adapter/teams";
+import { createGoogleChatAdapter } from "@chat-adapter/gchat";
+import { createRedisState } from "@chat-adapter/state-redis";
+
+const bot = new Chat({
+  userName: "mybot",
+  adapters: {
+    slack: createSlackAdapter(),
+    teams: createTeamsAdapter(),
+    gchat: createGoogleChatAdapter(),
+  },
+  state: createRedisState(),
+});
+
+// This handler fires for mentions on any platform
+bot.onNewMention(async (thread) => {
+  await thread.subscribe();
+  await thread.post("Hello!");
+});
+```
+
+Each adapter auto-detects credentials from environment variables, so you only need to pass config when overriding defaults.
+
+<Callout type="info">
+  The examples above use Redis for state. See [State Adapters](/docs/state-adapters) for all available options.
+</Callout>
+
+Each adapter creates a webhook handler accessible via `bot.webhooks.<name>`.
+
+## Customizing an adapter via subclassing
+
+Each official adapter exposes its extension surface as `protected` members so you can subclass it to override or extend platform-specific behavior without forking the package. Use this when you need to handle a payload type the built-in adapter doesn't cover, intercept verification, or wrap an existing handler.
+
+```typescript title="lib/custom-telegram.ts" lineNumbers
+import { TelegramAdapter, type TelegramUpdate } from "@chat-adapter/telegram";
+import type { WebhookOptions } from "chat";
+
+export class CustomTelegramAdapter extends TelegramAdapter {
+  protected override processUpdate(
+    update: TelegramUpdate,
+    options?: WebhookOptions
+  ): void {
+    // Handle a payload type the base adapter doesn't, e.g. chat_join_request.
+    if ("chat_join_request" in update) {
+      this.logger.info("Received chat_join_request", { update });
+      return;
+    }
+    super.processUpdate(update, options);
+  }
+}
+```
+
+Construct your subclass anywhere you'd construct the base adapter, for example, `adapters: { telegram: new CustomTelegramAdapter({ ... }) }`. Members marked `private` intentionally remain inaccessible. If you find a hook you need that isn't `protected`, please open an issue.
+
+<Callout type="warn">
+  The `protected` extension surface is intentionally broader than the public API but is not yet considered fully stable. Method signatures may evolve in minor releases as we learn from real-world subclasses. Pin the adapter version you build against, watch the changelog for the affected adapter, and prefer overriding the smallest hook that solves your problem so upgrades stay easy. If you rely on a particular hook, please open an issue so we can promote it to a stable, documented extension point.
+</Callout>
+
+<Cards>
+  <Card title="Build an adapter" description="Implement the Adapter interface for any messaging platform." href="/docs/contributing/building" />
+  <Card title="List a vendor-official adapter" description="How platform vendors qualify and list a maintained adapter in the Vendor Official tier." href="/docs/contributing/vendor-official" />
+</Cards>

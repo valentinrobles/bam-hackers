@@ -1,0 +1,3 @@
+import type { ApiCommandDescriptor } from './types.js';
+export declare function normalizeData(descriptor: ApiCommandDescriptor, data: unknown): unknown;
+//# sourceMappingURL=normalizers.d.ts.map

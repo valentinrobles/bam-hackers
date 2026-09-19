@@ -1,0 +1,1 @@
+{"version":3,"file":"build.d.ts","sourceRoot":"","sources":["../../../src/commands/worker/build.ts"],"names":[],"mappings":"AAKA,wBAAsB,WAAW,CAAC,EAChC,GAAG,EACH,IAAI,EACJ,KAAK,EACL,SAAS,EACT,KAAK,GACN,EAAE;IACD,GAAG,CAAC,EAAE,MAAM,CAAC;IACb,IAAI,CAAC,EAAE,MAAM,CAAC;IACd,KAAK,CAAC,EAAE,MAAM,CAAC;IACf,SAAS,CAAC,EAAE,MAAM,CAAC;IACnB,KAAK,CAAC,EAAE,OAAO,CAAC;CACjB,iBAyDA"}

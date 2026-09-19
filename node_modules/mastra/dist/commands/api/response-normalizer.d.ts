@@ -1,0 +1,2 @@
+export declare function normalizeResponse(value: unknown, key?: string, isSchemaMetadata?: boolean): unknown;
+//# sourceMappingURL=response-normalizer.d.ts.map

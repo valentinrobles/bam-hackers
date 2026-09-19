@@ -1,0 +1,4 @@
+import type { ScorerTemplate } from './types.js';
+export declare function selectScorer(): Promise<ScorerTemplate[] | null>;
+export declare function addNewScorer(scorerId?: string, customDir?: string): Promise<void>;
+//# sourceMappingURL=add-new-scorer.d.ts.map

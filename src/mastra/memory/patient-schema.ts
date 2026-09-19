@@ -31,6 +31,10 @@ export const patientSchema = z.object({
     .describe('Symptoms the patient reported, appended over time.'),
   openTicketId: z.string().nullable().default(null),
   treatmentSummary: z.string().optional().describe('Free-text summary of past treatment attempts. Read-only context for the agent.'),
+  dosesTaken: z
+    .array(z.object({ date: z.string(), drug: z.string(), dose: z.string(), time: z.string() }))
+    .default([])
+    .describe('Doses the patient confirmed taking (button "Ya me la puse" or a confirmation message).'),
   nurseNotes: z
     .array(z.object({ date: z.string(), ticketId: z.string(), question: z.string(), reply: z.string() }))
     .default([])

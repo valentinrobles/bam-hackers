@@ -1,5 +1,6 @@
 import { RequestContext } from '@mastra/core/request-context';
 import { registerApiRoute } from '@mastra/core/server';
+import { runDemoReset, runDemoSeed } from '../agents/companion';
 import { handleNurseDecision, postNurseApprovalCard } from '../services/nurse';
 import { getTicket } from '../services/tickets';
 
@@ -48,5 +49,37 @@ export const reminderRoute = registerApiRoute('/demo/reminder', {
     const run = await c.get('mastra').getWorkflow('reminders').createRun();
     const result = await run.start({ inputData: { kind, chatId } });
     return c.json(result.status === 'success' ? { kind, chatId: chatId ?? null, ...result.result } : { kind, chatId: chatId ?? null, status: result.status });
+  },
+});
+
+// POST /demo/followup?chatId=… fires the 24 h follow-up now.
+export const followupRoute = registerApiRoute('/demo/followup', {
+  method: 'POST',
+  handler: async (c) => {
+    const chatId = c.req.query('chatId')?.trim();
+    if (!chatId) return c.json({ error: 'chatId query parameter is required' }, 400);
+    const run = await c.get('mastra').getWorkflow('reminders').createRun();
+    const result = await run.start({ inputData: { kind: 'followup', chatId } });
+    return c.json(result.status === 'success' ? { kind: 'followup', chatId, ...result.result } : { kind: 'followup', chatId, status: result.status });
+  },
+});
+
+// POST /demo/seed?chatId=… does what /demo does in Telegram (Marta + first reminder).
+export const demoSeedRoute = registerApiRoute('/demo/seed', {
+  method: 'POST',
+  handler: async (c) => {
+    const chatId = c.req.query('chatId')?.trim();
+    if (!chatId) return c.json({ error: 'chatId query parameter is required' }, 400);
+    return c.json({ chatId, ...(await runDemoSeed(chatId)) });
+  },
+});
+
+// POST /demo/reset?chatId=… wipes the chat's record and cancels its pending sends.
+export const demoResetRoute = registerApiRoute('/demo/reset', {
+  method: 'POST',
+  handler: async (c) => {
+    const chatId = c.req.query('chatId')?.trim();
+    if (!chatId) return c.json({ error: 'chatId query parameter is required' }, 400);
+    return c.json({ chatId, ...(await runDemoReset(chatId)) });
   },
 });

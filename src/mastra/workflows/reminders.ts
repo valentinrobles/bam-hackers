@@ -2,12 +2,21 @@ import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { companion } from '../agents/companion';
 import { parsePatient, type Patient } from '../memory/patient-schema';
-import { postToPatient } from '../services/nurse';
-import { claimReminderSlot, latestUrgentTicketForChat, listPatientRecords, updateTicket, urgentTicketsDueForFollowUp, type Ticket } from '../services/tickets';
+import { DOSE_QUESTION, DOSE_TAKEN, postToPatient } from '../services/nurse';
+import {
+  claimReminderSlot,
+  claimScheduledSend,
+  dueScheduledSends,
+  getTicket,
+  latestUrgentTicketForChat,
+  listPatientRecords,
+  pendingScheduledSendsForChat,
+  updateTicket,
+  type Ticket,
+} from '../services/tickets';
 
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
 const TIMEZONE = process.env.REMINDER_TIMEZONE || 'Europe/Madrid';
-const FOLLOW_UP_AFTER_MS = 24 * 60 * 60 * 1000;
 
 export const reminderInput = z.object({
   // 'tick' is what the schedule sends every minute; the other two are manual triggers.
@@ -35,7 +44,20 @@ function clinicClock(now: Date): { day: string; hhmm: string } {
 }
 
 function medicationText(patient: Patient, item: Patient['protocol'][number]): string {
-  return `💉 ${patient.name ? `${patient.name}, r` : 'R'}ecordatorio: ${item.drug} ${item.dose} a las ${item.time}. Cuando te la pongas, escríbeme «hecho» y lo anoto.`;
+  return `💉 ${patient.name ? `${patient.name}, toca` : 'Toca'} ${item.drug} ${item.dose} (${item.time}).`;
+}
+
+// First message the judge sees after /demo, before any setup.
+function demoReminderText(patient: Patient, item: Patient['protocol'][number]): string {
+  return `💉 ${patient.name ? `${patient.name}, toca` : 'Toca'} ${item.drug} ${item.dose}. Te avisaré cada día a las ${item.time}.`;
+}
+
+function medicationButtons(item: Patient['protocol'][number]) {
+  // value = protocol time slot; the handler looks the entry up in the record.
+  return [
+    { actionId: DOSE_TAKEN, label: 'Ya me la puse', value: item.time },
+    { actionId: DOSE_QUESTION, label: 'Tengo una duda', value: item.time },
+  ];
 }
 
 function followUpText(patient: Patient | null, ticket: Ticket | null): string {
@@ -61,8 +83,8 @@ const dispatch = createStep({
     const details: string[] = [];
     const now = new Date();
     const { day, hhmm } = clinicClock(now);
-    const send = async (chatId: string, text: string, label: string) => {
-      const posted = await postToPatient(companion, chatId, text);
+    const send = async (chatId: string, text: string, label: string, buttons?: ReturnType<typeof medicationButtons>) => {
+      const posted = await postToPatient(companion, chatId, text, buttons);
       details.push(`${label} → ${chatId}: ${posted ? 'sent' : 'NOT sent'}`);
       logger?.info('reminder', { label, chatId, posted });
       return posted ? 1 : 0;
@@ -72,13 +94,16 @@ const dispatch = createStep({
     if (inputData.kind === 'medication' && inputData.chatId) {
       const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient;
       if (!patient?.protocol.length) return { sent, details: [`no protocol on record for ${inputData.chatId}`] };
-      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`);
+      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
       return { sent, details };
     }
 
     if (inputData.kind === 'followup' && inputData.chatId) {
+      // Fire the pending scheduled follow-up now; if none is pending, send one anyway.
       const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient ?? null;
-      const ticket = await latestUrgentTicketForChat(inputData.chatId);
+      const pending = await pendingScheduledSendsForChat(inputData.chatId, 'followup');
+      const ticket = pending[0]?.ticketId ? await getTicket(pending[0].ticketId) : await latestUrgentTicketForChat(inputData.chatId);
+      for (const row of pending) await claimScheduledSend(row.id);
       sent += await send(inputData.chatId, followUpText(patient, ticket), 'follow-up');
       if (ticket) await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
       return { sent, details };
@@ -89,15 +114,26 @@ const dispatch = createStep({
       for (const item of patient.protocol) {
         if (item.time !== hhmm) continue;
         if (!(await claimReminderSlot(chatId, day, item.time))) continue;
-        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`);
+        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
       }
     }
-    // Urgent tickets older than 24 h without a follow-up.
+    // Scheduled sends that are due (follow-ups planned when an urgent ticket was created).
     const patients = await loadPatients();
-    for (const ticket of await urgentTicketsDueForFollowUp(new Date(now.getTime() - FOLLOW_UP_AFTER_MS))) {
-      const patient = patients.find((p) => p.chatId === ticket.chatId)?.patient ?? null;
-      await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
-      sent += await send(ticket.chatId, followUpText(patient, ticket), `follow-up ${ticket.id}`);
+    for (const row of await dueScheduledSends(now)) {
+      if (!(await claimScheduledSend(row.id))) continue;
+      const patient = patients.find((p) => p.chatId === row.chatId)?.patient ?? null;
+      if (row.kind === 'demo_reminder') {
+        const item = patient?.protocol[0];
+        if (!patient || !item) {
+          details.push(`demo reminder ${row.id}: no protocol on record, skipped`);
+          continue;
+        }
+        sent += await send(row.chatId, demoReminderText(patient, item), `demo reminder ${row.id}`, medicationButtons(item));
+        continue;
+      }
+      const ticket = row.ticketId ? await getTicket(row.ticketId) : null;
+      if (ticket) await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
+      sent += await send(row.chatId, followUpText(patient, ticket), `follow-up ${row.id}`);
     }
     return { sent, details };
   },

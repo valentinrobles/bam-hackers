@@ -66,6 +66,10 @@ export async function appendSymptom(chatId: string, text: string, tier: Patient[
   return next.symptoms.length;
 }
 
+export async function recordDoseTaken(chatId: string, item: { drug: string; dose: string; time: string }): Promise<void> {
+  await patchPatient(chatId, (p) => ({ ...p, dosesTaken: [...p.dosesTaken, { date: nowStamp(), ...item }] }));
+}
+
 export async function addNurseNote(chatId: string, note: { ticketId: string; question: string; reply: string }): Promise<void> {
   await patchPatient(chatId, (p) => ({
     ...p,

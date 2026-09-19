@@ -15,6 +15,8 @@ const RENDER_CONTEXT_KEY = '__mastra_chat_channel_render';
 export const NURSE_APPROVE = 'nurse_approve';
 export const NURSE_DENY = 'nurse_deny';
 export const NURSE_VIDEO = 'nurse_video';
+export const DOSE_TAKEN = 'dose_taken';
+export const DOSE_QUESTION = 'dose_question';
 export const NOTIFY_NURSE_TOOL = 'notify_nurse';
 
 export function nurseChatId(): string | undefined {
@@ -272,8 +274,30 @@ async function clearOpenTicket(ticket: Ticket): Promise<void> {
 
 // Posts into the patient's private chat. Bounded so a slow Telegram call
 // cannot delay the rest of the flow.
-export async function postToPatient(agent: AnyAgent, chatId: string, text: string): Promise<boolean> {
-  const outcome = await postWithFallback(agent, chatId, 'patient post', (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
+export interface PatientButton {
+  actionId: string;
+  label: string;
+  value: string;
+}
+
+// Plain text, or text with inline buttons (Chat SDK card first, Bot API
+// keyboard as fallback; both encode callback_data the same way).
+export async function postToPatient(agent: AnyAgent, chatId: string, text: string, buttons?: PatientButton[]): Promise<boolean> {
+  const outcome = await postWithFallback(
+    agent,
+    chatId,
+    'patient post',
+    (thread) =>
+      buttons?.length
+        ? thread.post(Card({ children: [Text(text), Actions(buttons.map((b) => Button({ id: b.actionId, label: b.label, value: b.value })))] }))
+        : thread.post(text),
+    () =>
+      telegramSendMessage(
+        chatId,
+        text,
+        buttons?.length ? { inline_keyboard: [buttons.map((b) => ({ text: b.label, callback_data: callbackData(b.actionId, b.value) }))] } : undefined,
+      ),
+  );
   return outcome.posted;
 }
 

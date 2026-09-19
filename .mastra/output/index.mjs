@@ -3,10 +3,10 @@ import { Mastra } from '@mastra/core/mastra';
 import { PinoLogger } from '@mastra/loggers';
 import { Agent, isDurableAgentLike, MessageList } from '@mastra/core/agent';
 import { createTelegramAdapter } from '@chat-adapter/telegram';
-import { a as addNurseNote, r as readPatient, s as summarizePatient, c as clinicalThreadId, p as patchPatient, m as memory, b as chatIdFromThreadId, d as appendSymptom, e as resetChat, w as writePatient, f as emptyPatient, g as parsePatient, t as threadIdForChat } from './patient-memory.mjs';
+import { a as addNurseNote, r as readPatient, s as summarizePatient, c as clinicalThreadId, p as patchPatient, m as memory, b as chatIdFromThreadId, d as appendSymptom, w as writePatient, e as resetChat, f as recordDoseTaken, g as emptyPatient, h as parsePatient, t as threadIdForChat } from './patient-memory.mjs';
 import { N as NebiusCallProcessor, n as nebiusProviderOptions, r as resolvedNebiusModel, c as classifyMessage } from './nebius.mjs';
 import { Card, Actions, Button } from 'chat';
-import { g as getTicket, u as updateTicket, l as latestTicketByStatus, a as latestUrgentTicketForChat, c as claimReminderSlot, b as urgentTicketsDueForFollowUp, d as listPatientRecords } from './tickets.mjs';
+import { g as getTicket, u as updateTicket, l as latestTicketByStatus, s as scheduleSend, c as cancelPendingSends, p as pendingScheduledSendsForChat, a as latestUrgentTicketForChat, b as claimScheduledSend, d as claimReminderSlot, e as dueScheduledSends, f as listPatientRecords } from './tickets.mjs';
 import { s as startVideoCall, a as startVideoCallTool, c as callCredentials, b as summarizeCall } from './start-video-call.mjs';
 import { classifyMessageTool } from './tools/80a53523-8894-ad48-053e-548fff21baa7.mjs';
 import { o as openTicket, c as createTicketTool, n as notifyMake } from './create-ticket.mjs';
@@ -87,6 +87,7 @@ function martaPatient(now = /* @__PURE__ */ new Date()) {
     nextAppointment: { type: "ecograf\xEDa de control", datetime: `${spanishDate(nextWeekday(now, 4))}, 10:00` },
     symptoms: [],
     openTicketId: null,
+    dosesTaken: [],
     nurseNotes: []
   };
 }
@@ -95,6 +96,8 @@ const RENDER_CONTEXT_KEY = "__mastra_chat_channel_render";
 const NURSE_APPROVE = "nurse_approve";
 const NURSE_DENY = "nurse_deny";
 const NURSE_VIDEO = "nurse_video";
+const DOSE_TAKEN = "dose_taken";
+const DOSE_QUESTION = "dose_question";
 const NOTIFY_NURSE_TOOL = "notify_nurse";
 function nurseChatId() {
   return process.env.NURSE_TELEGRAM_CHAT_ID?.trim() || void 0;
@@ -278,8 +281,18 @@ async function clearOpenTicket(ticket) {
     logger$1.warn("could not clear openTicketId", { ticketId: ticket.id, error: String(error) });
   }
 }
-async function postToPatient(agent, chatId, text) {
-  const outcome = await postWithFallback(agent, chatId, "patient post", (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
+async function postToPatient(agent, chatId, text, buttons) {
+  const outcome = await postWithFallback(
+    agent,
+    chatId,
+    "patient post",
+    (thread) => buttons?.length ? thread.post(Card({ children: [Text(text), Actions(buttons.map((b) => Button({ id: b.actionId, label: b.label, value: b.value })))] })) : thread.post(text),
+    () => telegramSendMessage(
+      chatId,
+      text,
+      buttons?.length ? { inline_keyboard: [buttons.map((b) => ({ text: b.label, callback_data: callbackData(b.actionId, b.value) }))] } : void 0
+    )
+  );
   return outcome.posted;
 }
 async function startNurseVideoCall(agent, ticketId) {
@@ -425,20 +438,34 @@ async function ensureOnboarded(chatId, author, post) {
   await writePatient(chatId, { ...patient ?? emptyPatient, name: firstName(author), onboarded: true });
   return true;
 }
+const DEMO_REMINDER_DELAY_MS = 45 * 1e3;
+async function runDemoSeed(chatId) {
+  const marta = martaPatient();
+  await writePatient(chatId, marta);
+  await cancelPendingSends(chatId, "demo_reminder");
+  const row = await scheduleSend({ chatId, kind: "demo_reminder", dueAt: new Date(Date.now() + DEMO_REMINDER_DELAY_MS) });
+  return {
+    reminderDueAt: row.dueAt,
+    message: `Demo cargada. Ahora eres Marta: d\xEDa ${marta.cycle?.day} de estimulaci\xF3n, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Preg\xFAntame lo que quieras; en un minuto te llegar\xE1 tu primer recordatorio.`
+  };
+}
+async function runDemoReset(chatId) {
+  const cancelled = await cancelPendingSends(chatId);
+  await resetChat(chatId);
+  return { cancelled, message: "He borrado la memoria de este chat. Escr\xEDbeme \xABhola\xBB para empezar de nuevo." };
+}
 async function handleCommand(command, chatId, author, post) {
   switch (command) {
     case "demo": {
-      const marta = martaPatient();
-      await writePatient(chatId, marta);
-      await post(
-        `Demo cargada. Ahora eres Marta: d\xEDa ${marta.cycle?.day} de estimulaci\xF3n, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Preg\xFAntame lo que quieras.`
-      );
+      const { message } = await runDemoSeed(chatId);
+      await post(message);
       return;
     }
-    case "reset":
-      await resetChat(chatId);
-      await post("He borrado la memoria de este chat. Escr\xEDbeme \xABhola\xBB para empezar de nuevo.");
+    case "reset": {
+      const { message } = await runDemoReset(chatId);
+      await post(message);
       return;
+    }
     case "start": {
       const onboarded = await ensureOnboarded(chatId, author, post);
       if (!onboarded) await post("\xA1Hola de nuevo! \xBFEn qu\xE9 te puedo ayudar hoy?");
@@ -461,6 +488,7 @@ async function prepareTurn(chatId, text, requestContext) {
       question: text,
       reply: `Caso urgente: se avis\xF3 a la enfermera, se abri\xF3 videollamada (${patientUrl}) y se dio el tel\xE9fono de la cl\xEDnica ${CLINIC_EMERGENCY_PHONE$2}.`
     }).catch(() => void 0);
+    await scheduleSend({ chatId, kind: "followup", ticketId, dueAt: new Date(Date.now() + 24 * 60 * 60 * 1e3) }).catch(() => void 0);
     if (ticket) {
       void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
     }
@@ -580,9 +608,28 @@ function parseNurseAction(actionId, value) {
   const ticketId = (value && value !== actionId ? value : rest) ?? "";
   return { kind, ticketId };
 }
+async function handleDoseAction(actionId, slot, chatId, post) {
+  if (actionId !== DOSE_TAKEN && actionId !== DOSE_QUESTION) return false;
+  const patient = await readPatient(chatId);
+  const item = patient?.protocol.find((p) => p.time === slot) ?? patient?.protocol[0];
+  if (actionId === DOSE_TAKEN) {
+    if (item) await recordDoseTaken(chatId, item);
+    await post(item ? `Anotado \u{1F489} ${item.drug} ${item.dose} a las ${item.time}. \xA1Bien hecho!` : "Anotado. \xA1Bien hecho!");
+  } else {
+    await post("Cu\xE9ntame, te leo. Si es algo sobre la dosis o c\xF3mo te sientes, se lo paso a tu enfermera.");
+  }
+  return true;
+}
 const onAction = async (event, defaultHandler, ctx) => {
   const logger = ctx.mastra?.getLogger();
   logger?.info("telegram action", { actionId: event.actionId, value: event.value, from: event.user.userId });
+  const patientChatId = event.thread ? chatIdFromThreadId(event.thread.id) : void 0;
+  if (patientChatId && await handleDoseAction(event.actionId, event.value, patientChatId, (t) => event.thread.post(t)).catch((error) => {
+    logger?.error("dose action failed", { actionId: event.actionId, error });
+    return true;
+  })) {
+    return;
+  }
   const parsed = parseNurseAction(event.actionId, event.value);
   if (!parsed) {
     await defaultHandler();
@@ -893,10 +940,35 @@ const reminderRoute = registerApiRoute("/demo/reminder", {
     return c.json(result.status === "success" ? { kind, chatId: chatId ?? null, ...result.result } : { kind, chatId: chatId ?? null, status: result.status });
   }
 });
+const followupRoute = registerApiRoute("/demo/followup", {
+  method: "POST",
+  handler: async (c) => {
+    const chatId = c.req.query("chatId")?.trim();
+    if (!chatId) return c.json({ error: "chatId query parameter is required" }, 400);
+    const run = await c.get("mastra").getWorkflow("reminders").createRun();
+    const result = await run.start({ inputData: { kind: "followup", chatId } });
+    return c.json(result.status === "success" ? { kind: "followup", chatId, ...result.result } : { kind: "followup", chatId, status: result.status });
+  }
+});
+const demoSeedRoute = registerApiRoute("/demo/seed", {
+  method: "POST",
+  handler: async (c) => {
+    const chatId = c.req.query("chatId")?.trim();
+    if (!chatId) return c.json({ error: "chatId query parameter is required" }, 400);
+    return c.json({ chatId, ...await runDemoSeed(chatId) });
+  }
+});
+const demoResetRoute = registerApiRoute("/demo/reset", {
+  method: "POST",
+  handler: async (c) => {
+    const chatId = c.req.query("chatId")?.trim();
+    if (!chatId) return c.json({ error: "chatId query parameter is required" }, 400);
+    return c.json({ chatId, ...await runDemoReset(chatId) });
+  }
+});
 
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
 const TIMEZONE = process.env.REMINDER_TIMEZONE || "Europe/Madrid";
-const FOLLOW_UP_AFTER_MS = 24 * 60 * 60 * 1e3;
 const reminderInput = z.object({
   // 'tick' is what the schedule sends every minute; the other two are manual triggers.
   kind: z.enum(["tick", "medication", "followup"]).default("tick"),
@@ -920,7 +992,16 @@ function clinicClock(now) {
   return { day: `${get("year")}-${get("month")}-${get("day")}`, hhmm: `${get("hour")}:${get("minute")}` };
 }
 function medicationText(patient, item) {
-  return `\u{1F489} ${patient.name ? `${patient.name}, r` : "R"}ecordatorio: ${item.drug} ${item.dose} a las ${item.time}. Cuando te la pongas, escr\xEDbeme \xABhecho\xBB y lo anoto.`;
+  return `\u{1F489} ${patient.name ? `${patient.name}, toca` : "Toca"} ${item.drug} ${item.dose} (${item.time}).`;
+}
+function demoReminderText(patient, item) {
+  return `\u{1F489} ${patient.name ? `${patient.name}, toca` : "Toca"} ${item.drug} ${item.dose}. Te avisar\xE9 cada d\xEDa a las ${item.time}.`;
+}
+function medicationButtons(item) {
+  return [
+    { actionId: DOSE_TAKEN, label: "Ya me la puse", value: item.time },
+    { actionId: DOSE_QUESTION, label: "Tengo una duda", value: item.time }
+  ];
 }
 function followUpText(patient, ticket) {
   const name = patient?.name ? `${patient.name}, ` : "";
@@ -943,8 +1024,8 @@ const dispatch = createStep({
     const details = [];
     const now = /* @__PURE__ */ new Date();
     const { day, hhmm } = clinicClock(now);
-    const send = async (chatId, text, label) => {
-      const posted = await postToPatient(companion, chatId, text);
+    const send = async (chatId, text, label, buttons) => {
+      const posted = await postToPatient(companion, chatId, text, buttons);
       details.push(`${label} \u2192 ${chatId}: ${posted ? "sent" : "NOT sent"}`);
       logger?.info("reminder", { label, chatId, posted });
       return posted ? 1 : 0;
@@ -953,12 +1034,14 @@ const dispatch = createStep({
     if (inputData.kind === "medication" && inputData.chatId) {
       const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient;
       if (!patient?.protocol.length) return { sent, details: [`no protocol on record for ${inputData.chatId}`] };
-      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`);
+      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
       return { sent, details };
     }
     if (inputData.kind === "followup" && inputData.chatId) {
       const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient ?? null;
-      const ticket = await latestUrgentTicketForChat(inputData.chatId);
+      const pending = await pendingScheduledSendsForChat(inputData.chatId, "followup");
+      const ticket = pending[0]?.ticketId ? await getTicket(pending[0].ticketId) : await latestUrgentTicketForChat(inputData.chatId);
+      for (const row of pending) await claimScheduledSend(row.id);
       sent += await send(inputData.chatId, followUpText(patient, ticket), "follow-up");
       if (ticket) await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
       return { sent, details };
@@ -967,14 +1050,25 @@ const dispatch = createStep({
       for (const item of patient.protocol) {
         if (item.time !== hhmm) continue;
         if (!await claimReminderSlot(chatId, day, item.time)) continue;
-        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`);
+        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
       }
     }
     const patients = await loadPatients();
-    for (const ticket of await urgentTicketsDueForFollowUp(new Date(now.getTime() - FOLLOW_UP_AFTER_MS))) {
-      const patient = patients.find((p) => p.chatId === ticket.chatId)?.patient ?? null;
-      await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
-      sent += await send(ticket.chatId, followUpText(patient, ticket), `follow-up ${ticket.id}`);
+    for (const row of await dueScheduledSends(now)) {
+      if (!await claimScheduledSend(row.id)) continue;
+      const patient = patients.find((p) => p.chatId === row.chatId)?.patient ?? null;
+      if (row.kind === "demo_reminder") {
+        const item = patient?.protocol[0];
+        if (!patient || !item) {
+          details.push(`demo reminder ${row.id}: no protocol on record, skipped`);
+          continue;
+        }
+        sent += await send(row.chatId, demoReminderText(patient, item), `demo reminder ${row.id}`, medicationButtons(item));
+        continue;
+      }
+      const ticket = row.ticketId ? await getTicket(row.ticketId) : null;
+      if (ticket) await updateTicket(ticket.id, { followUpSentAt: now.toISOString() });
+      sent += await send(row.chatId, followUpText(patient, ticket), `follow-up ${row.id}`);
     }
     return { sent, details };
   }
@@ -1037,7 +1131,7 @@ const mastra = new Mastra({
     level: "info"
   }),
   server: {
-    apiRoutes: [evalMessageRoute, nurseDecisionRoute, nurseCardRoute, reminderRoute, callPageRoute, callCredentialsRoute, callEndedRoute]
+    apiRoutes: [evalMessageRoute, nurseDecisionRoute, nurseCardRoute, reminderRoute, followupRoute, demoSeedRoute, demoResetRoute, callPageRoute, callCredentialsRoute, callEndedRoute]
   }
 });
 

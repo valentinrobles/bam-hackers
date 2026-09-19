@@ -190,3 +190,112 @@ export class NebiusCallProcessor implements Processor {
     return rest ? { ...part, payload: { ...part.payload, text: rest } } : null;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Triage: closed rules, small model, temperature 0, forced tool call.
+// ---------------------------------------------------------------------------
+
+import { z } from 'zod';
+
+export const tiers = ['routine', 'logistic', 'clinical', 'urgent'] as const;
+export type Tier = (typeof tiers)[number];
+
+export const classificationSchema = z.object({
+  tier: z.enum(tiers),
+  reason: z.string().max(300),
+});
+export type Classification = z.infer<typeof classificationSchema>;
+
+const TRIAGE_PROMPT = `You classify one message from a patient in IVF treatment into exactly one tier. Apply these closed rules in order; the first that matches wins. When two tiers could apply, pick the higher one (urgent > clinical > logistic > routine).
+
+urgent: the message mentions difficulty breathing, severe or worsening abdominal pain, heavy bleeding, vomiting that prevents drinking, rapid abdominal swelling, high fever, fainting, or thoughts of self-harm.
+clinical: the message mentions doses (missed, doubts, changes), any physical symptom not listed above (including any bleeding or pain that is not described as heavy or severe), results (beta, ultrasound, follicles), medication, or asks "is it normal that...". Also clinical: asking you to act as a doctor or to give medical advice.
+logistic: the message is about appointments, schedules, address, documents, what to bring, opening hours.
+routine: greetings, confirmations ("I took it"), thanks, small talk, questions outside the treatment.
+
+Messages may be in Spanish, English or any language. Call the classify function once. Never answer the patient.`;
+
+// Terms that can only raise the tier to urgent, never lower it.
+const URGENT_PATTERN =
+  /respir|ahog|falta de aire|desmay|me he mareado y ca|suicid|hacerme daño|quitarme la vida|sangrado abundante|mucha sangre|hemorragia|fiebre alta|no (puedo|consigo) (beber|retener)|breath|faint|heavy bleed|self.?harm|kill myself/i;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+async function callTriageModel(text: string): Promise<Classification> {
+  const modelId = await resolveNebiusModelId('triage');
+  const startedAt = Date.now();
+  const res = await fetch(`${nebiusBaseUrl()}/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.NEBIUS_API_KEY ?? ''}`, 'content-type': 'application/json' },
+    signal: AbortSignal.timeout(20000),
+    body: JSON.stringify({
+      model: modelId,
+      temperature: 0,
+      max_tokens: 150,
+      messages: [
+        { role: 'system', content: TRIAGE_PROMPT },
+        { role: 'user', content: text },
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'classify',
+            description: 'Record the tier for this message',
+            parameters: {
+              type: 'object',
+              properties: {
+                tier: { type: 'string', enum: [...tiers] },
+                reason: { type: 'string', description: 'One short sentence naming the rule that matched' },
+              },
+              required: ['tier', 'reason'],
+            },
+          },
+        },
+      ],
+      tool_choice: 'required',
+      ...noThinkingBody(modelId),
+    }),
+  });
+  if (!res.ok) throw new Error(`triage HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const body: unknown = await res.json();
+  const usage = isRecord(body) && isRecord(body.usage) ? body.usage : {};
+  logModelCall({
+    role: 'triage',
+    model: modelId,
+    step: 0,
+    latencyMs: Date.now() - startedAt,
+    inputTokens: typeof usage.prompt_tokens === 'number' ? usage.prompt_tokens : undefined,
+    outputTokens: typeof usage.completion_tokens === 'number' ? usage.completion_tokens : undefined,
+    totalTokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : undefined,
+    reasoningTokens: typeof usage.reasoning_tokens === 'number' ? usage.reasoning_tokens : undefined,
+  });
+  const choices = isRecord(body) && Array.isArray(body.choices) ? body.choices : [];
+  const message = isRecord(choices[0]) && isRecord(choices[0].message) ? choices[0].message : {};
+  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const first = isRecord(toolCalls[0]) && isRecord(toolCalls[0].function) ? toolCalls[0].function : null;
+  if (!first || typeof first.arguments !== 'string') throw new Error('triage returned no tool call');
+  return classificationSchema.parse(JSON.parse(first.arguments));
+}
+
+export async function classifyMessage(text: string): Promise<Classification> {
+  const trimmed = text.trim();
+  if (!trimmed) return { tier: 'routine', reason: 'empty message' };
+  let result: Classification | undefined;
+  for (let attempt = 0; attempt < 2 && !result; attempt++) {
+    try {
+      result = await callTriageModel(trimmed);
+    } catch (error) {
+      logger.warn('triage attempt failed', { attempt, error: String(error) });
+    }
+  }
+  if (!result) {
+    result = { tier: 'clinical', reason: 'triage unavailable, escalated to a human by default' };
+  }
+  if (result.tier !== 'urgent' && URGENT_PATTERN.test(trimmed)) {
+    result = { tier: 'urgent', reason: `urgent keyword rule (${result.reason})` };
+  }
+  return result;
+}

@@ -1,0 +1,30 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Mastra / build
+.mastra/
+dist/
+build/
+
+# Local databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Vonage private key
+*.key
+private.key
+
+# Logs & OS
+*.log
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

@@ -1,27 +1,32 @@
 import type { Patient } from './patient-schema';
 
-function nextWeekday(from: Date, weekday: number): Date {
+const es = new Intl.DateTimeFormat('es-ES', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+
+// Dates in the record carry the weekday spelled out so the model never has to
+// compute one (it gets them wrong).
+export function spanishDate(d: Date): string {
+  return es.format(d);
+}
+
+function daysFrom(from: Date, days: number): Date {
   const d = new Date(from);
-  d.setDate(d.getDate() + ((weekday - d.getDay() + 7) % 7 || 7));
+  d.setDate(d.getDate() + days);
   return d;
 }
 
-function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+function nextWeekday(from: Date, weekday: number): Date {
+  return daysFrom(from, (weekday - from.getDay() + 7) % 7 || 7);
 }
 
-// Demo case from CLAUDE.md: stimulation day 6, Gonal-f 225 IU at 21:00,
-// monitoring ultrasound on Thursday at 10:00.
+// Demo case from CLAUDE.md, relative to today: stimulation started 5 days ago
+// (day 6), Gonal-f 225 UI at 21:00, monitoring ultrasound next Thursday 10:00.
 export function martaPatient(now = new Date()): Patient {
-  const cycleStart = new Date(now);
-  cycleStart.setDate(cycleStart.getDate() - 5);
-  const thursday = nextWeekday(now, 4);
   return {
     name: 'Marta',
     onboarded: true,
-    cycle: { day: 6, phase: 'stimulation', startDate: isoDate(cycleStart) },
+    cycle: { day: 6, phase: 'stimulation', startDate: spanishDate(daysFrom(now, -5)) },
     protocol: [{ drug: 'Gonal-f', dose: '225 UI', time: '21:00' }],
-    nextAppointment: { type: 'ecografía de control', datetime: `jueves ${isoDate(thursday)} 10:00` },
+    nextAppointment: { type: 'ecografía de control', datetime: `${spanishDate(nextWeekday(now, 4))}, 10:00` },
     symptoms: [],
     openTicketId: null,
   };

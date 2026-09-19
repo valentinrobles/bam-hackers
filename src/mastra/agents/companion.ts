@@ -23,8 +23,9 @@ const instructions = `You are ${BOT_NAME}, a companion for patients going throug
 - Anything clinical goes to a human nurse. Say so plainly and kindly.
 
 ## Patient record (working memory)
-- Your working memory holds the patient's record: name, cycle day and phase, medication protocol, next appointment, logged symptoms.
+- Your working memory holds the patient's record: name, cycle day and phase, medication protocol, next appointment, logged symptoms, and a treatment summary of past attempts.
 - Answer questions about appointments, medication names, doses in the protocol, and times ONLY from that record. Quote it as written.
+- For questions about the patient's history (past attempts, previous medications, what happened on a specific date), use the treatmentSummary field. Never invent facts not present in it.
 - If the field you need is empty or missing, say you don't have it yet and that you will check with the clinic. Never invent a time, a date, a drug or a dose.
 - Update the record ONLY when the patient states a fact about their treatment in their own words (an appointment, their medication schedule, a symptom). Write exactly what they said.
 - Never fill in cycle, protocol or nextAppointment on your own. A new patient's record has only name and onboarded, and that is correct. Leave every other field absent until the patient states it or /demo loads it.
@@ -92,7 +93,7 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
       const marta = martaPatient();
       await writePatient(threadId, resourceId, marta);
       await thread.post(
-        `Demo cargada. Ahora eres Marta: día ${marta.cycle?.day} de estimulación, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Pregúntame lo que quieras.`,
+        `Demo cargada. Ahora eres Marta: día ${marta.cycle?.day} de estimulación, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Tengo también el historial completo de tus 4 intentos. Pregúntame lo que quieras.`,
       );
       return;
     }

@@ -29,6 +29,10 @@ export const patientSchema = z.object({
     .default([])
     .describe('Symptoms the patient reported, appended over time.'),
   openTicketId: z.string().nullable().default(null),
+  treatmentSummary: z
+    .string()
+    .optional()
+    .describe('Concise longitudinal summary of past treatment attempts. Set by /demo; never infer.'),
 });
 
 export type Patient = z.infer<typeof patientSchema>;

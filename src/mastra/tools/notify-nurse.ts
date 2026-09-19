@@ -91,10 +91,11 @@ export const notifyNurseTool = createTool({
         suggestedAction: input.suggestedAction,
         videoCallUrl,
       });
+      // bounce:once — only one nurse can bounce; after that the next nurse cannot.
       await sendToNurseChat(text, {
         inline_keyboard: [[
           { text: '📹 Aceptar llamada', callback_data: `videocall:${ticketId}` },
-          { text: '↩️ Rebotar llamada', callback_data: `bounce:${ticketId}` },
+          { text: '↩️ Rebotar (solo una vez)', callback_data: `bounce:once:${ticketId}` },
         ]],
       });
     } else {

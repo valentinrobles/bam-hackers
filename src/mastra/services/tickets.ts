@@ -55,6 +55,19 @@ async function db(): Promise<Client> {
           'CREATE TABLE IF NOT EXISTS reminders_sent (chatId TEXT NOT NULL, day TEXT NOT NULL, slot TEXT NOT NULL, sentAt TEXT NOT NULL, PRIMARY KEY (chatId, day, slot))',
         ),
       )
+      .then(() =>
+        client!.execute(
+          `CREATE TABLE IF NOT EXISTS scheduled_sends (
+            id TEXT PRIMARY KEY,
+            chatId TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            ticketId TEXT,
+            dueAt TEXT NOT NULL,
+            createdAt TEXT NOT NULL,
+            sentAt TEXT
+          )`,
+        ),
+      )
       .then(() => undefined);
   }
   await ready;
@@ -172,4 +185,82 @@ export async function claimReminderSlot(chatId: string, day: string, slot: strin
 export async function listPatientRecords(): Promise<{ chatId: string; workingMemory: string }[]> {
   const res = await (await db()).execute('SELECT id, workingMemory FROM mastra_resources WHERE workingMemory IS NOT NULL');
   return res.rows.map((row) => ({ chatId: String(row.id), workingMemory: String(row.workingMemory) }));
+}
+
+export type ScheduledSendKind = 'followup' | 'demo_reminder';
+
+export interface ScheduledSend {
+  id: string;
+  chatId: string;
+  kind: ScheduledSendKind;
+  ticketId: string | null;
+  dueAt: string;
+  createdAt: string;
+  sentAt: string | null;
+}
+
+function rowToSend(row: Record<string, unknown>): ScheduledSend {
+  return {
+    id: String(row.id),
+    chatId: String(row.chatId),
+    kind: (String(row.kind) as ScheduledSendKind) ?? 'followup',
+    ticketId: row.ticketId == null ? null : String(row.ticketId),
+    dueAt: String(row.dueAt),
+    createdAt: String(row.createdAt),
+    sentAt: row.sentAt == null ? null : String(row.sentAt),
+  };
+}
+
+// One row per planned proactive message. Survives restarts; sentAt prevents
+// duplicates.
+export async function scheduleSend(input: { chatId: string; kind: ScheduledSendKind; ticketId?: string | null; dueAt: Date }): Promise<ScheduledSend> {
+  const send: ScheduledSend = {
+    id: `S-${Date.now().toString(36).toUpperCase()}${randomBytes(2).toString('hex').toUpperCase()}`,
+    chatId: input.chatId,
+    kind: input.kind,
+    ticketId: input.ticketId ?? null,
+    dueAt: input.dueAt.toISOString(),
+    createdAt: new Date().toISOString(),
+    sentAt: null,
+  };
+  await (await db()).execute({
+    sql: 'INSERT INTO scheduled_sends (id, chatId, kind, ticketId, dueAt, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
+    args: [send.id, send.chatId, send.kind, send.ticketId, send.dueAt, send.createdAt],
+  });
+  return send;
+}
+
+export async function dueScheduledSends(now: Date): Promise<ScheduledSend[]> {
+  const res = await (await db()).execute({
+    sql: 'SELECT * FROM scheduled_sends WHERE sentAt IS NULL AND dueAt <= ? ORDER BY dueAt ASC',
+    args: [now.toISOString()],
+  });
+  return res.rows.map((row) => rowToSend(row as unknown as Record<string, unknown>));
+}
+
+export async function pendingScheduledSendsForChat(chatId: string, kind: ScheduledSendKind): Promise<ScheduledSend[]> {
+  const res = await (await db()).execute({
+    sql: 'SELECT * FROM scheduled_sends WHERE sentAt IS NULL AND chatId = ? AND kind = ? ORDER BY dueAt ASC',
+    args: [chatId, kind],
+  });
+  return res.rows.map((row) => rowToSend(row as unknown as Record<string, unknown>));
+}
+
+// Returns false when another tick already claimed this row.
+export async function claimScheduledSend(id: string): Promise<boolean> {
+  const res = await (await db()).execute({
+    sql: 'UPDATE scheduled_sends SET sentAt = ? WHERE id = ? AND sentAt IS NULL',
+    args: [new Date().toISOString(), id],
+  });
+  return res.rowsAffected > 0;
+}
+
+// Drops pending (unsent) rows for a chat; all kinds when kind is omitted.
+export async function cancelPendingSends(chatId: string, kind?: ScheduledSendKind): Promise<number> {
+  const res = await (await db()).execute(
+    kind
+      ? { sql: 'DELETE FROM scheduled_sends WHERE sentAt IS NULL AND chatId = ? AND kind = ?', args: [chatId, kind] }
+      : { sql: 'DELETE FROM scheduled_sends WHERE sentAt IS NULL AND chatId = ?', args: [chatId] },
+  );
+  return res.rowsAffected;
 }

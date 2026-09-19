@@ -12,6 +12,7 @@ import {
   memory,
   patchPatient,
   readPatient,
+  recordDoseTaken,
   resetChat,
   summarizePatient,
   writePatient,
@@ -23,6 +24,8 @@ import {
   NURSE_APPROVE,
   NURSE_DENY,
   NURSE_VIDEO,
+  DOSE_QUESTION,
+  DOSE_TAKEN,
   NurseCardProcessor,
   startNurseVideoCall,
   forwardNurseReply,
@@ -32,7 +35,7 @@ import {
   postNurseAlert,
   setNurseAgent,
 } from '../services/nurse';
-import { getTicket, updateTicket } from '../services/tickets';
+import { cancelPendingSends, getTicket, scheduleSend, updateTicket } from '../services/tickets';
 import { classifyMessageTool } from '../tools/classify-message';
 import { createTicketTool, openTicket } from '../tools/create-ticket';
 import { logSymptomTool } from '../tools/log-symptom';
@@ -181,6 +184,29 @@ async function ensureOnboarded(chatId: string, author: Author, post: (text: stri
   return true;
 }
 
+// Seconds until the first demo reminder. The scheduler ticks once a minute,
+// so the message lands between 45 s and about 1 min 45 s after /demo.
+const DEMO_REMINDER_DELAY_MS = 45 * 1000;
+
+// Shared by the Telegram /demo command and POST /demo/seed.
+export async function runDemoSeed(chatId: string): Promise<{ message: string; reminderDueAt: string }> {
+  const marta = martaPatient();
+  await writePatient(chatId, marta);
+  await cancelPendingSends(chatId, 'demo_reminder');
+  const row = await scheduleSend({ chatId, kind: 'demo_reminder', dueAt: new Date(Date.now() + DEMO_REMINDER_DELAY_MS) });
+  return {
+    reminderDueAt: row.dueAt,
+    message: `Demo cargada. Ahora eres Marta: día ${marta.cycle?.day} de estimulación, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Pregúntame lo que quieras; en un minuto te llegará tu primer recordatorio.`,
+  };
+}
+
+// Shared by the Telegram /reset command and POST /demo/reset.
+export async function runDemoReset(chatId: string): Promise<{ message: string; cancelled: number }> {
+  const cancelled = await cancelPendingSends(chatId);
+  await resetChat(chatId);
+  return { cancelled, message: 'He borrado la memoria de este chat. Escríbeme «hola» para empezar de nuevo.' };
+}
+
 async function handleCommand(
   command: 'start' | 'demo' | 'reset',
   chatId: string,
@@ -189,17 +215,15 @@ async function handleCommand(
 ): Promise<void> {
   switch (command) {
     case 'demo': {
-      const marta = martaPatient();
-      await writePatient(chatId, marta);
-      await post(
-        `Demo cargada. Ahora eres Marta: día ${marta.cycle?.day} de estimulación, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Pregúntame lo que quieras.`,
-      );
+      const { message } = await runDemoSeed(chatId);
+      await post(message);
       return;
     }
-    case 'reset':
-      await resetChat(chatId);
-      await post('He borrado la memoria de este chat. Escríbeme «hola» para empezar de nuevo.');
+    case 'reset': {
+      const { message } = await runDemoReset(chatId);
+      await post(message);
       return;
+    }
     case 'start': {
       const onboarded = await ensureOnboarded(chatId, author, post);
       if (!onboarded) await post('¡Hola de nuevo! ¿En qué te puedo ayudar hoy?');
@@ -237,6 +261,8 @@ export async function prepareTurn(chatId: string, text: string, requestContext: 
       question: text,
       reply: `Caso urgente: se avisó a la enfermera, se abrió videollamada (${patientUrl}) y se dio el teléfono de la clínica ${CLINIC_EMERGENCY_PHONE}.`,
     }).catch(() => undefined);
+    // The 24 h follow-up is planned now and persisted; the reminders tick sends it.
+    await scheduleSend({ chatId, kind: 'followup', ticketId, dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) }).catch(() => undefined);
     if (ticket) {
       void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`)
         .then((o) => console.info('[companion] nurse alert', { ticketId, ...o }))
@@ -386,9 +412,30 @@ function parseNurseAction(actionId: string, value: string | undefined): { kind: 
   return { kind, ticketId };
 }
 
+// Reminder buttons in the patient chat.
+async function handleDoseAction(actionId: string, slot: string | undefined, chatId: string, post: (t: string) => Promise<unknown>): Promise<boolean> {
+  if (actionId !== DOSE_TAKEN && actionId !== DOSE_QUESTION) return false;
+  const patient = await readPatient(chatId);
+  const item = patient?.protocol.find((p) => p.time === slot) ?? patient?.protocol[0];
+  if (actionId === DOSE_TAKEN) {
+    if (item) await recordDoseTaken(chatId, item);
+    await post(item ? `Anotado 💉 ${item.drug} ${item.dose} a las ${item.time}. ¡Bien hecho!` : 'Anotado. ¡Bien hecho!');
+  } else {
+    await post('Cuéntame, te leo. Si es algo sobre la dosis o cómo te sientes, se lo paso a tu enfermera.');
+  }
+  return true;
+}
+
 const onAction: ActionChannelHandler = async (event, defaultHandler, ctx) => {
   const logger = ctx.mastra?.getLogger();
   logger?.info('telegram action', { actionId: event.actionId, value: event.value, from: event.user.userId });
+  const patientChatId = event.thread ? chatIdFromThreadId(event.thread.id) : undefined;
+  if (patientChatId && (await handleDoseAction(event.actionId, event.value, patientChatId, (t) => event.thread!.post(t)).catch((error) => {
+    logger?.error('dose action failed', { actionId: event.actionId, error });
+    return true;
+  }))) {
+    return;
+  }
   const parsed = parseNurseAction(event.actionId, event.value);
   if (!parsed) {
     await defaultHandler();

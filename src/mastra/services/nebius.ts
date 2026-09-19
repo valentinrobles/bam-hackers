@@ -203,6 +203,7 @@ export type Tier = (typeof tiers)[number];
 export const classificationSchema = z.object({
   tier: z.enum(tiers),
   reason: z.string().max(300),
+  language: z.enum(['es', 'en', 'other']).default('other'),
 });
 export type Classification = z.infer<typeof classificationSchema>;
 
@@ -213,7 +214,7 @@ clinical: the message mentions doses (missed, doubts, changes), any physical sym
 logistic: the message is about appointments, schedules, address, documents, what to bring, opening hours.
 routine: greetings, confirmations ("I took it"), thanks, small talk, questions outside the treatment.
 
-Messages may be in Spanish, English or any language. Call the classify function once. Never answer the patient.`;
+Messages may be in Spanish, English or any language; report the language as es, en or other. Call the classify function once. Never answer the patient.`;
 
 // Terms that can only raise the tier to urgent, never lower it.
 const URGENT_PATTERN =
@@ -249,8 +250,9 @@ async function callTriageModel(text: string): Promise<Classification> {
               properties: {
                 tier: { type: 'string', enum: [...tiers] },
                 reason: { type: 'string', description: 'One short sentence naming the rule that matched' },
+                language: { type: 'string', enum: ['es', 'en', 'other'], description: 'Language the message is written in' },
               },
-              required: ['tier', 'reason'],
+              required: ['tier', 'reason', 'language'],
             },
           },
         },
@@ -282,7 +284,7 @@ async function callTriageModel(text: string): Promise<Classification> {
 
 export async function classifyMessage(text: string): Promise<Classification> {
   const trimmed = text.trim();
-  if (!trimmed) return { tier: 'routine', reason: 'empty message' };
+  if (!trimmed) return { tier: 'routine', reason: 'empty message', language: 'other' };
   let result: Classification | undefined;
   for (let attempt = 0; attempt < 2 && !result; attempt++) {
     try {
@@ -292,10 +294,10 @@ export async function classifyMessage(text: string): Promise<Classification> {
     }
   }
   if (!result) {
-    result = { tier: 'clinical', reason: 'triage unavailable, escalated to a human by default' };
+    result = { tier: 'clinical', reason: 'triage unavailable, escalated to a human by default', language: 'other' };
   }
   if (result.tier !== 'urgent' && URGENT_PATTERN.test(trimmed)) {
-    result = { tier: 'urgent', reason: `urgent keyword rule (${result.reason})` };
+    result = { ...result, tier: 'urgent', reason: `urgent keyword rule (${result.reason})` };
   }
   return result;
 }

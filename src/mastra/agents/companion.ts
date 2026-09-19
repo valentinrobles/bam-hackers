@@ -18,6 +18,7 @@ import {
   writePatient,
 } from '../memory/patient-memory';
 import { emptyPatient } from '../memory/patient-schema';
+import { messages, normalizeLang, type Lang } from '../i18n';
 import { martaPatient } from '../memory/seed-marta';
 import { NebiusCallProcessor, classifyMessage, nebiusProviderOptions, resolvedNebiusModel, type Tier } from '../services/nebius';
 import {
@@ -46,13 +47,19 @@ import { startVideoCall } from '../services/vonage';
 const BOT_NAME = process.env.BOT_NAME ?? 'Lumi';
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
 
-export const onboardingMessage = [
-  `¡Hola! Soy ${BOT_NAME}, una acompañante para pacientes en tratamiento de FIV. Te ayudo con recordatorios de medicación, citas y dudas prácticas, y paso cualquier consulta médica a tu enfermera.`,
-  `No sustituyo a tu equipo médico. Si quieres probar con un caso de ejemplo, envía /demo.`,
-].join('\n\n');
+export const onboardingMessage = messages('es').onboarding;
+export const fallbackReply = messages('es').fallback;
 
-export const fallbackReply =
-  `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la clínica: ${CLINIC_EMERGENCY_PHONE}.`;
+// Telegram tells us the user's app language on every update; it decides the
+// language of the very first message, before triage has seen anything.
+function telegramLang(raw: unknown): Lang | undefined {
+  const from = (raw as { from?: { language_code?: string } } | undefined)?.from;
+  return normalizeLang(from?.language_code);
+}
+
+async function langFor(chatId: string, fallback?: Lang): Promise<Lang> {
+  return (await readPatient(chatId))?.language ?? fallback ?? 'es';
+}
 
 const baseInstructions = `You are ${BOT_NAME}, a companion for patients going through IVF treatment. You sit between the patient and the clinic on Telegram.
 
@@ -89,7 +96,7 @@ const baseInstructions = `You are ${BOT_NAME}, a companion for patients going th
 - Tone never changes the safety rules. Never reassure about a potentially serious symptom, never soften an escalation, never delay the emergency phone on an urgent message.
 
 ## Format
-- Speak Spanish by default (Spain, informal "tú"). Switch language only if the patient writes in another language.
+- Reply in the language of the record's "language" field (es = Spanish from Spain, informal "tú"; en = English). If the patient clearly writes in the other one, follow the patient.
 - Plain conversation is one to three short sentences. Never more than four sentences in a message.
 - When there are several items (protocol, appointments, steps), use short bullet points, one line each.
 - No headers, no bold, no markdown tables.
@@ -176,11 +183,12 @@ function firstName(author: Author): string | undefined {
   return author.fullName?.trim().split(/\s+/)[0] || author.userName || undefined;
 }
 
-async function ensureOnboarded(chatId: string, author: Author, post: (text: string) => Promise<unknown>): Promise<boolean> {
+async function ensureOnboarded(chatId: string, author: Author, post: (text: string) => Promise<unknown>, lang?: Lang): Promise<boolean> {
   const patient = await readPatient(chatId);
   if (patient?.onboarded) return false;
-  await post(onboardingMessage);
-  await writePatient(chatId, { ...(patient ?? emptyPatient), name: firstName(author), onboarded: true });
+  const language = lang ?? patient?.language ?? 'es';
+  await post(messages(language).onboarding);
+  await writePatient(chatId, { ...(patient ?? emptyPatient), name: firstName(author), onboarded: true, language });
   return true;
 }
 
@@ -189,22 +197,31 @@ async function ensureOnboarded(chatId: string, author: Author, post: (text: stri
 const DEMO_REMINDER_DELAY_MS = 45 * 1000;
 
 // Shared by the Telegram /demo command and POST /demo/seed.
-export async function runDemoSeed(chatId: string): Promise<{ message: string; reminderDueAt: string }> {
-  const marta = martaPatient();
+export async function runDemoSeed(chatId: string, lang?: Lang): Promise<{ message: string; reminderDueAt: string }> {
+  const language = lang ?? (await langFor(chatId));
+  const marta = martaPatient(new Date(), language);
   await writePatient(chatId, marta);
   await cancelPendingSends(chatId, 'demo_reminder');
   const row = await scheduleSend({ chatId, kind: 'demo_reminder', dueAt: new Date(Date.now() + DEMO_REMINDER_DELAY_MS) });
   return {
     reminderDueAt: row.dueAt,
-    message: `Demo cargada. Ahora eres Marta: día ${marta.cycle?.day} de estimulación, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Pregúntame lo que quieras; en un minuto te llegará tu primer recordatorio.`,
+    message: messages(language).demoLoaded({
+      day: marta.cycle?.day,
+      drug: marta.protocol[0]?.drug,
+      dose: marta.protocol[0]?.dose,
+      time: marta.protocol[0]?.time,
+      appointmentType: marta.nextAppointment?.type,
+      appointmentWhen: marta.nextAppointment?.datetime,
+    }),
   };
 }
 
 // Shared by the Telegram /reset command and POST /demo/reset.
-export async function runDemoReset(chatId: string): Promise<{ message: string; cancelled: number }> {
+export async function runDemoReset(chatId: string, lang?: Lang): Promise<{ message: string; cancelled: number }> {
+  const language = lang ?? (await langFor(chatId));
   const cancelled = await cancelPendingSends(chatId);
   await resetChat(chatId);
-  return { cancelled, message: 'He borrado la memoria de este chat. Escríbeme «hola» para empezar de nuevo.' };
+  return { cancelled, message: messages(language).resetDone };
 }
 
 async function handleCommand(
@@ -212,21 +229,22 @@ async function handleCommand(
   chatId: string,
   author: Author,
   post: (text: string) => Promise<unknown>,
+  hintLang?: Lang,
 ): Promise<void> {
   switch (command) {
     case 'demo': {
-      const { message } = await runDemoSeed(chatId);
+      const { message } = await runDemoSeed(chatId, (await readPatient(chatId))?.language ?? hintLang);
       await post(message);
       return;
     }
     case 'reset': {
-      const { message } = await runDemoReset(chatId);
+      const { message } = await runDemoReset(chatId, (await readPatient(chatId))?.language ?? hintLang);
       await post(message);
       return;
     }
     case 'start': {
-      const onboarded = await ensureOnboarded(chatId, author, post);
-      if (!onboarded) await post('¡Hola de nuevo! ¿En qué te puedo ayudar hoy?');
+      const onboarded = await ensureOnboarded(chatId, author, post, hintLang);
+      if (!onboarded) await post(messages(await langFor(chatId, hintLang)).welcomeBack);
     }
   }
 }
@@ -246,21 +264,22 @@ export interface PreparedTurn {
 // triage, symptom log, ticket, request context. Shared by the Telegram
 // handler and POST /eval/message so both paths behave the same.
 export async function prepareTurn(chatId: string, text: string, requestContext: RequestContext): Promise<PreparedTurn> {
-  const { tier, reason } = await classifyMessage(text);
+  const { tier, reason, language } = await classifyMessage(text);
   requestContext.set('tier', tier);
+  let patient = await readPatient(chatId);
+  const detected = normalizeLang(language);
+  if (detected && patient && patient.language !== detected) {
+    patient = await patchPatient(chatId, (p) => ({ ...p, language: detected }));
+  }
   if (tier !== 'clinical' && tier !== 'urgent') return { tier, reason };
-  const patient = await readPatient(chatId);
+  const lang = patient?.language ?? detected ?? 'es';
   await appendSymptom(chatId, text, tier);
   const { ticketId } = await openTicket({ chatId, tier, message: text, contextSummary: summarizePatient(patient) });
   requestContext.set('ticketId', ticketId);
   const ticket = await getTicket(ticketId);
   if (tier === 'urgent') {
     const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
-    await addNurseNote(chatId, {
-      ticketId,
-      question: text,
-      reply: `Caso urgente: se avisó a la enfermera, se abrió videollamada (${patientUrl}) y se dio el teléfono de la clínica ${CLINIC_EMERGENCY_PHONE}.`,
-    }).catch(() => undefined);
+    await addNurseNote(chatId, { ticketId, question: text, reply: messages(lang).urgentNote(patientUrl) }).catch(() => undefined);
     // The 24 h follow-up is planned now and persisted; the reminders tick sends it.
     await scheduleSend({ chatId, kind: 'followup', ticketId, dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) }).catch(() => undefined);
     if (ticket) {
@@ -268,20 +287,13 @@ export async function prepareTurn(chatId: string, text: string, requestContext: 
         .then((o) => console.info('[companion] nurse alert', { ticketId, ...o }))
         .catch((error: unknown) => console.warn('[companion] nurse alert not posted', { ticketId, error: String(error) }));
     }
-    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, patientUrl) };
+    return { tier, reason, ticketId, ticket, directReply: messages(lang).urgentReply(patient?.name, patientUrl) };
   }
-  return { tier, reason, ticketId, ticket, ack: clinicalAck(patient?.name) };
+  return { tier, reason, ticketId, ticket, ack: messages(lang).clinicalAck(patient?.name) };
 }
 
-// Urgent replies are composed here, not by the model: in tests Nemotron dropped
-// the phone number or wrote "[link]" one time in three. Never an emoji here.
-function urgentReply(name: string | undefined, videoUrl: string): string {
-  return [
-    `${name ? `${name}, gracias` : 'Gracias'} por contármelo; te leo y no estás sola en esto.`,
-    `Estoy avisando a tu enfermera ahora mismo y te va a atender por videollamada en este enlace: ${videoUrl}`,
-    `Si empeora, no mejora o no puedes esperar, llama ya a la clínica al ${CLINIC_EMERGENCY_PHONE}.`,
-  ].join('\n');
-}
+// Urgent replies are composed in code (i18n.ts), not by the model: in tests
+// Nemotron dropped the phone number or wrote "[link]" one time in three.
 
 // Step 0 of a clinical turn must be the notify_nurse call: left to itself the
 // model sometimes answers as if the nurse had already approved.
@@ -316,28 +328,26 @@ export async function runClinicalTurn(chatId: string, ticketId: string, text: st
   return result;
 }
 
-function clinicalAck(name: string | undefined): string {
-  return `${name ? `${name}, esto` : 'Esto'} se lo paso a tu enfermera ahora mismo 👩‍⚕️. Te escribo en cuanto me conteste.`;
-}
 
 const onSlashCommand: SlashCommandChannelHandler = async (event, _defaultHandler, ctx) => {
   const logger = ctx.mastra?.getLogger();
   const chatId = chatIdFromThreadId(event.channel.id);
   const command = parseCommand(`${event.command} ${event.text}`);
-  logger?.info('telegram command', { chatId, command: event.command, userId: event.user.userId });
+  const hintLang = telegramLang(event.raw);
+  logger?.info('telegram command', { chatId, command: event.command, userId: event.user.userId, hintLang });
   if (chatId === nurseChatId()) {
     await event.channel.post('Este es el chat de la enfermera: aquí recibes los tickets y respondes a las pacientes.').catch(() => undefined);
     return;
   }
   try {
     if (command) {
-      await handleCommand(command, chatId, event.user, (text) => event.channel.post(text));
+      await handleCommand(command, chatId, event.user, (text) => event.channel.post(text), hintLang);
     } else {
-      await event.channel.post('No conozco ese comando. Puedes usar /start, /demo o /reset, o simplemente escribirme.');
+      await event.channel.post(messages(await langFor(chatId, hintLang)).unknownCommand);
     }
   } catch (error) {
     logger?.error('command failed', { chatId, command, error });
-    await event.channel.post(fallbackReply).catch(() => undefined);
+    await event.channel.post(messages(await langFor(chatId, hintLang)).fallback).catch(() => undefined);
   }
 };
 
@@ -362,13 +372,14 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
   }
 
   const post = (t: string) => thread.post(t);
+  const hintLang = telegramLang(message.raw);
   try {
     const command = parseCommand(text);
     if (command) {
-      await handleCommand(command, chatId, message.author, post);
+      await handleCommand(command, chatId, message.author, post, hintLang);
       return;
     }
-    if (await ensureOnboarded(chatId, message.author, post)) {
+    if (await ensureOnboarded(chatId, message.author, post, hintLang)) {
       // First contact: the onboarding text is the reply.
       return;
     }
@@ -386,7 +397,7 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
         logger?.info('clinical turn finished', { chatId, ticketId: turn.ticketId, finishReason: result.finishReason });
       } catch (error) {
         logger?.error('clinical turn failed, sending fallback', { chatId, ticketId: turn.ticketId, error });
-        await post(fallbackReply);
+        await post(messages(await langFor(chatId)).fallback);
       }
       return;
     }
@@ -398,7 +409,7 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
     await defaultHandler(thread, message);
   } catch (error) {
     logger?.error('agent run failed, sending fallback reply', { chatId, error });
-    await thread.post(fallbackReply).catch((postError) => logger?.error('fallback reply could not be posted', { chatId, error: postError }));
+    await thread.post(messages(await langFor(chatId)).fallback).catch((postError) => logger?.error('fallback reply could not be posted', { chatId, error: postError }));
   }
 };
 
@@ -416,12 +427,13 @@ function parseNurseAction(actionId: string, value: string | undefined): { kind: 
 async function handleDoseAction(actionId: string, slot: string | undefined, chatId: string, post: (t: string) => Promise<unknown>): Promise<boolean> {
   if (actionId !== DOSE_TAKEN && actionId !== DOSE_QUESTION) return false;
   const patient = await readPatient(chatId);
+  const m = messages(patient?.language);
   const item = patient?.protocol.find((p) => p.time === slot) ?? patient?.protocol[0];
   if (actionId === DOSE_TAKEN) {
     if (item) await recordDoseTaken(chatId, item);
-    await post(item ? `Anotado 💉 ${item.drug} ${item.dose} a las ${item.time}. ¡Bien hecho!` : 'Anotado. ¡Bien hecho!');
+    await post(m.doseTaken(item));
   } else {
-    await post('Cuéntame, te leo. Si es algo sobre la dosis o cómo te sientes, se lo paso a tu enfermera.');
+    await post(m.doseQuestion);
   }
   return true;
 }

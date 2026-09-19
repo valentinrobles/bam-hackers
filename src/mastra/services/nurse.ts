@@ -4,7 +4,8 @@ import { PinoLogger } from '@mastra/loggers';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 import { Actions, Button, Card, type TextElement, type Thread } from 'chat';
-import { addNurseNote, clinicalThreadId, patchPatient, readPatient, summarizePatient } from '../memory/patient-memory';
+import { messages } from '../i18n';
+import { addNurseNote, clinicalThreadId, patchPatient, patientLanguage, readPatient, summarizePatient } from '../memory/patient-memory';
 import { getTicket, latestTicketByStatus, updateTicket, type Ticket } from './tickets';
 import { startVideoCall } from './vonage';
 
@@ -23,7 +24,7 @@ export function nurseChatId(): string | undefined {
   return process.env.NURSE_TELEGRAM_CHAT_ID?.trim() || undefined;
 }
 
-export const nurseReplyPrefix = '👩‍⚕️ Tu enfermera dice:';
+export const nurseReplyPrefix = messages('es').nurseSays;
 
 const Text = (content: string): TextElement => ({ type: 'text', content });
 
@@ -222,9 +223,8 @@ export async function handleNurseDecision(
 
   // What the patient sees is posted here, in code. The resumed run only closes
   // the suspended tool call; its text is returned for the API path and logs.
-  const patientText = approved
-    ? `${nurseReplyPrefix} ${ticket.suggestedReply ?? ''}`.trim()
-    : `${ticket.patientName ? `${ticket.patientName}, tu` : 'Tu'} enfermera ha leído tu mensaje y te escribirá directamente en unos minutos.`;
+  const m = messages(await patientLanguage(ticket.chatId));
+  const patientText = approved ? `${m.nurseSays} ${ticket.suggestedReply ?? ''}`.trim() : m.nurseWillWrite(ticket.patientName ?? undefined);
   const delivered = await postToPatient(agent, ticket.chatId, patientText);
   logger.info('nurse decision delivery', { ticketId: ticket.id, approved, delivered });
   const threadId = clinicalThreadId(ticket.chatId, ticket.id);
@@ -307,8 +307,8 @@ export async function startNurseVideoCall(agent: AnyAgent, ticketId: string): Pr
   const ticket = await getTicket(ticketId);
   if (!ticket) return { ticket: null };
   const { patientUrl, nurseUrl } = await startVideoCall(ticketId);
-  const name = ticket.patientName ? `${ticket.patientName}, tu` : 'Tu';
-  const patientNotified = await postToPatient(agent, ticket.chatId, `${name} enfermera quiere verte por videollamada ahora. Entra aquí desde el móvil o el ordenador: ${patientUrl}`);
+  const m = messages(await patientLanguage(ticket.chatId));
+  const patientNotified = await postToPatient(agent, ticket.chatId, m.videoInvite(ticket.patientName ?? undefined, patientUrl));
   return { ticket, nurseUrl, patientNotified };
 }
 
@@ -316,7 +316,7 @@ export async function startNurseVideoCall(agent: AnyAgent, ticketId: string): Pr
 export async function forwardNurseReply(agent: AnyAgent, text: string): Promise<{ ticket: Ticket | null; delivered: boolean }> {
   const ticket = await latestTicketByStatus('awaiting_nurse_reply');
   if (!ticket) return { ticket: null, delivered: false };
-  const delivered = await postToPatient(agent, ticket.chatId, `${nurseReplyPrefix} ${text}`);
+  const delivered = await postToPatient(agent, ticket.chatId, `${messages(await patientLanguage(ticket.chatId)).nurseSays} ${text}`);
   if (!delivered) return { ticket, delivered: false };
   await updateTicket(ticket.id, { status: 'answered', suggestedReply: text });
   await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: text }).catch((error: unknown) =>

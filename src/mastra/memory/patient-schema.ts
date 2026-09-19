@@ -8,6 +8,7 @@ const ONLY_IF_STATED = 'Omit entirely unless the patient stated it explicitly or
 export const patientSchema = z.object({
   name: z.string().optional().describe('Patient first name.'),
   onboarded: z.boolean().default(false),
+  language: z.enum(['es', 'en']).default('es').describe('Language the patient writes in. Reply in it.'),
   cycle: z
     .object({
       day: z.number(),

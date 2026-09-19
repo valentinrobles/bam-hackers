@@ -23,7 +23,7 @@ export async function openTicket(input: z.infer<typeof createTicketInput>): Prom
   });
   await patchPatient(input.chatId, (p) => ({ ...p, openTicketId: ticket.id }));
   // Make scenario schema: every field a string, no nulls, no extra properties.
-  const { sent } = await notifyMake('ticket.created', {
+  const payload = {
     ticketId: ticket.id,
     chatId: ticket.chatId,
     patientName: ticket.patientName ?? '',
@@ -31,7 +31,9 @@ export async function openTicket(input: z.infer<typeof createTicketInput>): Prom
     message: ticket.message,
     contextSummary: ticket.contextSummary ?? '',
     createdAt: ticket.createdAt,
-  });
+  };
+  const { sent } = await notifyMake('ticket.created', payload);
+  if (ticket.tier === 'urgent') await notifyMake('ticket.urgent', payload);
   return { ticketId: ticket.id, makeNotified: sent };
 }
 

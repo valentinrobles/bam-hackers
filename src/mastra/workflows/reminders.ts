@@ -1,6 +1,7 @@
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { companion } from '../agents/companion';
+import { messages } from '../i18n';
 import { parsePatient, type Patient } from '../memory/patient-schema';
 import { DOSE_QUESTION, DOSE_TAKEN, postToPatient } from '../services/nurse';
 import {
@@ -15,7 +16,6 @@ import {
   type Ticket,
 } from '../services/tickets';
 
-const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
 const TIMEZONE = process.env.REMINDER_TIMEZONE || 'Europe/Madrid';
 
 export const reminderInput = z.object({
@@ -44,26 +44,24 @@ function clinicClock(now: Date): { day: string; hhmm: string } {
 }
 
 function medicationText(patient: Patient, item: Patient['protocol'][number]): string {
-  return `💉 ${patient.name ? `${patient.name}, toca` : 'Toca'} ${item.drug} ${item.dose} (${item.time}).`;
+  return messages(patient.language).reminder(patient.name, item);
 }
 
-// First message the judge sees after /demo, before any setup.
 function demoReminderText(patient: Patient, item: Patient['protocol'][number]): string {
-  return `💉 ${patient.name ? `${patient.name}, toca` : 'Toca'} ${item.drug} ${item.dose}. Te avisaré cada día a las ${item.time}.`;
+  return messages(patient.language).demoReminder(patient.name, item);
 }
 
-function medicationButtons(item: Patient['protocol'][number]) {
+function medicationButtons(patient: Patient, item: Patient['protocol'][number]) {
+  const m = messages(patient.language);
   // value = protocol time slot; the handler looks the entry up in the record.
   return [
-    { actionId: DOSE_TAKEN, label: 'Ya me la puse', value: item.time },
-    { actionId: DOSE_QUESTION, label: 'Tengo una duda', value: item.time },
+    { actionId: DOSE_TAKEN, label: m.doseTakenButton, value: item.time },
+    { actionId: DOSE_QUESTION, label: m.doseQuestionButton, value: item.time },
   ];
 }
 
 function followUpText(patient: Patient | null, ticket: Ticket | null): string {
-  const name = patient?.name ? `${patient.name}, ` : '';
-  const about = ticket ? ` Ayer avisamos a tu enfermera por lo que me contaste («${ticket.message.slice(0, 80)}»).` : '';
-  return `👩‍⚕️ ${name}¿cómo estás hoy?${about} Si algo ha empeorado o no mejora, llama a la clínica al ${CLINIC_EMERGENCY_PHONE}.`;
+  return messages(patient?.language).followUp(patient?.name, ticket ? ticket.message.slice(0, 80) : null);
 }
 
 async function loadPatients(): Promise<{ chatId: string; patient: Patient }[]> {
@@ -94,7 +92,7 @@ const dispatch = createStep({
     if (inputData.kind === 'medication' && inputData.chatId) {
       const patient = (await loadPatients()).find((p) => p.chatId === inputData.chatId)?.patient;
       if (!patient?.protocol.length) return { sent, details: [`no protocol on record for ${inputData.chatId}`] };
-      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
+      for (const item of patient.protocol) sent += await send(inputData.chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(patient, item));
       return { sent, details };
     }
 
@@ -114,7 +112,7 @@ const dispatch = createStep({
       for (const item of patient.protocol) {
         if (item.time !== hhmm) continue;
         if (!(await claimReminderSlot(chatId, day, item.time))) continue;
-        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(item));
+        sent += await send(chatId, medicationText(patient, item), `medication ${item.time}`, medicationButtons(patient, item));
       }
     }
     // Scheduled sends that are due (follow-ups planned when an urgent ticket was created).
@@ -128,7 +126,7 @@ const dispatch = createStep({
           details.push(`demo reminder ${row.id}: no protocol on record, skipped`);
           continue;
         }
-        sent += await send(row.chatId, demoReminderText(patient, item), `demo reminder ${row.id}`, medicationButtons(item));
+        sent += await send(row.chatId, demoReminderText(patient, item), `demo reminder ${row.id}`, medicationButtons(patient, item));
         continue;
       }
       const ticket = row.ticketId ? await getTicket(row.ticketId) : null;

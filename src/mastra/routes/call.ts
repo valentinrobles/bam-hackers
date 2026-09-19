@@ -1,12 +1,12 @@
 import { registerApiRoute } from '@mastra/core/server';
-import { addNurseNote } from '../memory/patient-memory';
+import { messages, type Lang } from '../i18n';
+import { addNurseNote, patientLanguage } from '../memory/patient-memory';
 import { notifyMake } from '../services/make';
 import { postToPatient } from '../services/nurse';
 import { getTicket, updateTicket } from '../services/tickets';
 import { callCredentials, summarizeCall, type CallRole } from '../services/vonage';
 
 const BOT_NAME = process.env.BOT_NAME ?? 'Lumi';
-const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
 
 function roleFrom(value: string | undefined): CallRole {
   return value === 'nurse' ? 'nurse' : 'patient';
@@ -18,15 +18,16 @@ function escapeHtml(value: string): string {
 
 // One static page for both roles. The Vonage client SDK comes from Vonage's CDN;
 // everything else is inline so the page needs nothing but this server.
-function callPage(ticketId: string, role: CallRole): string {
-  const you = role === 'nurse' ? 'Enfermera' : 'Paciente';
-  const other = role === 'nurse' ? 'la paciente' : 'tu enfermera';
+function callPage(ticketId: string, role: CallRole, lang: Lang): string {
+  const c = messages(lang).call;
+  const you = role === 'nurse' ? c.nurse : c.patient;
+  const other = role === 'nurse' ? c.otherPatient : c.otherNurse;
   return `<!doctype html>
-<html lang="es">
+<html lang="${lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Videollamada · ${escapeHtml(BOT_NAME)}</title>
+<title>${c.title} · ${escapeHtml(BOT_NAME)}</title>
 <script src="https://video.standard.vonage.com/v2/js/opentok.min.js"></script>
 <style>
   :root { color-scheme: dark; }
@@ -52,16 +53,16 @@ function callPage(ticketId: string, role: CallRole): string {
 </style>
 </head>
 <body>
-<header><span>${you} · ticket <strong>${escapeHtml(ticketId)}</strong></span><span id="peer">Esperando a ${other}…</span></header>
+<header><span>${you} · ticket <strong>${escapeHtml(ticketId)}</strong></span><span id="peer">${c.waitingFor(other)}</span></header>
 <main>
   <div id="remote"></div>
   <div id="local"></div>
-  <div id="status">Conectando…</div>
+  <div id="status">${c.connecting}</div>
 </main>
-<div id="done">Llamada finalizada.<br>Puedes cerrar esta pestaña.</div>
+<div id="done">${c.ended}</div>
 <footer>
-  <button id="retry">Reintentar</button>
-  <button id="hangup">Colgar</button>
+  <button id="retry">${c.retry}</button>
+  <button id="hangup">${c.hangUp}</button>
 </footer>
 <script>
 (function () {
@@ -72,6 +73,7 @@ function callPage(ticketId: string, role: CallRole): string {
   var hangupBtn = document.getElementById('hangup');
   var retryBtn = document.getElementById('retry');
   var session = null, publisher = null, ended = false;
+  var T = ${JSON.stringify({ permission: c.permission, noDevice: c.noDevice, busy: c.busy, moduleMissing: c.moduleMissing, connecting: c.connecting, connected: c.connected(other), waiting: c.waitingFor(other), inCall: c.inCall, disconnected: c.disconnected, genericPrefix: c.generic('__DETAIL__') })};
 
   function setStatus(text, isError) {
     statusEl.textContent = text;
@@ -81,16 +83,15 @@ function callPage(ticketId: string, role: CallRole): string {
 
   function explain(err) {
     var name = (err && err.name) || '';
-    if (/NotAllowed|Permission|OT_USER_MEDIA_ACCESS_DENIED/i.test(name) || /denied|permission/i.test(String(err && err.message)))
-      return 'No tenemos permiso para usar la cámara y el micrófono. Acepta el permiso en el navegador y pulsa Reintentar.';
-    if (/NotFound|OT_NO_DEVICES_FOUND/i.test(name)) return 'No se ha encontrado cámara o micrófono en este dispositivo.';
-    if (/NotReadable|OT_HARDWARE_UNAVAILABLE/i.test(name)) return 'Otra aplicación está usando la cámara. Ciérrala y pulsa Reintentar.';
-    return 'No se ha podido conectar: ' + ((err && err.message) || String(err)) + '. Si no funciona, llama a la clínica al ${CLINIC_EMERGENCY_PHONE}.';
+    if (/NotAllowed|Permission|OT_USER_MEDIA_ACCESS_DENIED/i.test(name) || /denied|permission/i.test(String(err && err.message))) return T.permission;
+    if (/NotFound|OT_NO_DEVICES_FOUND/i.test(name)) return T.noDevice;
+    if (/NotReadable|OT_HARDWARE_UNAVAILABLE/i.test(name)) return T.busy;
+    return T.genericPrefix.replace('__DETAIL__', (err && err.message) || String(err));
   }
 
   async function start() {
-    setStatus('Conectando…', false);
-    if (!window.OT) { setStatus('No se ha podido cargar el módulo de vídeo. Comprueba la conexión y pulsa Reintentar.', true); return; }
+    setStatus(T.connecting, false);
+    if (!window.OT) { setStatus(T.moduleMissing, true); return; }
     var creds;
     try {
       var res = await fetch('/call/' + encodeURIComponent(ticketId) + '/credentials?role=' + role);
@@ -103,11 +104,11 @@ function callPage(ticketId: string, role: CallRole): string {
       session.subscribe(event.stream, 'remote', { insertMode: 'replace', width: '100%', height: '100%' }, function (err) {
         if (err) setStatus(explain(err), true);
       });
-      peerEl.textContent = 'En llamada';
+      peerEl.textContent = T.inCall;
       setStatus('', false);
     });
-    session.on('streamDestroyed', function () { peerEl.textContent = 'Esperando a ${other}…'; });
-    session.on('sessionDisconnected', function () { if (!ended) setStatus('Desconectado de la llamada.', true); });
+    session.on('streamDestroyed', function () { peerEl.textContent = T.waiting; });
+    session.on('sessionDisconnected', function () { if (!ended) setStatus(T.disconnected, true); });
 
     publisher = OT.initPublisher('local', { insertMode: 'replace', width: '100%', height: '100%', publishAudio: true, publishVideo: true, name: role }, function (err) {
       if (err) setStatus(explain(err), true);
@@ -118,7 +119,7 @@ function callPage(ticketId: string, role: CallRole): string {
       if (err) { setStatus(explain(err), true); return; }
       session.publish(publisher, function (pubErr) {
         if (pubErr) setStatus(explain(pubErr), true);
-        else setStatus('Conectado. Esperando a ${other}…', false);
+        else setStatus(T.connected, false);
       });
     });
   }
@@ -152,7 +153,9 @@ export const callPageRoute = registerApiRoute('/call/:ticketId', {
   handler: async (c) => {
     const ticketId = c.req.param('ticketId');
     const role = roleFrom(c.req.query('role'));
-    return c.html(callPage(ticketId, role));
+    const ticket = await getTicket(ticketId).catch(() => null);
+    const lang: Lang = role === 'nurse' ? 'es' : ticket ? await patientLanguage(ticket.chatId) : 'es';
+    return c.html(callPage(ticketId, role, lang));
   },
 });
 
@@ -184,13 +187,12 @@ export const callEndedRoute = registerApiRoute('/call/:ticketId/ended', {
     await updateTicket(ticketId, { callEndedAt: endedAt.toISOString(), status: 'closed' });
     const when = new Intl.DateTimeFormat('es-ES', { timeZone: process.env.REMINDER_TIMEZONE || 'Europe/Madrid', dateStyle: 'long', timeStyle: 'short' }).format(endedAt);
     const summary = await summarizeCall(ticket).catch(() => null);
-    await addNurseNote(ticket.chatId, {
-      ticketId,
-      question: ticket.message,
-      reply: summary ? `Videollamada con tu enfermera el ${when}. Resumen: ${summary}` : `Videollamada con tu enfermera el ${when}.`,
-    }).catch((error: unknown) => logger.warn('could not write call note', { ticketId, error: String(error) }));
+    const m = messages(await patientLanguage(ticket.chatId));
+    await addNurseNote(ticket.chatId, { ticketId, question: ticket.message, reply: m.callNote(when, summary) }).catch((error: unknown) =>
+      logger.warn('could not write call note', { ticketId, error: String(error) }),
+    );
     const agent = c.get('mastra').getAgent('companion');
-    const notified = await postToPatient(agent, ticket.chatId, 'Llamada finalizada. Si necesitas algo más, aquí estoy.');
+    const notified = await postToPatient(agent, ticket.chatId, m.callEnded);
     await notifyMake('call.ended', {
       ticketId: ticket.id,
       chatId: ticket.chatId,

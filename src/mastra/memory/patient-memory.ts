@@ -1,5 +1,6 @@
 import { Memory } from '@mastra/memory';
 import { storage } from '../storage';
+import type { Lang } from '../i18n';
 import { emptyPatient, parsePatient, patientSchema, type Patient } from './patient-schema';
 
 export const memory = new Memory({
@@ -64,6 +65,10 @@ export async function appendSymptom(chatId: string, text: string, tier: Patient[
     symptoms: [...p.symptoms, { date: nowStamp(), text, tier }],
   }));
   return next.symptoms.length;
+}
+
+export async function patientLanguage(chatId: string): Promise<Lang> {
+  return (await readPatient(chatId))?.language ?? 'es';
 }
 
 export async function recordDoseTaken(chatId: string, item: { drug: string; dose: string; time: string }): Promise<void> {

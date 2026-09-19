@@ -47,11 +47,14 @@ const BOT_NAME = process.env.BOT_NAME ?? 'Lumi';
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? '+34900000000';
 const NURSE_RESPONSE_MINUTES = process.env.NURSE_RESPONSE_MINUTES ?? '4';
 
-export const onboardingMessage = [
-  `👋 Hola, soy ${BOT_NAME}, tu acompañante durante el tratamiento de FIV.`,
-  `Estoy aquí para ayudarte con:\n💊 Recordatorios de medicación\n📅 Dudas sobre citas\n📋 Preguntas prácticas del día a día`,
-  `Cualquier duda médica se la paso directamente a tu enfermera. Yo no soy médico ni te reemplazo a tu equipo. 🙏\n\nEscribe /demo si quieres ver cómo funciono con un caso de ejemplo.`,
-].join('\n\n');
+export function onboardingMessage(name?: string): string {
+  const greeting = name ? `Hola ${name}` : 'Hola';
+  return [
+    `${greeting}, soy ${BOT_NAME}, tu coordinador y acompañante durante tu tratamiento de FIV.`,
+    `Te ayudaré con:\n💊 Recordatorios de medicación\n📅 Dudas sobre citas\n📋 Preguntas prácticas del día a día`,
+    `Cualquier duda médica que requiera de un especialista médico la paso directamente a tu enfermera.\n\nEscribe /demo si quieres ver cómo funciono con un caso de ejemplo.`,
+  ].join('\n\n');
+}
 
 export const fallbackReply =
   `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la clínica: ${CLINIC_EMERGENCY_PHONE}.`;
@@ -180,9 +183,9 @@ Tone never changes the safety rules. Never reassure about a potentially serious 
   · ⚠️ something to be careful about
   · 🏥 clinic / nurse
   · 📋 information / record
-  · 🙏 empathy / support
   · 🚨 urgent — use only for actual urgency escalations
 - Never use more than 2 emojis per message unless the context is celebratory. Never any emoji in urgent escalation messages.
+- Never use hand-related emojis.
 - Off-topic messages: a short friendly reply, then gently back to the treatment.
 - Never reply with an error or stay silent. If you cannot help, say what you can do instead.
 
@@ -275,8 +278,9 @@ function firstName(author: Author): string | undefined {
 async function ensureOnboarded(chatId: string, author: Author, post: (text: string) => Promise<unknown>): Promise<boolean> {
   const patient = await readPatient(chatId);
   if (patient?.onboarded) return false;
-  await post(onboardingMessage);
-  await writePatient(chatId, { ...(patient ?? emptyPatient), name: firstName(author), onboarded: true });
+  const name = firstName(author);
+  await post(onboardingMessage(name));
+  await writePatient(chatId, { ...(patient ?? emptyPatient), name, onboarded: true });
   return true;
 }
 
@@ -373,9 +377,9 @@ export async function prepareTurn(chatId: string, text: string, requestContext: 
 // number and the video link are always present.
 function urgentReply(name: string | undefined, videoUrl: string): string {
   return [
-    `${name ? `${name}, gracias` : 'Gracias'} por contármelo; te escucho.`,
-    `Estoy avisando a tu enfermera ahora mismo y te va a atender por videollamada en este enlace: ${videoUrl}`,
-    `Si empeora, no mejora o no puedes esperar, llama ya a la clínica al ${CLINIC_EMERGENCY_PHONE}.`,
+    `Gracias por contármelo${name ? `, ${name}` : ''}.`,
+    `Estoy avisando a tu enfermera ahora mismo y te va a llamar por videollamada en este enlace: ${videoUrl}`,
+    `Si no mejora o no puedes esperar, llama directamente a la clínica al ${CLINIC_EMERGENCY_PHONE}.`,
   ].join('\n');
 }
 

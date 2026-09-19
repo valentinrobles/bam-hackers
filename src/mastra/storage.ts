@@ -16,7 +16,9 @@ function projectRoot(): string {
   }
 }
 
+export const databaseUrl = process.env.DATABASE_URL ?? `file:${path.join(projectRoot(), 'mastra.db')}`;
+
 export const storage = new LibSQLStore({
   id: 'ivf-companion-storage',
-  url: process.env.DATABASE_URL ?? `file:${path.join(projectRoot(), 'mastra.db')}`,
+  url: databaseUrl,
 });

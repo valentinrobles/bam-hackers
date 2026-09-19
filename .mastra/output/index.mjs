@@ -2,15 +2,22 @@ import { scoreTraces, scoreTracesWorkflow } from '@mastra/core/evals/scoreTraces
 import { Mastra } from '@mastra/core/mastra';
 import { PinoLogger } from '@mastra/loggers';
 import { Agent, isDurableAgentLike, MessageList } from '@mastra/core/agent';
-import { Memory } from '@mastra/memory';
 import { createTelegramAdapter } from '@chat-adapter/telegram';
-import z$2, { z } from 'zod';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
-import { LibSQLStore } from '@mastra/libsql';
+import { r as readPatient, s as summarizePatient, c as clinicalThreadId, p as patchPatient, m as memory, a as chatIdFromThreadId, b as appendSymptom, d as resetChat, w as writePatient, e as emptyPatient, t as threadIdForChat } from './patient-memory.mjs';
+import { N as NebiusCallProcessor, n as nebiusProviderOptions, r as resolvedNebiusModel, c as classifyMessage } from './nebius.mjs';
+import { Card, Actions, Button } from 'chat';
+import { g as getTicket, u as updateTicket, l as latestTicketByStatus } from './tickets.mjs';
+import { classifyMessageTool } from './tools/80a53523-8894-ad48-053e-548fff21baa7.mjs';
+import { openTicket, createTicketTool } from './tools/06500b67-0372-b96a-8569-6574078588e3.mjs';
+import { logSymptomTool } from './tools/8536deb5-171f-f5a8-af8a-2187b32d2353.mjs';
+import { notifyNurseTool } from './tools/abcc5ea5-aa0f-e662-f224-b8898923c3bb.mjs';
+import { c as createVideoCall, s as startVideoCallTool } from './start-video-call.mjs';
+import { RequestContext, MASTRA_RESOURCE_ID_KEY as MASTRA_RESOURCE_ID_KEY$1, MASTRA_THREAD_ID_KEY as MASTRA_THREAD_ID_KEY$1 } from '@mastra/core/request-context';
+import { registerApiRoute, CompositeAuth, MastraServerBase } from '@mastra/core/server';
+import { s as storage } from './storage.mjs';
 import * as crypto$2 from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync as existsSync$1, createReadStream, statSync } from 'fs';
+import { readFileSync, existsSync, createReadStream, statSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -21,11 +28,11 @@ import { request as request$1, createServer, STATUS_CODES } from 'http';
 import { Http2ServerRequest, constants } from 'http2';
 import process$1, { versions } from 'process';
 import { submitPlanTool, isProviderDefinedTool, isVercelTool, Tool } from '@mastra/core/tools';
-import { z as z$1, toJSONSchema, ZodOptional, ZodNullable, ZodArray, ZodRecord, ZodObject } from 'zod/v4';
+import { z, toJSONSchema, ZodOptional, ZodNullable, ZodArray, ZodRecord, ZodObject } from 'zod/v4';
 import z3, { ZodFirstPartyTypeKind } from 'zod/v3';
 import { toStandardSchema as toStandardSchema$5 } from '@mastra/core/schema';
 import { zodToJsonSchema as zodToJsonSchema$2 } from '@mastra/core/utils/zod-to-json';
-import { CompositeAuth, MastraServerBase } from '@mastra/core/server';
+import z$2, { z as z$1 } from 'zod';
 import * as authEE from '@mastra/core/auth/ee';
 import { matchesPermission } from '@mastra/core/auth/ee';
 import { MastraMemory } from '@mastra/core/memory';
@@ -39,7 +46,6 @@ import util, { isDeepStrictEqual } from 'util';
 import { MastraA2AError } from '@mastra/core/a2a';
 import { lookup } from 'dns/promises';
 import { isIP } from 'net';
-import { MASTRA_RESOURCE_ID_KEY as MASTRA_RESOURCE_ID_KEY$1, MASTRA_THREAD_ID_KEY as MASTRA_THREAD_ID_KEY$1, RequestContext } from '@mastra/core/request-context';
 import { generateEmptyFromSchema, safeStringify } from '@mastra/core/utils';
 import { coreFeatures } from '@mastra/core/features';
 import * as coreStorage from '@mastra/core/storage';
@@ -51,32 +57,12 @@ import { LocalSkillSource } from '@mastra/core/workspace';
 import { pipeline } from 'stream/promises';
 import { Buffer as Buffer$1 } from 'buffer';
 import { tools } from './tools.mjs';
-
-const cyclePhases = ["stimulation", "trigger", "retrieval", "transfer", "two_week_wait"];
-const symptomTiers = ["routine", "clinical", "urgent"];
-const ONLY_IF_STATED = "Omit entirely unless the patient stated it explicitly or /demo seeded it. Never guess.";
-const patientSchema = z.object({
-  name: z.string().optional().describe("Patient first name."),
-  onboarded: z.boolean().default(false),
-  cycle: z.object({
-    day: z.number(),
-    phase: z.enum(cyclePhases),
-    startDate: z.string()
-  }).optional().describe(`Current treatment cycle. ${ONLY_IF_STATED}`),
-  protocol: z.array(z.object({ drug: z.string(), dose: z.string(), time: z.string() })).default([]).describe(`Medication protocol. ${ONLY_IF_STATED}`),
-  nextAppointment: z.object({ type: z.string(), datetime: z.string() }).optional().describe(`Next clinic appointment. ${ONLY_IF_STATED}`),
-  symptoms: z.array(z.object({ date: z.string(), text: z.string(), tier: z.enum(symptomTiers) })).default([]).describe("Symptoms the patient reported, appended over time."),
-  openTicketId: z.string().nullable().default(null)
-});
-const emptyPatient = patientSchema.parse({});
-function parsePatient(raw) {
-  if (!raw) return null;
-  try {
-    return patientSchema.parse(JSON.parse(raw));
-  } catch {
-    return null;
-  }
-}
+import '@mastra/memory';
+import '@libsql/client';
+import 'node:crypto';
+import 'node:fs';
+import 'node:path';
+import '@mastra/libsql';
 
 const es = new Intl.DateTimeFormat("es-ES", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 function spanishDate(d) {
@@ -102,147 +88,200 @@ function martaPatient(now = /* @__PURE__ */ new Date()) {
   };
 }
 
-const ENV_VAR = { main: "MODEL_MAIN", triage: "MODEL_TRIAGE" };
-const DEFAULT_MODEL = {
-  main: "nvidia/nemotron-3-super-120b-a12b",
-  triage: "nvidia/nemotron-3-super-120b-a12b"
-};
-function noThinkingBody(modelId) {
-  return /glm/i.test(modelId) ? { thinking: { type: "disabled" } } : { chat_template_kwargs: { enable_thinking: false } };
+const RENDER_CONTEXT_KEY = "__mastra_chat_channel_render";
+const NURSE_APPROVE = "nurse_approve";
+const NURSE_DENY = "nurse_deny";
+const NOTIFY_NURSE_TOOL = "notify_nurse";
+function nurseChatId() {
+  return process.env.NURSE_TELEGRAM_CHAT_ID?.trim() || void 0;
 }
-const logger$1 = new PinoLogger({ name: "nebius", level: "info" });
-function nebiusModelId(role) {
-  return process.env[ENV_VAR[role]] || DEFAULT_MODEL[role];
+const nurseReplyPrefix = "\u{1F469}\u200D\u2695\uFE0F Tu enfermera dice:";
+const Text = (content) => ({ type: "text", content });
+const logger$1 = new PinoLogger({ name: "nurse", level: "info" });
+let nurseAgent;
+function setNurseAgent(agent) {
+  nurseAgent = agent;
 }
-function nebiusBaseUrl() {
-  return (process.env.NEBIUS_BASE_URL || "https://api.tokenfactory.nebius.com/v1").replace(/\/+$/, "");
+const CALLBACK_DATA_PREFIX = "chat:";
+function telegramApiBase() {
+  return (process.env.TELEGRAM_API_BASE_URL || "https://api.telegram.org").replace(/\/+$/, "");
 }
-let servedModelIds;
-async function listServedModelIds() {
-  if (!servedModelIds) {
-    servedModelIds = (async () => {
-      const apiKey = process.env.NEBIUS_API_KEY;
-      if (!apiKey) return [];
-      const res = await fetch(`${nebiusBaseUrl()}/models`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
-        signal: AbortSignal.timeout(5e3)
-      });
-      if (!res.ok) throw new Error(`GET /models returned ${res.status}`);
-      const body = await res.json();
-      return (body.data ?? []).map((m) => m.id).filter((id) => typeof id === "string");
-    })().catch((error) => {
-      logger$1.warn("nebius: could not list models, using configured ids as-is", { error: String(error) });
-      servedModelIds = void 0;
-      return [];
-    });
+function callbackData(actionId, value) {
+  return `${CALLBACK_DATA_PREFIX}${JSON.stringify({ a: actionId, v: value })}`;
+}
+async function telegramSendMessage(chatId, text, replyMarkup) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set");
+  const res = await fetch(`${telegramApiBase()}/bot${token}/sendMessage`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, ...replyMarkup ? { reply_markup: replyMarkup } : {} }),
+    signal: AbortSignal.timeout(8e3)
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) throw new Error(`sendMessage ${res.status}: ${body.description ?? "no description"}`);
+}
+async function postWithFallback(agent, chatId, label, viaSdk, viaBotApi) {
+  const sdk = agent?.getChannels()?.sdk;
+  if (sdk) {
+    try {
+      const thread = await sdk.openDM(chatId);
+      await viaSdk(thread);
+      return { posted: true, via: "chat-sdk" };
+    } catch (error) {
+      logger$1.warn(`${label}: Chat SDK post failed, falling back to Bot API`, { chatId, error: String(error) });
+    }
+  } else {
+    logger$1.warn(`${label}: channel SDK not available, using Bot API`, { chatId });
   }
-  return servedModelIds;
-}
-const resolvedIds = /* @__PURE__ */ new Map();
-async function resolveNebiusModelId(role) {
-  const cached = resolvedIds.get(role);
-  if (cached) return cached;
-  const configured = nebiusModelId(role);
-  const served = await listServedModelIds();
-  const match = served.find((id) => id.toLowerCase() === configured.toLowerCase());
-  if (!match) {
-    if (served.length) logger$1.warn("nebius: configured model id is not in /models", { role, configured });
-    return configured;
+  try {
+    await viaBotApi();
+    return { posted: true, via: "bot-api" };
+  } catch (error) {
+    const reason = String(error);
+    logger$1.error(`${label}: Bot API post failed`, { chatId, error: reason });
+    return { posted: false, reason };
   }
-  if (match !== configured) logger$1.warn("nebius: corrected model id case", { role, configured, served: match });
-  resolvedIds.set(role, match);
-  return match;
 }
-function nebiusModel(role, modelId = nebiusModelId(role)) {
-  const baseUrl = process.env.NEBIUS_BASE_URL;
-  return {
-    id: `nebius/${modelId}`,
-    apiKey: process.env.NEBIUS_API_KEY,
-    ...baseUrl ? { url: baseUrl } : {}
-  };
+function requireNurseChatId(label) {
+  const chatId = nurseChatId();
+  if (!chatId) logger$1.error(`${label}: NURSE_TELEGRAM_CHAT_ID is not set, nothing sent to the nurse`);
+  return chatId ?? null;
 }
-async function resolvedNebiusModel(role) {
-  return nebiusModel(role, await resolveNebiusModelId(role));
+function ticketHeader(ticket) {
+  const name = ticket.patientName ?? "paciente sin nombre";
+  return `Ticket ${ticket.id} \xB7 ${ticket.tier.toUpperCase()} \xB7 ${name}`;
 }
-function nebiusProviderOptions(role) {
-  return { nebius: noThinkingBody(nebiusModelId(role)) };
+async function postNurseApprovalCard(agent, ticket, suggestedReply) {
+  const chatId = requireNurseChatId("nurse card");
+  if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
+  const patient = await readPatient(ticket.chatId);
+  const summary = summarizePatient(patient);
+  const plain = [ticketHeader(ticket), summary, `Mensaje de la paciente:
+${ticket.message}`, `Respuesta propuesta:
+${suggestedReply}`].join("\n\n");
+  return postWithFallback(
+    agent,
+    chatId,
+    "nurse card",
+    (thread) => thread.post(
+      Card({
+        title: ticketHeader(ticket),
+        children: [
+          Text(summary),
+          Text(`Mensaje de la paciente:
+${ticket.message}`),
+          Text(`Respuesta propuesta:
+${suggestedReply}`),
+          Actions([
+            Button({ id: NURSE_APPROVE, label: "Aprobar y enviar", value: ticket.id, style: "primary" }),
+            Button({ id: NURSE_DENY, label: "Rechazar y escribir", value: ticket.id, style: "danger" })
+          ])
+        ]
+      })
+    ),
+    () => telegramSendMessage(chatId, plain, {
+      inline_keyboard: [
+        [
+          { text: "Aprobar y enviar", callback_data: callbackData(NURSE_APPROVE, ticket.id) },
+          { text: "Rechazar y escribir", callback_data: callbackData(NURSE_DENY, ticket.id) }
+        ]
+      ]
+    })
+  );
 }
-const THINK_CLOSE = "</think>";
-const THINK_OPEN = "<think>";
-function stripThinking(text) {
-  const idx = text.lastIndexOf(THINK_CLOSE);
-  if (idx === -1) return text;
-  return text.slice(idx + THINK_CLOSE.length).trimStart();
+async function postNurseAlert(agent, ticket, note) {
+  const chatId = requireNurseChatId("nurse alert");
+  if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
+  const patient = await readPatient(ticket.chatId);
+  const label = ticket.tier === "urgent" ? "\u{1F6A8} URGENTE" : "Ticket sin respuesta propuesta";
+  const text = [`${label} \xB7 ${ticketHeader(ticket)}`, ticket.message, summarizePatient(patient), note].filter(Boolean).join("\n\n");
+  return postWithFallback(agent, chatId, "nurse alert", (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
 }
-function logModelCall(stats) {
-  logger$1.info(`nebius ${stats.role} call`, stats);
-}
-function thinkState(state) {
-  if (!state.think) state.think = { phase: "undecided", buffer: "" };
-  return state.think;
-}
-class NebiusCallProcessor {
-  constructor(role) {
-    this.role = role;
-    this.id = `nebius-${role}`;
-  }
-  role;
-  id;
-  async processInputStep({ stepNumber, state }) {
-    state[`step-${stepNumber}-start`] = Date.now();
-  }
-  async processOutputStep({ messages, stepNumber, usage, state }) {
-    const startedAt = state[`step-${stepNumber}-start`];
-    logModelCall({
-      role: this.role,
-      model: resolvedIds.get(this.role) ?? nebiusModelId(this.role),
-      step: stepNumber,
-      latencyMs: typeof startedAt === "number" ? Date.now() - startedAt : -1,
-      inputTokens: usage?.inputTokens,
-      outputTokens: usage?.outputTokens,
-      totalTokens: usage?.totalTokens,
-      reasoningTokens: usage?.reasoningTokens
-    });
-    return messages;
-  }
-  async processOutputStream({ part, state }) {
-    if (part.type !== "text-delta") return part;
-    const think = thinkState(state);
-    if (think.phase === "passthrough") return part;
-    think.buffer += part.payload.text;
-    const trimmed = think.buffer.trimStart();
-    if (think.phase === "undecided") {
-      if (trimmed.startsWith(THINK_OPEN)) {
-        think.phase = "thinking";
-      } else if (THINK_OPEN.startsWith(trimmed)) {
-        return null;
-      } else {
-        think.phase = "passthrough";
-        return { ...part, payload: { ...part.payload, text: think.buffer } };
+class NurseCardProcessor {
+  id = "nurse-card";
+  async processOutputStream({ part, agent: contextAgent }) {
+    if (part.type !== "tool-call-approval" || part.payload.toolName !== NOTIFY_NURSE_TOOL) return part;
+    const agent = contextAgent ?? nurseAgent;
+    try {
+      const args = part.payload.args;
+      const ticketId = typeof args.ticketId === "string" ? args.ticketId : void 0;
+      const suggestedReply = typeof args.suggestedReply === "string" ? args.suggestedReply : "";
+      const ticket = ticketId ? await getTicket(ticketId) : null;
+      if (!ticket) {
+        logger$1.warn("notify_nurse suspended for an unknown ticket", { ticketId });
+        return part;
       }
+      await updateTicket(ticket.id, {
+        runId: part.runId,
+        toolCallId: part.payload.toolCallId,
+        suggestedReply,
+        status: "awaiting_nurse"
+      });
+      logger$1.info("notify_nurse suspended, posting nurse card", { ticketId: ticket.id, runId: part.runId, toolCallId: part.payload.toolCallId });
+      void postNurseApprovalCard(agent, ticket, suggestedReply).then((outcome) => logger$1.info("nurse approval card", { ticketId: ticket.id, ...outcome })).catch((error) => logger$1.error("could not post the nurse card", { ticketId: ticket.id, error: String(error) }));
+    } catch (error) {
+      logger$1.error("nurse card processor failed", { error: String(error) });
     }
-    if (!think.buffer.includes(THINK_CLOSE)) return null;
-    think.phase = "passthrough";
-    const rest = stripThinking(think.buffer);
-    return rest ? { ...part, payload: { ...part.payload, text: rest } } : null;
+    return part;
   }
 }
-
-function projectRoot() {
-  let dir = process.cwd();
-  while (true) {
-    if (existsSync(path.join(dir, "package.json")) && !dir.includes(`${path.sep}.mastra${path.sep}`)) {
-      return dir;
+async function handleNurseDecision(agent, ticketId, approved, requestContext) {
+  const ticket = await getTicket(ticketId);
+  if (!ticket) return { outcome: "not_found" };
+  if (!ticket.runId || !ticket.toolCallId) return { outcome: "not_suspended", ticket };
+  if (ticket.status !== "awaiting_nurse") return { outcome: "already_handled", ticket };
+  const patientText = approved ? `${nurseReplyPrefix} ${ticket.suggestedReply ?? ""}`.trim() : `${ticket.patientName ? `${ticket.patientName}, tu` : "Tu"} enfermera ha le\xEDdo tu mensaje y te escribir\xE1 directamente en unos minutos.`;
+  const delivered = await postToPatient(agent, ticket.chatId, patientText);
+  logger$1.info("nurse decision delivery", { ticketId: ticket.id, approved, delivered });
+  const threadId = clinicalThreadId(ticket.chatId, ticket.id);
+  const renderContext = await agent.getChannels()?.buildRenderContextForThread(threadId);
+  if (renderContext) requestContext.set(RENDER_CONTEXT_KEY, renderContext);
+  requestContext.set("tier", "clinical");
+  requestContext.set("ticketId", ticket.id);
+  requestContext.set("nurseDecision", approved ? "approved" : "declined");
+  const memory = { thread: threadId, resource: ticket.chatId };
+  const options = { runId: ticket.runId, toolCallId: ticket.toolCallId, requestContext, memory };
+  try {
+    const stream = approved ? await agent.approveToolCall(options) : await agent.declineToolCall({
+      ...options,
+      reason: "La enfermera ha le\xEDdo el mensaje y prefiere responder personalmente; escribir\xE1 a la paciente en unos minutos."
+    });
+    await updateTicket(ticket.id, { status: approved ? "approved" : "awaiting_nurse_reply" });
+    const text = await stream.text;
+    if (approved) {
+      await updateTicket(ticket.id, { status: "answered" });
+      await clearOpenTicket(ticket);
     }
-    const parent = path.dirname(dir);
-    if (parent === dir) return process.cwd();
-    dir = parent;
+    return { outcome: "resumed", ticket, text, delivered };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("No snapshot found")) {
+      await updateTicket(ticket.id, { status: "closed" });
+      return { outcome: "already_handled", ticket };
+    }
+    throw error;
   }
 }
-const storage = new LibSQLStore({
-  id: "ivf-companion-storage",
-  url: process.env.DATABASE_URL ?? `file:${path.join(projectRoot(), "mastra.db")}`
-});
+async function clearOpenTicket(ticket) {
+  try {
+    await patchPatient(ticket.chatId, (p) => p.openTicketId === ticket.id ? { ...p, openTicketId: null } : p);
+  } catch (error) {
+    logger$1.warn("could not clear openTicketId", { ticketId: ticket.id, error: String(error) });
+  }
+}
+async function postToPatient(agent, chatId, text) {
+  const outcome = await postWithFallback(agent, chatId, "patient post", (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
+  return outcome.posted;
+}
+async function forwardNurseReply(agent, text) {
+  const ticket = await latestTicketByStatus("awaiting_nurse_reply");
+  if (!ticket) return { ticket: null, delivered: false };
+  const delivered = await postToPatient(agent, ticket.chatId, `${nurseReplyPrefix} ${text}`);
+  if (!delivered) return { ticket, delivered: false };
+  await updateTicket(ticket.id, { status: "answered", suggestedReply: text });
+  await clearOpenTicket(ticket);
+  return { ticket, delivered: true };
+}
 
 const BOT_NAME = process.env.BOT_NAME ?? "Lumi";
 const CLINIC_EMERGENCY_PHONE = process.env.CLINIC_EMERGENCY_PHONE ?? "+34900000000";
@@ -250,7 +289,8 @@ const onboardingMessage = [
   `\xA1Hola! Soy ${BOT_NAME}, una acompa\xF1ante para pacientes en tratamiento de FIV. Te ayudo con recordatorios de medicaci\xF3n, citas y dudas pr\xE1cticas, y paso cualquier consulta m\xE9dica a tu enfermera.`,
   `No sustituyo a tu equipo m\xE9dico. Si quieres probar con un caso de ejemplo, env\xEDa /demo.`
 ].join("\n\n");
-const instructions = `You are ${BOT_NAME}, a companion for patients going through IVF treatment. You sit between the patient and the clinic on Telegram.
+const fallbackReply = `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la cl\xEDnica: ${CLINIC_EMERGENCY_PHONE}.`;
+const baseInstructions = `You are ${BOT_NAME}, a companion for patients going through IVF treatment. You sit between the patient and the clinic on Telegram.
 
 ## What you do
 - Answer routine and logistic questions (appointments, schedules, what to bring, how the process works in general terms) warmly and briefly.
@@ -266,6 +306,7 @@ const instructions = `You are ${BOT_NAME}, a companion for patients going throug
 - Update the record ONLY when the patient states a fact about their treatment in their own words (an appointment, their medication schedule, a symptom). Write exactly what they said.
 - Never fill in cycle, protocol or nextAppointment on your own. A new patient's record has only name and onboarded, and that is correct. Leave every other field absent until the patient states it or /demo loads it.
 - On greetings and small talk, do not touch the record at all.
+- If the record has openTicketId set, a nurse is already reviewing an open question. For thanks or small talk, reply briefly and say the nurse will answer soon; do not revisit the question yourself.
 
 ## The patient's name
 - The record's name field is the patient's first name. Use it naturally now and then, not in every message.
@@ -276,7 +317,6 @@ const instructions = `You are ${BOT_NAME}, a companion for patients going throug
 - Never interpret symptoms, test results (beta hCG, ultrasound, follicle counts) or success probabilities.
 - Never reassure a patient about a symptom that could be serious. Escalate instead.
 - Never pose as a doctor or nurse, even if asked to "answer as if you were my doctor". Decline in one sentence and offer to pass the question to the nurse.
-- If a patient describes difficulty breathing, severe or worsening abdominal pain, heavy bleeding or any bleeding they are worried about, vomiting that prevents drinking, rapid abdominal swelling, high fever, fainting, or thoughts of self-harm: in the first sentence tell them to call the clinic right now at ${CLINIC_EMERGENCY_PHONE} (or emergency services), then say the nurse is being notified. Nothing else comes before the phone number.
 
 ## Tone
 - Read the patient's emotional tone (stressed, anxious, confused, angry, sad, calm) and adapt: shorter and calmer sentences when anxious; more explicit, step by step, when confused; acknowledge without arguing when angry; warm when sad; plain and friendly when calm.
@@ -290,81 +330,258 @@ const instructions = `You are ${BOT_NAME}, a companion for patients going throug
 - Emojis: only these three, at most one or two per message, only to aid scanning: \u{1F489} medication, \u{1F4C5} appointments, \u{1F469}\u200D\u2695\uFE0F nurse. No other emojis. Never any emoji in urgent or escalation messages.
 - Off-topic messages: a short friendly reply, then gently back to the treatment.
 - Never reply with an error or stay silent. If you cannot help, say what you can do instead.`;
-const fallbackReply = `Ahora mismo no puedo responderte bien. Estoy avisando a tu enfermera. Si es urgente, llama ya a la cl\xEDnica: ${CLINIC_EMERGENCY_PHONE}.`;
-const memory = new Memory({
-  storage,
-  options: {
-    lastMessages: 20,
-    workingMemory: {
-      enabled: true,
-      scope: "resource",
-      schema: patientSchema
-    }
+function tierInstructions(tier, ticketId, nurseDecision) {
+  if (nurseDecision) {
+    return `## This message
+The nurse has ${nurseDecision} the suggested reply for ticket ${ticketId ?? ""} and the patient has already been told the outcome in a separate message. Call no tools. Reply with a single short sentence and no advice, for example "Aqu\xED sigo para lo que necesites."`;
   }
-});
-function chatIdFromThreadId(threadId) {
-  return threadId.replace(/^telegram:/, "");
-}
-async function readPatient(threadId, resourceId) {
-  return parsePatient(await memory.getWorkingMemory({ threadId, resourceId }));
-}
-async function writePatient(threadId, resourceId, patient) {
-  await memory.updateWorkingMemory({ threadId, resourceId, workingMemory: JSON.stringify(patient) });
-}
-async function resetChat(threadId, resourceId) {
-  await writePatient(threadId, resourceId, emptyPatient);
-  if (await memory.getThreadById({ threadId })) {
-    await memory.deleteThread(threadId);
+  switch (tier) {
+    case "clinical":
+      return `## This message
+Triage tier: CLINICAL. Ticket ${ticketId ?? "(already open)"} exists and the patient has already been told you are contacting the nurse. Do not answer the clinical question yourself and do not create another ticket.
+Call notify_nurse exactly once, with ticketId "${ticketId ?? ""}" and a suggestedReply in Spanish written as the nurse would answer: concrete, safe, two or three sentences, addressed to the patient by name if known. Do not write any text before calling the tool.
+After notify_nurse returns (approved or declined), the patient has already been told the outcome in a separate message. Reply with a single short sentence and no advice, for example "Aqu\xED sigo para lo que necesites."`;
+    case "urgent":
+      return `## This message
+Triage tier: URGENT. Ticket ${ticketId ?? "(already open)"} exists and the nurse has been alerted. Call start_video_call with ticketId "${ticketId ?? ""}" first, then reply. The reply must contain, in this order: the patient's name if known, one warm sentence acknowledging what they wrote, the sentence "Estoy avisando a tu enfermera ahora mismo", the video call link from the tool as the place where the nurse will see them now, and the clinic phone with its condition, for example "si el sangrado es abundante o no para, llama ya al ${CLINIC_EMERGENCY_PHONE}" (adapt the condition to the symptom). Four or five short sentences. No emojis. Do not ask the patient to describe more before giving the phone.`;
+    case "logistic":
+      return `## This message
+Triage tier: LOGISTIC. Answer from the record. If a field is missing, say you will check with the clinic.`;
+    case "routine":
+      return `## This message
+Triage tier: ROUTINE. Reply briefly and warmly. If the patient mentions a symptom in passing, call log_symptom.`;
+    default:
+      return `## This message
+No triage tier is attached. Classify it yourself with classify_message before answering. If the tier is clinical, open a ticket with create_ticket and then call notify_nurse. If it is urgent, open a ticket, call start_video_call and give the clinic phone ${CLINIC_EMERGENCY_PHONE} in the first sentence.`;
   }
 }
-const onDirectMessage = async (thread, message, defaultHandler, ctx) => {
-  const logger = ctx.mastra?.getLogger();
-  const threadId = thread.id;
-  const resourceId = chatIdFromThreadId(threadId);
-  const text = message.text.trim();
-  logger?.info("telegram inbound", {
-    chatId: resourceId,
-    userId: message.author.userId,
-    userName: message.author.userName,
-    threadId
-  });
-  try {
-    if (text === "/demo" || text.startsWith("/demo ")) {
+const allTools = {
+  classify_message: classifyMessageTool,
+  log_symptom: logSymptomTool,
+  create_ticket: createTicketTool,
+  notify_nurse: notifyNurseTool,
+  start_video_call: startVideoCallTool
+};
+function toolsForTier(tier) {
+  switch (tier) {
+    case "clinical":
+      return { notify_nurse: notifyNurseTool };
+    case "urgent":
+      return { start_video_call: startVideoCallTool, log_symptom: logSymptomTool };
+    case "logistic":
+    case "routine":
+      return { log_symptom: logSymptomTool };
+    default:
+      return allTools;
+  }
+}
+function readTier(requestContext) {
+  const value = requestContext.get("tier");
+  return value === "routine" || value === "logistic" || value === "clinical" || value === "urgent" ? value : void 0;
+}
+function readTicketId(requestContext) {
+  const value = requestContext.get("ticketId");
+  return typeof value === "string" ? value : void 0;
+}
+function readNurseDecision(requestContext) {
+  const value = requestContext.get("nurseDecision");
+  return value === "approved" || value === "declined" ? value : void 0;
+}
+const COMMAND_PATTERN = /^\s*\/(start|demo|reset)(?:@\w+)?(?:\s|$)/i;
+function parseCommand(text) {
+  const cleaned = text.replace(/<user[^>]*>|<\/user>/gi, "").trim();
+  const match = COMMAND_PATTERN.exec(cleaned);
+  return match ? match[1].toLowerCase() : null;
+}
+function firstName(author) {
+  return author.fullName?.trim().split(/\s+/)[0] || author.userName || void 0;
+}
+async function ensureOnboarded(chatId, author, post) {
+  const patient = await readPatient(chatId);
+  if (patient?.onboarded) return false;
+  await post(onboardingMessage);
+  await writePatient(chatId, { ...patient ?? emptyPatient, name: firstName(author), onboarded: true });
+  return true;
+}
+async function handleCommand(command, chatId, author, post) {
+  switch (command) {
+    case "demo": {
       const marta = martaPatient();
-      await writePatient(threadId, resourceId, marta);
-      await thread.post(
+      await writePatient(chatId, marta);
+      await post(
         `Demo cargada. Ahora eres Marta: d\xEDa ${marta.cycle?.day} de estimulaci\xF3n, ${marta.protocol[0]?.drug} ${marta.protocol[0]?.dose} a las ${marta.protocol[0]?.time}, ${marta.nextAppointment?.type} el ${marta.nextAppointment?.datetime}. Preg\xFAntame lo que quieras.`
       );
       return;
     }
-    if (text === "/reset" || text.startsWith("/reset ")) {
-      await resetChat(threadId, resourceId);
-      await thread.post("He borrado la memoria de este chat. Escr\xEDbeme \xABhola\xBB para empezar de nuevo.");
+    case "reset":
+      await resetChat(chatId);
+      await post("He borrado la memoria de este chat. Escr\xEDbeme \xABhola\xBB para empezar de nuevo.");
+      return;
+    case "start": {
+      const onboarded = await ensureOnboarded(chatId, author, post);
+      if (!onboarded) await post("\xA1Hola de nuevo! \xBFEn qu\xE9 te puedo ayudar hoy?");
+    }
+  }
+}
+async function prepareTurn(chatId, text, requestContext) {
+  const { tier, reason } = await classifyMessage(text);
+  requestContext.set("tier", tier);
+  if (tier !== "clinical" && tier !== "urgent") return { tier, reason };
+  const patient = await readPatient(chatId);
+  await appendSymptom(chatId, text, tier);
+  const { ticketId } = await openTicket({ chatId, tier, message: text, contextSummary: summarizePatient(patient) });
+  requestContext.set("ticketId", ticketId);
+  const ticket = await getTicket(ticketId);
+  if (tier === "urgent") {
+    const { url } = await createVideoCall(ticketId);
+    if (ticket) {
+      void postNurseAlert(companion, ticket).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
+    }
+    return { tier, reason, ticketId, ticket, directReply: urgentReply(patient?.name, url) };
+  }
+  return { tier, reason, ticketId, ticket, ack: clinicalAck(patient?.name) };
+}
+function urgentReply(name, videoUrl) {
+  return [
+    `${name ? `${name}, gracias` : "Gracias"} por cont\xE1rmelo; te leo y no est\xE1s sola en esto.`,
+    `Estoy avisando a tu enfermera ahora mismo y te va a atender por videollamada en este enlace: ${videoUrl}`,
+    `Si empeora, no mejora o no puedes esperar, llama ya a la cl\xEDnica al ${CLINIC_EMERGENCY_PHONE}.`
+  ].join("\n");
+}
+class TierToolChoiceProcessor {
+  id = "tier-tool-choice";
+  async processInputStep({ stepNumber, requestContext }) {
+    if (stepNumber !== 0 || !requestContext || readNurseDecision(requestContext)) return void 0;
+    if (readTier(requestContext) === "clinical") return { toolChoice: "required" };
+    return void 0;
+  }
+}
+async function runClinicalTurn(chatId, ticketId, text, requestContext) {
+  const result = await companion.generate(text, {
+    requestContext,
+    memory: { thread: clinicalThreadId(chatId, ticketId), resource: chatId }
+  });
+  const ticket = await getTicket(ticketId);
+  if (ticket && ticket.status === "open") {
+    console.warn("[companion] clinical turn ended without notify_nurse; routing ticket to the nurse directly", { ticketId, finishReason: result.finishReason });
+    await updateTicket(ticketId, { status: "awaiting_nurse_reply" });
+    await postNurseAlert(companion, ticket, "Responde en este chat y se lo reenv\xEDo a la paciente tal cual.").catch(() => void 0);
+  }
+  return result;
+}
+function clinicalAck(name) {
+  return `${name ? `${name}, esto` : "Esto"} se lo paso a tu enfermera ahora mismo \u{1F469}\u200D\u2695\uFE0F. Te escribo en cuanto me conteste.`;
+}
+const onSlashCommand = async (event, _defaultHandler, ctx) => {
+  const logger = ctx.mastra?.getLogger();
+  const chatId = chatIdFromThreadId(event.channel.id);
+  const command = parseCommand(`${event.command} ${event.text}`);
+  logger?.info("telegram command", { chatId, command: event.command, userId: event.user.userId });
+  if (chatId === nurseChatId()) {
+    await event.channel.post("Este es el chat de la enfermera: aqu\xED recibes los tickets y respondes a las pacientes.").catch(() => void 0);
+    return;
+  }
+  try {
+    if (command) {
+      await handleCommand(command, chatId, event.user, (text) => event.channel.post(text));
+    } else {
+      await event.channel.post("No conozco ese comando. Puedes usar /start, /demo o /reset, o simplemente escribirme.");
+    }
+  } catch (error) {
+    logger?.error("command failed", { chatId, command, error });
+    await event.channel.post(fallbackReply).catch(() => void 0);
+  }
+};
+const onDirectMessage = async (thread, message, defaultHandler, ctx) => {
+  const logger = ctx.mastra?.getLogger();
+  const chatId = chatIdFromThreadId(thread.id);
+  const text = message.text.replace(/<user[^>]*>|<\/user>/gi, "").trim();
+  logger?.info("telegram inbound", { chatId, userId: message.author.userId, userName: message.author.userName, threadId: thread.id });
+  if (chatId === nurseChatId()) {
+    try {
+      const { ticket, delivered } = await forwardNurseReply(companion, text);
+      if (!ticket) await thread.post("No hay ning\xFAn ticket esperando tu respuesta ahora mismo.");
+      else if (delivered) await thread.post(`Enviado a ${ticket.patientName ?? "la paciente"} (ticket ${ticket.id}).`);
+      else await thread.post(`No he podido reenviarlo (ticket ${ticket.id}). Int\xE9ntalo de nuevo.`);
+    } catch (error) {
+      logger?.error("nurse reply forwarding failed", { error });
+      await thread.post("No he podido reenviar tu respuesta. Int\xE9ntalo de nuevo.").catch(() => void 0);
+    }
+    return;
+  }
+  const post = (t) => thread.post(t);
+  try {
+    const command = parseCommand(text);
+    if (command) {
+      await handleCommand(command, chatId, message.author, post);
       return;
     }
-    const patient = await readPatient(threadId, resourceId);
-    if (!patient?.onboarded) {
-      logger?.info("telegram new chat, sending onboarding", { chatId: resourceId });
-      await thread.post(onboardingMessage);
-      const name = message.author.fullName?.trim().split(/\s+/)[0] || message.author.userName || void 0;
-      await writePatient(threadId, resourceId, { ...patient ?? emptyPatient, name, onboarded: true });
-      if (text === "/start") return;
-    } else if (text === "/start") {
-      await thread.post("\xA1Hola de nuevo! \xBFEn qu\xE9 te puedo ayudar hoy?");
+    if (await ensureOnboarded(chatId, message.author, post)) {
+      return;
+    }
+    const turn = await prepareTurn(chatId, text, ctx.requestContext);
+    logger?.info("triage", { chatId, tier: turn.tier, reason: turn.reason, ticketId: turn.ticketId });
+    if (turn.ack) await post(turn.ack);
+    if (turn.directReply) {
+      await post(turn.directReply);
+      return;
+    }
+    if (turn.tier === "clinical" && turn.ticketId) {
+      try {
+        const result = await runClinicalTurn(chatId, turn.ticketId, text, ctx.requestContext);
+        logger?.info("clinical turn finished", { chatId, ticketId: turn.ticketId, finishReason: result.finishReason });
+      } catch (error) {
+        logger?.error("clinical turn failed, sending fallback", { chatId, ticketId: turn.ticketId, error });
+        await post(fallbackReply);
+      }
       return;
     }
   } catch (error) {
-    logger?.error("pre-handler failed, continuing with default handler", { chatId: resourceId, error });
+    logger?.error("pre-handler failed, continuing with default handler", { chatId, error });
   }
   try {
     await defaultHandler(thread, message);
   } catch (error) {
-    logger?.error("agent run failed, sending fallback reply", { chatId: resourceId, error });
-    try {
-      await thread.post(fallbackReply);
-    } catch (postError) {
-      logger?.error("fallback reply could not be posted", { chatId: resourceId, error: postError });
+    logger?.error("agent run failed, sending fallback reply", { chatId, error });
+    await thread.post(fallbackReply).catch((postError) => logger?.error("fallback reply could not be posted", { chatId, error: postError }));
+  }
+};
+function parseNurseAction(actionId, value) {
+  const [id, rest] = actionId.includes(":") ? [actionId.slice(0, actionId.indexOf(":")), actionId.slice(actionId.indexOf(":") + 1)] : [actionId, void 0];
+  if (id !== NURSE_APPROVE && id !== NURSE_DENY) return null;
+  const ticketId = (value && value !== actionId ? value : rest) ?? "";
+  return { approved: id === NURSE_APPROVE, ticketId };
+}
+const onAction = async (event, defaultHandler, ctx) => {
+  const logger = ctx.mastra?.getLogger();
+  logger?.info("telegram action", { actionId: event.actionId, value: event.value, from: event.user.userId });
+  const parsed = parseNurseAction(event.actionId, event.value);
+  if (!parsed) {
+    await defaultHandler();
+    return;
+  }
+  const { approved, ticketId } = parsed;
+  const reply = (t) => event.thread?.post(t).catch(() => void 0);
+  try {
+    const result = await handleNurseDecision(companion, ticketId, approved, ctx.requestContext);
+    switch (result.outcome) {
+      case "resumed":
+        await reply(
+          approved ? `Enviado a ${result.ticket.patientName ?? "la paciente"} (ticket ${result.ticket.id}).` : `Ticket ${result.ticket.id} rechazado. Escribe aqu\xED tu respuesta para ${result.ticket.patientName ?? "la paciente"} y se la reenv\xEDo tal cual.`
+        );
+        return;
+      case "already_handled":
+        await reply(`El ticket ${result.ticket.id} ya se gestion\xF3.`);
+        return;
+      case "not_suspended":
+        await reply(`El ticket ${result.ticket.id} no est\xE1 esperando aprobaci\xF3n.`);
+        return;
+      case "not_found":
+        await reply(`No encuentro el ticket ${ticketId}.`);
     }
+  } catch (error) {
+    logger?.error("nurse decision failed", { ticketId, approved, error });
+    await reply(`No he podido aplicar la decisi\xF3n del ticket ${ticketId}. Int\xE9ntalo de nuevo.`);
   }
 };
 function telegramMode() {
@@ -374,14 +591,17 @@ const mainCallProcessor = new NebiusCallProcessor("main");
 const companion = new Agent({
   id: "companion",
   name: BOT_NAME,
-  instructions,
+  instructions: ({ requestContext }) => `${baseInstructions}
+
+${tierInstructions(readTier(requestContext), readTicketId(requestContext), readNurseDecision(requestContext))}`,
   model: () => resolvedNebiusModel("main"),
+  tools: ({ requestContext }) => toolsForTier(readTier(requestContext)),
   memory,
   defaultOptions: {
     providerOptions: nebiusProviderOptions("main")
   },
-  inputProcessors: [mainCallProcessor],
-  outputProcessors: [mainCallProcessor],
+  inputProcessors: [mainCallProcessor, new TierToolChoiceProcessor()],
+  outputProcessors: [mainCallProcessor, new NurseCardProcessor()],
   channels: {
     adapters: {
       telegram: {
@@ -393,9 +613,79 @@ const companion = new Agent({
         }
       }
     },
+    tools: false,
     resolveResourceId: ({ thread }) => chatIdFromThreadId(thread.id),
     resolveThreadId: ({ thread }) => thread.id,
-    handlers: { onDirectMessage }
+    handlers: { onDirectMessage, onSlashCommand, onAction }
+  }
+});
+setNurseAgent(companion);
+
+const nurseDecisionRoute = registerApiRoute("/demo/nurse-decision", {
+  method: "POST",
+  handler: async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.ticketId !== "string" || typeof body.approved !== "boolean") {
+      return c.json({ error: "expected { ticketId: string, approved: boolean }" }, 400);
+    }
+    const agent = c.get("mastra").getAgent("companion");
+    try {
+      const result = await handleNurseDecision(agent, body.ticketId, body.approved, new RequestContext());
+      return c.json(result);
+    } catch (error) {
+      c.get("mastra").getLogger().error("nurse decision failed", { error });
+      return c.json({ error: String(error) }, 500);
+    }
+  }
+});
+const nurseCardRoute = registerApiRoute("/demo/nurse-card", {
+  method: "POST",
+  handler: async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.ticketId !== "string") return c.json({ error: "expected { ticketId: string }" }, 400);
+    const ticket = await getTicket(body.ticketId);
+    if (!ticket) return c.json({ error: "ticket not found" }, 404);
+    const agent = c.get("mastra").getAgent("companion");
+    const outcome = await postNurseApprovalCard(agent, ticket, ticket.suggestedReply ?? "(sin respuesta propuesta todav\xEDa)");
+    return c.json({ ticketId: ticket.id, ...outcome });
+  }
+});
+
+const evalMessageRoute = registerApiRoute("/eval/message", {
+  method: "POST",
+  handler: async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.text !== "string" || !body.text.trim()) {
+      return c.json({ error: "expected { text: string, chatId?: string }" }, 400);
+    }
+    const chatId = typeof body.chatId === "string" && body.chatId.trim() ? body.chatId.trim() : `eval-${Date.now().toString(36)}`;
+    const mastra = c.get("mastra");
+    const agent = mastra.getAgent("companion");
+    const requestContext = new RequestContext();
+    const startedAt = Date.now();
+    try {
+      const turn = await prepareTurn(chatId, body.text, requestContext);
+      if (turn.directReply) {
+        return c.json({ chatId, tier: turn.tier, reason: turn.reason, ticketId: turn.ticketId ?? null, reply: turn.directReply, finishReason: "direct", latencyMs: Date.now() - startedAt });
+      }
+      const result = turn.tier === "clinical" && turn.ticketId ? await runClinicalTurn(chatId, turn.ticketId, body.text, requestContext) : await agent.generate(body.text, {
+        requestContext,
+        memory: { thread: threadIdForChat(chatId), resource: chatId }
+      });
+      const reply = turn.tier === "clinical" ? turn.ack ?? "" : [turn.ack, result.text].filter(Boolean).join("\n\n");
+      return c.json({
+        chatId,
+        tier: turn.tier,
+        reason: turn.reason,
+        ticketId: turn.ticketId ?? null,
+        reply,
+        finishReason: result.finishReason,
+        latencyMs: Date.now() - startedAt
+      });
+    } catch (error) {
+      mastra.getLogger().error("eval message failed", { chatId, error });
+      return c.json({ chatId, error: String(error) }, 500);
+    }
   }
 });
 
@@ -407,7 +697,10 @@ const mastra = new Mastra({
   logger: new PinoLogger({
     name: "ivf-companion",
     level: "info"
-  })
+  }),
+  server: {
+    apiRoutes: [evalMessageRoute, nurseDecisionRoute, nurseCardRoute]
+  }
 });
 
 /**
@@ -1869,7 +2162,7 @@ function patchRecordSchemas(schema) {
 	const def = schema._zod?.def;
 	if (def?.type === "record" && def.keyType && !def.valueType) {
 		def.valueType = def.keyType;
-		def.keyType = z$1.string();
+		def.keyType = z.string();
 	}
 	if (!def) return schema;
 	if (def.type === "object" && def.shape) {
@@ -11999,92 +12292,92 @@ var NoObjectGeneratedError = class extends AISDKError {
 	}
 };
 _a4 = symbol4;
-var dataContentSchema = z.union([
-	z.string(),
-	z.instanceof(Uint8Array),
-	z.instanceof(ArrayBuffer),
-	z.custom((value) => {
+var dataContentSchema = z$1.union([
+	z$1.string(),
+	z$1.instanceof(Uint8Array),
+	z$1.instanceof(ArrayBuffer),
+	z$1.custom((value) => {
 		var _a17, _b;
 		return (_b = (_a17 = globalThis.Buffer) == null ? void 0 : _a17.isBuffer(value)) != null ? _b : false;
 	}, { message: "Must be a Buffer" })
 ]);
-var jsonValueSchema$1 = z.lazy(() => z.union([
-	z.null(),
-	z.string(),
-	z.number(),
-	z.boolean(),
-	z.record(z.string(), jsonValueSchema$1),
-	z.array(jsonValueSchema$1)
+var jsonValueSchema$1 = z$1.lazy(() => z$1.union([
+	z$1.null(),
+	z$1.string(),
+	z$1.number(),
+	z$1.boolean(),
+	z$1.record(z$1.string(), jsonValueSchema$1),
+	z$1.array(jsonValueSchema$1)
 ]));
-var providerMetadataSchema = z.record(z.string(), z.record(z.string(), jsonValueSchema$1));
-var toolResultContentSchema = z.array(z.union([z.object({
-	type: z.literal("text"),
-	text: z.string()
-}), z.object({
-	type: z.literal("image"),
-	data: z.string(),
-	mimeType: z.string().optional()
+var providerMetadataSchema = z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema$1));
+var toolResultContentSchema = z$1.array(z$1.union([z$1.object({
+	type: z$1.literal("text"),
+	text: z$1.string()
+}), z$1.object({
+	type: z$1.literal("image"),
+	data: z$1.string(),
+	mimeType: z$1.string().optional()
 })]));
-var textPartSchema$1 = z.object({
-	type: z.literal("text"),
-	text: z.string(),
+var textPartSchema$1 = z$1.object({
+	type: z$1.literal("text"),
+	text: z$1.string(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var imagePartSchema = z.object({
-	type: z.literal("image"),
-	image: z.union([dataContentSchema, z.instanceof(URL)]),
-	mimeType: z.string().optional(),
+var imagePartSchema = z$1.object({
+	type: z$1.literal("image"),
+	image: z$1.union([dataContentSchema, z$1.instanceof(URL)]),
+	mimeType: z$1.string().optional(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var filePartSchema$1 = z.object({
-	type: z.literal("file"),
-	data: z.union([dataContentSchema, z.instanceof(URL)]),
-	filename: z.string().optional(),
-	mimeType: z.string(),
+var filePartSchema$1 = z$1.object({
+	type: z$1.literal("file"),
+	data: z$1.union([dataContentSchema, z$1.instanceof(URL)]),
+	filename: z$1.string().optional(),
+	mimeType: z$1.string(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var reasoningPartSchema = z.object({
-	type: z.literal("reasoning"),
-	text: z.string(),
+var reasoningPartSchema = z$1.object({
+	type: z$1.literal("reasoning"),
+	text: z$1.string(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var redactedReasoningPartSchema = z.object({
-	type: z.literal("redacted-reasoning"),
-	data: z.string(),
+var redactedReasoningPartSchema = z$1.object({
+	type: z$1.literal("redacted-reasoning"),
+	data: z$1.string(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var toolCallPartSchema = z.object({
-	type: z.literal("tool-call"),
-	toolCallId: z.string(),
-	toolName: z.string(),
-	args: z.unknown(),
+var toolCallPartSchema = z$1.object({
+	type: z$1.literal("tool-call"),
+	toolCallId: z$1.string(),
+	toolName: z$1.string(),
+	args: z$1.unknown(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var toolResultPartSchema = z.object({
-	type: z.literal("tool-result"),
-	toolCallId: z.string(),
-	toolName: z.string(),
-	result: z.unknown(),
+var toolResultPartSchema = z$1.object({
+	type: z$1.literal("tool-result"),
+	toolCallId: z$1.string(),
+	toolName: z$1.string(),
+	result: z$1.unknown(),
 	content: toolResultContentSchema.optional(),
-	isError: z.boolean().optional(),
+	isError: z$1.boolean().optional(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreSystemMessageSchema = z.object({
-	role: z.literal("system"),
-	content: z.string(),
+var coreSystemMessageSchema = z$1.object({
+	role: z$1.literal("system"),
+	content: z$1.string(),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreUserMessageSchema = z.object({
-	role: z.literal("user"),
-	content: z.union([z.string(), z.array(z.union([
+var coreUserMessageSchema = z$1.object({
+	role: z$1.literal("user"),
+	content: z$1.union([z$1.string(), z$1.array(z$1.union([
 		textPartSchema$1,
 		imagePartSchema,
 		filePartSchema$1
@@ -12092,9 +12385,9 @@ var coreUserMessageSchema = z.object({
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreAssistantMessageSchema = z.object({
-	role: z.literal("assistant"),
-	content: z.union([z.string(), z.array(z.union([
+var coreAssistantMessageSchema = z$1.object({
+	role: z$1.literal("assistant"),
+	content: z$1.union([z$1.string(), z$1.array(z$1.union([
 		textPartSchema$1,
 		filePartSchema$1,
 		reasoningPartSchema,
@@ -12104,13 +12397,13 @@ var coreAssistantMessageSchema = z.object({
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-var coreToolMessageSchema = z.object({
-	role: z.literal("tool"),
-	content: z.array(toolResultPartSchema),
+var coreToolMessageSchema = z$1.object({
+	role: z$1.literal("tool"),
+	content: z$1.array(toolResultPartSchema),
 	providerOptions: providerMetadataSchema.optional(),
 	experimental_providerMetadata: providerMetadataSchema.optional()
 });
-z.union([
+z$1.union([
 	coreSystemMessageSchema,
 	coreUserMessageSchema,
 	coreAssistantMessageSchema,
@@ -12295,99 +12588,99 @@ createIdGenerator({
 	prefix: "msg",
 	size: 24
 });
-var ClientOrServerImplementationSchema = z.object({
-	name: z.string(),
-	version: z.string()
+var ClientOrServerImplementationSchema = z$1.object({
+	name: z$1.string(),
+	version: z$1.string()
 }).passthrough();
-var BaseParamsSchema = z.object({ _meta: z.optional(z.object({}).passthrough()) }).passthrough();
+var BaseParamsSchema = z$1.object({ _meta: z$1.optional(z$1.object({}).passthrough()) }).passthrough();
 var ResultSchema = BaseParamsSchema;
-var RequestSchema = z.object({
-	method: z.string(),
-	params: z.optional(BaseParamsSchema)
+var RequestSchema = z$1.object({
+	method: z$1.string(),
+	params: z$1.optional(BaseParamsSchema)
 });
-var ServerCapabilitiesSchema = z.object({
-	experimental: z.optional(z.object({}).passthrough()),
-	logging: z.optional(z.object({}).passthrough()),
-	prompts: z.optional(z.object({ listChanged: z.optional(z.boolean()) }).passthrough()),
-	resources: z.optional(z.object({
-		subscribe: z.optional(z.boolean()),
-		listChanged: z.optional(z.boolean())
+var ServerCapabilitiesSchema = z$1.object({
+	experimental: z$1.optional(z$1.object({}).passthrough()),
+	logging: z$1.optional(z$1.object({}).passthrough()),
+	prompts: z$1.optional(z$1.object({ listChanged: z$1.optional(z$1.boolean()) }).passthrough()),
+	resources: z$1.optional(z$1.object({
+		subscribe: z$1.optional(z$1.boolean()),
+		listChanged: z$1.optional(z$1.boolean())
 	}).passthrough()),
-	tools: z.optional(z.object({ listChanged: z.optional(z.boolean()) }).passthrough())
+	tools: z$1.optional(z$1.object({ listChanged: z$1.optional(z$1.boolean()) }).passthrough())
 }).passthrough();
 ResultSchema.extend({
-	protocolVersion: z.string(),
+	protocolVersion: z$1.string(),
 	capabilities: ServerCapabilitiesSchema,
 	serverInfo: ClientOrServerImplementationSchema,
-	instructions: z.optional(z.string())
+	instructions: z$1.optional(z$1.string())
 });
-var PaginatedResultSchema = ResultSchema.extend({ nextCursor: z.optional(z.string()) });
-var ToolSchema = z.object({
-	name: z.string(),
-	description: z.optional(z.string()),
-	inputSchema: z.object({
-		type: z.literal("object"),
-		properties: z.optional(z.object({}).passthrough())
+var PaginatedResultSchema = ResultSchema.extend({ nextCursor: z$1.optional(z$1.string()) });
+var ToolSchema = z$1.object({
+	name: z$1.string(),
+	description: z$1.optional(z$1.string()),
+	inputSchema: z$1.object({
+		type: z$1.literal("object"),
+		properties: z$1.optional(z$1.object({}).passthrough())
 	}).passthrough()
 }).passthrough();
-PaginatedResultSchema.extend({ tools: z.array(ToolSchema) });
-var TextContentSchema = z.object({
-	type: z.literal("text"),
-	text: z.string()
+PaginatedResultSchema.extend({ tools: z$1.array(ToolSchema) });
+var TextContentSchema = z$1.object({
+	type: z$1.literal("text"),
+	text: z$1.string()
 }).passthrough();
-var ImageContentSchema = z.object({
-	type: z.literal("image"),
-	data: z.string().base64(),
-	mimeType: z.string()
+var ImageContentSchema = z$1.object({
+	type: z$1.literal("image"),
+	data: z$1.string().base64(),
+	mimeType: z$1.string()
 }).passthrough();
-var ResourceContentsSchema = z.object({
+var ResourceContentsSchema = z$1.object({
 	/**
 	* The URI of this resource.
 	*/
-	uri: z.string(),
+	uri: z$1.string(),
 	/**
 	* The MIME type of this resource, if known.
 	*/
-	mimeType: z.optional(z.string())
+	mimeType: z$1.optional(z$1.string())
 }).passthrough();
-var TextResourceContentsSchema = ResourceContentsSchema.extend({ text: z.string() });
-var BlobResourceContentsSchema = ResourceContentsSchema.extend({ blob: z.string().base64() });
-var EmbeddedResourceSchema = z.object({
-	type: z.literal("resource"),
-	resource: z.union([TextResourceContentsSchema, BlobResourceContentsSchema])
+var TextResourceContentsSchema = ResourceContentsSchema.extend({ text: z$1.string() });
+var BlobResourceContentsSchema = ResourceContentsSchema.extend({ blob: z$1.string().base64() });
+var EmbeddedResourceSchema = z$1.object({
+	type: z$1.literal("resource"),
+	resource: z$1.union([TextResourceContentsSchema, BlobResourceContentsSchema])
 }).passthrough();
 ResultSchema.extend({
-	content: z.array(z.union([
+	content: z$1.array(z$1.union([
 		TextContentSchema,
 		ImageContentSchema,
 		EmbeddedResourceSchema
 	])),
-	isError: z.boolean().default(false).optional()
-}).or(ResultSchema.extend({ toolResult: z.unknown() }));
+	isError: z$1.boolean().default(false).optional()
+}).or(ResultSchema.extend({ toolResult: z$1.unknown() }));
 var JSONRPC_VERSION = "2.0";
-var JSONRPCRequestSchema = z.object({
-	jsonrpc: z.literal(JSONRPC_VERSION),
-	id: z.union([z.string(), z.number().int()])
+var JSONRPCRequestSchema = z$1.object({
+	jsonrpc: z$1.literal(JSONRPC_VERSION),
+	id: z$1.union([z$1.string(), z$1.number().int()])
 }).merge(RequestSchema).strict();
-var JSONRPCResponseSchema = z.object({
-	jsonrpc: z.literal(JSONRPC_VERSION),
-	id: z.union([z.string(), z.number().int()]),
+var JSONRPCResponseSchema = z$1.object({
+	jsonrpc: z$1.literal(JSONRPC_VERSION),
+	id: z$1.union([z$1.string(), z$1.number().int()]),
 	result: ResultSchema
 }).strict();
-var JSONRPCErrorSchema = z.object({
-	jsonrpc: z.literal(JSONRPC_VERSION),
-	id: z.union([z.string(), z.number().int()]),
-	error: z.object({
-		code: z.number().int(),
-		message: z.string(),
-		data: z.optional(z.unknown())
+var JSONRPCErrorSchema = z$1.object({
+	jsonrpc: z$1.literal(JSONRPC_VERSION),
+	id: z$1.union([z$1.string(), z$1.number().int()]),
+	error: z$1.object({
+		code: z$1.number().int(),
+		message: z$1.string(),
+		data: z$1.optional(z$1.unknown())
 	})
 }).strict();
-var JSONRPCNotificationSchema = z.object({ jsonrpc: z.literal(JSONRPC_VERSION) }).merge(z.object({
-	method: z.string(),
-	params: z.optional(BaseParamsSchema)
+var JSONRPCNotificationSchema = z$1.object({ jsonrpc: z$1.literal(JSONRPC_VERSION) }).merge(z$1.object({
+	method: z$1.string(),
+	params: z$1.optional(BaseParamsSchema)
 })).strict();
-z.union([
+z$1.union([
 	JSONRPCRequestSchema,
 	JSONRPCNotificationSchema,
 	JSONRPCResponseSchema,
@@ -12728,25 +13021,25 @@ function pickParams(schema, params) {
 * ```
 */
 function jsonQueryParam(schema) {
-	return z$1.union([schema, z$1.string().transform((val, ctx) => {
+	return z.union([schema, z.string().transform((val, ctx) => {
 		try {
 			const parsed = JSON.parse(val);
 			const result = schema.safeParse(parsed);
 			if (!result.success) {
 				for (const issue of result.error.issues) ctx.addIssue({
-					code: z$1.ZodIssueCode.custom,
+					code: z.ZodIssueCode.custom,
 					message: issue.message,
 					path: issue.path
 				});
-				return z$1.NEVER;
+				return z.NEVER;
 			}
 			return result.data;
 		} catch (e) {
 			ctx.addIssue({
-				code: z$1.ZodIssueCode.custom,
+				code: z.ZodIssueCode.custom,
 				message: `Invalid JSON: ${e instanceof Error ? e.message : "parse error"}`
 			});
-			return z$1.NEVER;
+			return z.NEVER;
 		}
 	})]);
 }
@@ -12789,7 +13082,7 @@ function wrapSchemaForQueryParams(schema) {
 	const shape = schema.shape;
 	for (const [key, fieldSchema] of Object.entries(shape)) if (isComplexType(fieldSchema)) newShape[key] = jsonQueryParam(fieldSchema);
 	else newShape[key] = fieldSchema;
-	return z$1.object(newShape);
+	return z.object(newShape);
 }
 /**
 * Creates a server route with auto-generated OpenAPI specification and type-safe handler inference.
@@ -14443,21 +14736,21 @@ var __require = /* #__PURE__ */ (() => createRequire(import.meta.url))();
 function typedPermissive(schema) {
 	return schema;
 }
-const runIdSchema = z$1.object({ runId: z$1.string().describe("Unique identifier for the run") });
+const runIdSchema = z.object({ runId: z.string().describe("Unique identifier for the run") });
 /**
 * Query parameter schema for runId (optional)
 * Used by create-run route where runId is optional
 */
-const optionalRunIdSchema = z$1.object({ runId: z$1.string().optional() });
+const optionalRunIdSchema = z.object({ runId: z.string().optional() });
 /**
 * Pagination response info
 * Used across all paginated endpoints
 */
-const paginationInfoSchema$1 = z$1.object({
-	total: z$1.number(),
-	page: z$1.number(),
-	perPage: z$1.union([z$1.number(), z$1.literal(false)]),
-	hasMore: z$1.boolean()
+const paginationInfoSchema$1 = z.object({
+	total: z.number(),
+	page: z.number(),
+	perPage: z.union([z.number(), z.literal(false)]),
+	hasMore: z.boolean()
 });
 /**
 * Pagination values are non-negative integers. Constraining them here keeps
@@ -14469,18 +14762,18 @@ const paginationInfoSchema$1 = z$1.object({
 * The lower bound is 0 rather than 1 because `perPage: 0` is a supported
 * storage contract (the include-only fast path).
 */
-const paginationNumber = () => z$1.coerce.number().int().min(0);
+const paginationNumber = () => z.coerce.number().int().min(0);
 /**
 * Factory function for page/perPage pagination query params
 * @param defaultPerPage - Default value for perPage (omit for no default)
 */
 const createPagePaginationSchema = (defaultPerPage) => {
 	const baseSchema = { page: paginationNumber().optional().default(0) };
-	if (defaultPerPage !== void 0) return z$1.object({
+	if (defaultPerPage !== void 0) return z.object({
 		...baseSchema,
 		perPage: paginationNumber().optional().default(defaultPerPage)
 	});
-	else return z$1.object({
+	else return z.object({
 		...baseSchema,
 		perPage: paginationNumber().optional()
 	});
@@ -14490,7 +14783,7 @@ const createPagePaginationSchema = (defaultPerPage) => {
 * Use this when you need backwards compatibility with older clients using limit/offset
 */
 const createCombinedPaginationSchema = () => {
-	return z$1.object({
+	return z.object({
 		page: paginationNumber().optional(),
 		perPage: paginationNumber().optional(),
 		/**
@@ -14507,43 +14800,43 @@ const createCombinedPaginationSchema = () => {
 * Tracing options for observability
 * Used by agents and workflows
 */
-const tracingOptionsSchema = z$1.object({
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	requestContextKeys: z$1.array(z$1.string()).optional(),
-	traceId: z$1.string().optional(),
-	parentSpanId: z$1.string().optional(),
-	tags: z$1.array(z$1.string()).optional(),
-	hideInput: z$1.boolean().optional(),
-	hideOutput: z$1.boolean().optional()
+const tracingOptionsSchema = z.object({
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	requestContextKeys: z.array(z.string()).optional(),
+	traceId: z.string().optional(),
+	parentSpanId: z.string().optional(),
+	tags: z.array(z.string()).optional(),
+	hideInput: z.boolean().optional(),
+	hideOutput: z.boolean().optional()
 });
 /**
 * Core message schema from AI SDK
 * Represents messages exchanged with AI models
 * Content can be string, array of content parts, or object (for complex message types)
 */
-const coreMessageSchema = typedPermissive(z$1.unknown());
+const coreMessageSchema = typedPermissive(z.unknown());
 /**
 * Standard success response schema
 * Used by operations that return only a success boolean
 */
-const successResponseSchema = z$1.object({ success: z$1.boolean() });
+const successResponseSchema = z.object({ success: z.boolean() });
 /**
 * Standard message response schema
 * Used by operations that return only a message string
 */
-const messageResponseSchema = z$1.object({ message: z$1.string() });
+const messageResponseSchema = z.object({ message: z.string() });
 /**
 * Partial data query parameter schema
 * Used by list endpoints to return minimal data without schemas
 */
-z$1.object({ partial: z$1.string().optional() });
+z.object({ partial: z.string().optional() });
 /**
 * Status filter for get-by-id endpoints.
 * Controls which version is resolved:
 * - 'published' (default) — resolve with the active (published) version.
 * - 'draft' — resolve with the latest version (which may be ahead of the published one).
 */
-const statusQuerySchema = z$1.object({ status: z$1.enum([
+const statusQuerySchema = z.object({ status: z.enum([
 	"draft",
 	"published",
 	"archived"
@@ -14551,25 +14844,25 @@ const statusQuerySchema = z$1.object({ status: z$1.enum([
 /**
 * Base log message schema
 */
-const baseLogMessageSchema = z$1.object({
-	level: z$1.enum([
+const baseLogMessageSchema = z.object({
+	level: z.enum([
 		"debug",
 		"info",
 		"warn",
 		"error",
 		"silent"
 	]),
-	msg: z$1.string(),
-	time: z$1.date(),
-	context: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	runId: z$1.string().optional(),
-	pid: z$1.number(),
-	hostname: z$1.string(),
-	name: z$1.string()
+	msg: z.string(),
+	time: z.date(),
+	context: z.record(z.string(), z.unknown()).optional(),
+	runId: z.string().optional(),
+	pid: z.number(),
+	hostname: z.string(),
+	name: z.string()
 });
 
 //#region src/server/schemas/workflows.ts
-const workflowRunStatusSchema$1 = z$1.enum([
+const workflowRunStatusSchema$1 = z.enum([
 	"running",
 	"waiting",
 	"suspended",
@@ -14582,30 +14875,30 @@ const workflowRunStatusSchema$1 = z$1.enum([
 	"paused",
 	"skipped"
 ]);
-const workflowIdPathParams = z$1.object({ workflowId: z$1.string().describe("Unique identifier for the workflow") });
-const workflowRunPathParams = workflowIdPathParams.extend({ runId: z$1.string().describe("Unique identifier for the workflow run") });
+const workflowIdPathParams = z.object({ workflowId: z.string().describe("Unique identifier for the workflow") });
+const workflowRunPathParams = workflowIdPathParams.extend({ runId: z.string().describe("Unique identifier for the workflow run") });
 /**
 * Schema for serialized step
 * Uses passthrough() to allow step-specific fields
 */
-const serializedStepSchema = z$1.object({
-	id: z$1.string(),
-	description: z$1.string().optional(),
-	stateSchema: z$1.string().optional(),
-	inputSchema: z$1.string().optional(),
-	outputSchema: z$1.string().optional(),
-	resumeSchema: z$1.string().optional(),
-	suspendSchema: z$1.string().optional(),
-	component: z$1.string().optional(),
-	isWorkflow: z$1.boolean().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const serializedStepSchema = z.object({
+	id: z.string(),
+	description: z.string().optional(),
+	stateSchema: z.string().optional(),
+	inputSchema: z.string().optional(),
+	outputSchema: z.string().optional(),
+	resumeSchema: z.string().optional(),
+	suspendSchema: z.string().optional(),
+	component: z.string().optional(),
+	isWorkflow: z.boolean().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
 /**
 * Schema for serialized step flow entry
 * Represents different step flow types in the workflow graph
 */
-const serializedStepFlowEntrySchema = z$1.object({
-	type: z$1.enum([
+const serializedStepFlowEntrySchema = z.object({
+	type: z.enum([
 		"step",
 		"agent",
 		"tool",
@@ -14619,51 +14912,51 @@ const serializedStepFlowEntrySchema = z$1.object({
 		"foreach",
 		"workflow"
 	]),
-	id: z$1.string().optional(),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	id: z.string().optional(),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
 /**
 * Schema for workflow information
 * Returned by getWorkflowByIdHandler and listWorkflowsHandler
 */
-const workflowInfoSchema = z$1.object({
-	steps: z$1.record(z$1.string(), serializedStepSchema),
-	allSteps: z$1.record(z$1.string(), serializedStepSchema),
-	name: z$1.string().optional(),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	stepGraph: z$1.array(serializedStepFlowEntrySchema),
-	inputSchema: z$1.string().optional(),
-	outputSchema: z$1.string().optional(),
-	stateSchema: z$1.string().optional(),
-	options: z$1.object({}).optional(),
-	isProcessorWorkflow: z$1.boolean().optional(),
-	origin: z$1.enum(["code", "dynamic"]).optional()
+const workflowInfoSchema = z.object({
+	steps: z.record(z.string(), serializedStepSchema),
+	allSteps: z.record(z.string(), serializedStepSchema),
+	name: z.string().optional(),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	stepGraph: z.array(serializedStepFlowEntrySchema),
+	inputSchema: z.string().optional(),
+	outputSchema: z.string().optional(),
+	stateSchema: z.string().optional(),
+	options: z.object({}).optional(),
+	isProcessorWorkflow: z.boolean().optional(),
+	origin: z.enum(["code", "dynamic"]).optional()
 });
 /**
 * Schema for list workflows endpoint response
 * Returns a record of workflow ID to workflow info
 */
-const listWorkflowsResponseSchema = z$1.record(z$1.string(), workflowInfoSchema);
+const listWorkflowsResponseSchema = z.record(z.string(), workflowInfoSchema);
 /**
 * Schema for workflow run object
 */
-const workflowRunSchema = z$1.object({
-	workflowName: z$1.string(),
-	runId: z$1.string(),
-	snapshot: typedPermissive(z$1.union([z$1.record(z$1.string(), z$1.unknown()), z$1.string()])),
-	createdAt: z$1.date(),
-	updatedAt: z$1.date(),
-	resourceId: z$1.string().optional()
+const workflowRunSchema = z.object({
+	workflowName: z.string(),
+	runId: z.string(),
+	snapshot: typedPermissive(z.union([z.record(z.string(), z.unknown()), z.string()])),
+	createdAt: z.date(),
+	updatedAt: z.date(),
+	resourceId: z.string().optional()
 });
 /**
 * Schema for workflow runs response (paginated)
 * Includes runs array and total count
 */
-const workflowRunsResponseSchema = z$1.object({
-	runs: z$1.array(workflowRunSchema),
-	total: z$1.number()
+const workflowRunsResponseSchema = z.object({
+	runs: z.array(workflowRunSchema),
+	total: z.number()
 });
 /**
 * Schema for query parameters when listing workflow runs
@@ -14671,26 +14964,26 @@ const workflowRunsResponseSchema = z$1.object({
 * If page/perPage provided, use directly; otherwise convert from limit/offset
 */
 const listWorkflowRunsQuerySchema = createCombinedPaginationSchema().extend({
-	fromDate: z$1.coerce.date().optional(),
-	toDate: z$1.coerce.date().optional(),
-	resourceId: z$1.string().optional(),
+	fromDate: z.coerce.date().optional(),
+	toDate: z.coerce.date().optional(),
+	resourceId: z.string().optional(),
 	status: workflowRunStatusSchema$1.optional()
 });
-const workflowRunCountsEntrySchema = z$1.object({
-	running: z$1.number(),
-	suspended: z$1.number()
+const workflowRunCountsEntrySchema = z.object({
+	running: z.number(),
+	suspended: z.number()
 });
-const workflowRunCountsResponseSchema = z$1.record(z$1.string(), workflowRunCountsEntrySchema);
+const workflowRunCountsResponseSchema = z.record(z.string(), workflowRunCountsEntrySchema);
 /**
 * Base schema for workflow execution with input data and tracing
 */
-const workflowExecutionBodySchema = z$1.object({
-	resourceId: z$1.string().optional(),
-	inputData: z$1.unknown().optional(),
-	initialState: z$1.unknown().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const workflowExecutionBodySchema = z.object({
+	resourceId: z.string().optional(),
+	inputData: z.unknown().optional(),
+	initialState: z.unknown().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
 	tracingOptions: tracingOptionsSchema.optional(),
-	perStep: z$1.boolean().optional()
+	perStep: z.boolean().optional()
 });
 /**
 * Schema for legacy stream workflow body (no closeOnSuspend support)
@@ -14701,41 +14994,41 @@ const streamLegacyWorkflowBodySchema = workflowExecutionBodySchema;
 * Schema for stream workflow body
 * Used by both /stream and /streamVNext endpoints
 */
-const streamWorkflowBodySchema = workflowExecutionBodySchema.extend({ closeOnSuspend: z$1.boolean().optional() });
+const streamWorkflowBodySchema = workflowExecutionBodySchema.extend({ closeOnSuspend: z.boolean().optional() });
 /**
 * Schema for resume workflow body
 * Used by resume-stream, resume-async and resume endpoints
 */
-const resumeBodySchema = z$1.object({
-	step: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional(),
-	resumeData: z$1.unknown().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const resumeBodySchema = z.object({
+	step: z.union([z.string(), z.array(z.string())]).optional(),
+	resumeData: z.unknown().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
 	tracingOptions: tracingOptionsSchema.optional(),
-	perStep: z$1.boolean().optional(),
-	forEachIndex: z$1.number().int().nonnegative().optional()
+	perStep: z.boolean().optional(),
+	forEachIndex: z.number().int().nonnegative().optional()
 });
 /**
 * Schema for restart workflow body
 * Used by restart-async and restart endpoints
 */
-const restartBodySchema = z$1.object({
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const restartBodySchema = z.object({
+	requestContext: z.record(z.string(), z.unknown()).optional(),
 	tracingOptions: tracingOptionsSchema.optional()
 });
 /**
 * Schema for time travel workflow body
 * Used by time-travel-stream, time-travel-async and time-travel endpoints
 */
-const timeTravelBodySchema = z$1.object({
-	inputData: z$1.unknown().optional(),
-	resumeData: z$1.unknown().optional(),
-	initialState: z$1.unknown().optional(),
-	step: z$1.union([z$1.string(), z$1.array(z$1.string())]),
-	context: typedPermissive(z$1.record(z$1.string(), z$1.unknown())).optional(),
-	nestedStepsContext: typedPermissive(z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.unknown()))).optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const timeTravelBodySchema = z.object({
+	inputData: z.unknown().optional(),
+	resumeData: z.unknown().optional(),
+	initialState: z.unknown().optional(),
+	step: z.union([z.string(), z.array(z.string())]),
+	context: typedPermissive(z.record(z.string(), z.unknown())).optional(),
+	nestedStepsContext: typedPermissive(z.record(z.string(), z.record(z.string(), z.unknown()))).optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
 	tracingOptions: tracingOptionsSchema.optional(),
-	perStep: z$1.boolean().optional()
+	perStep: z.boolean().optional()
 });
 /**
 * Schema for start async workflow body
@@ -14744,9 +15037,9 @@ const startAsyncWorkflowBodySchema = workflowExecutionBodySchema;
 /**
 * Schema for send workflow run event body
 */
-z$1.object({
-	event: z$1.string(),
-	data: z$1.unknown()
+z.object({
+	event: z.string(),
+	data: z.unknown()
 });
 const VALID_WORKFLOW_RESULT_FIELDS = /* @__PURE__ */ new Set([
 	"result",
@@ -14757,29 +15050,29 @@ const VALID_WORKFLOW_RESULT_FIELDS = /* @__PURE__ */ new Set([
 	"serializedStepGraph"
 ]);
 const WORKFLOW_RESULT_FIELDS_ERROR = "Invalid field name. Available fields: result, error, payload, steps, activeStepsPath, serializedStepGraph";
-const createFieldsValidator = (description) => z$1.string().optional().refine((value) => {
+const createFieldsValidator = (description) => z.string().optional().refine((value) => {
 	if (!value) return true;
 	return value.split(",").map((f) => f.trim()).every((field) => VALID_WORKFLOW_RESULT_FIELDS.has(field));
 }, { message: WORKFLOW_RESULT_FIELDS_ERROR }).describe(description);
-const withNestedWorkflowsField = z$1.enum(["true", "false"]).optional().describe("Whether to include nested workflow data in steps. Defaults to true. Set to false for better performance.");
+const withNestedWorkflowsField = z.enum(["true", "false"]).optional().describe("Whether to include nested workflow data in steps. Defaults to true. Set to false for better performance.");
 /**
 * Schema for workflow execution result
 * All fields are optional since field filtering allows requesting specific fields only
 */
-const workflowExecutionResultSchema = z$1.object({
+const workflowExecutionResultSchema = z.object({
 	status: workflowRunStatusSchema$1.optional(),
-	result: z$1.unknown().optional(),
-	error: z$1.unknown().optional(),
-	payload: z$1.unknown().optional(),
-	initialState: z$1.unknown().optional(),
-	steps: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	activeStepsPath: z$1.record(z$1.string(), z$1.array(z$1.number())).optional(),
-	serializedStepGraph: z$1.array(serializedStepFlowEntrySchema).optional()
+	result: z.unknown().optional(),
+	error: z.unknown().optional(),
+	payload: z.unknown().optional(),
+	initialState: z.unknown().optional(),
+	steps: z.record(z.string(), z.unknown()).optional(),
+	activeStepsPath: z.record(z.string(), z.array(z.number())).optional(),
+	serializedStepGraph: z.array(serializedStepFlowEntrySchema).optional()
 });
 /**
 * Schema for query parameters when getting a unified workflow run result
 */
-const workflowRunResultQuerySchema = z$1.object({
+const workflowRunResultQuerySchema = z.object({
 	fields: createFieldsValidator("Comma-separated list of fields to return. Available fields: result, error, payload, steps, activeStepsPath, serializedStepGraph. Metadata fields (runId, workflowName, resourceId, createdAt, updatedAt) and status are always included."),
 	withNestedWorkflows: withNestedWorkflowsField
 });
@@ -14787,20 +15080,20 @@ const workflowRunResultQuerySchema = z$1.object({
 * Schema for unified workflow run result response
 * Combines metadata and processed execution state
 */
-const workflowRunResultSchema = z$1.object({
-	runId: z$1.string(),
-	workflowName: z$1.string(),
-	resourceId: z$1.string().optional(),
-	createdAt: z$1.date(),
-	updatedAt: z$1.date(),
+const workflowRunResultSchema = z.object({
+	runId: z.string(),
+	workflowName: z.string(),
+	resourceId: z.string().optional(),
+	createdAt: z.date(),
+	updatedAt: z.date(),
 	status: workflowRunStatusSchema$1,
-	initialState: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	result: z$1.unknown().optional(),
-	error: z$1.unknown().optional(),
-	payload: z$1.unknown().optional(),
-	steps: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	activeStepsPath: z$1.record(z$1.string(), z$1.array(z$1.number())).optional(),
-	serializedStepGraph: z$1.array(serializedStepFlowEntrySchema).optional()
+	initialState: z.record(z.string(), z.unknown()).optional(),
+	result: z.unknown().optional(),
+	error: z.unknown().optional(),
+	payload: z.unknown().optional(),
+	steps: z.record(z.string(), z.unknown()).optional(),
+	activeStepsPath: z.record(z.string(), z.array(z.number())).optional(),
+	serializedStepGraph: z.array(serializedStepFlowEntrySchema).optional()
 });
 /**
 * Response schema for workflow control operations
@@ -14810,22 +15103,22 @@ const workflowControlResponseSchema = messageResponseSchema;
 * Response schema for create workflow run operation
 * Returns only the runId after creating a run
 */
-const createWorkflowRunResponseSchema = z$1.object({ runId: z$1.string() });
+const createWorkflowRunResponseSchema = z.object({ runId: z.string() });
 /**
 * Schema for create workflow run body
 * Used by /create-run endpoint
 */
-const createWorkflowRunBodySchema = z$1.object({
-	resourceId: z$1.string().optional(),
-	disableScorers: z$1.boolean().optional()
+const createWorkflowRunBodySchema = z.object({
+	resourceId: z.string().optional(),
+	disableScorers: z.boolean().optional()
 });
 /**
 * Schema for observe workflow query params
 * Extends runId with optional offset for efficient resume
 */
-const observeWorkflowQuerySchema = z$1.object({
-	runId: z$1.string().describe("Unique identifier for the run"),
-	offset: z$1.coerce.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
+const observeWorkflowQuerySchema = z.object({
+	runId: z.string().describe("Unique identifier for the run"),
+	offset: z.coerce.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
 });
 
 //#region src/server/schemas/default-options.ts
@@ -14836,60 +15129,60 @@ const observeWorkflowQuerySchema = z$1.object({
 * This schema represents the serializable subset of AgentExecutionOptionsBase,
 * excluding callbacks, runtime objects, and function references.
 */
-const defaultOptionsSchema = z$1.object({
+const defaultOptionsSchema = z.object({
 	/** Unique identifier for this execution run */
-	runId: z$1.string().optional(),
+	runId: z.string().optional(),
 	/** Save messages incrementally after each stream step completes (default: false) */
-	savePerStep: z$1.boolean().optional(),
+	savePerStep: z.boolean().optional(),
 	/** Maximum number of steps to run */
-	maxSteps: z$1.number().optional(),
+	maxSteps: z.number().optional(),
 	/** Provider-specific options passed to the language model */
 	/** Tools that are active for this execution (stored as tool IDs) */
-	activeTools: z$1.array(z$1.string()).optional(),
+	activeTools: z.array(z.string()).optional(),
 	/** Maximum number of times processors can trigger a retry */
-	maxProcessorRetries: z$1.number().optional(),
+	maxProcessorRetries: z.number().optional(),
 	/** Tool selection strategy: 'auto', 'none', 'required', or specific tools */
-	toolChoice: z$1.union([
-		z$1.literal("auto"),
-		z$1.literal("none"),
-		z$1.literal("required"),
-		z$1.object({
-			type: z$1.literal("tool"),
-			toolName: z$1.string()
+	toolChoice: z.union([
+		z.literal("auto"),
+		z.literal("none"),
+		z.literal("required"),
+		z.object({
+			type: z.literal("tool"),
+			toolName: z.string()
 		})
 	]).optional(),
 	/** Model-specific settings like temperature, maxTokens, topP, etc. */
-	modelSettings: z$1.object({
-		temperature: z$1.number().optional(),
-		maxTokens: z$1.number().optional(),
-		topP: z$1.number().optional(),
-		topK: z$1.number().optional(),
-		frequencyPenalty: z$1.number().optional(),
-		presencePenalty: z$1.number().optional(),
-		stopSequences: z$1.array(z$1.string()).optional(),
-		seed: z$1.number().optional(),
-		maxRetries: z$1.number().optional()
+	modelSettings: z.object({
+		temperature: z.number().optional(),
+		maxTokens: z.number().optional(),
+		topP: z.number().optional(),
+		topK: z.number().optional(),
+		frequencyPenalty: z.number().optional(),
+		presencePenalty: z.number().optional(),
+		stopSequences: z.array(z.string()).optional(),
+		seed: z.number().optional(),
+		maxRetries: z.number().optional()
 	}).optional(),
 	/** Whether to return detailed scoring data in the response */
-	returnScorerData: z$1.boolean().optional(),
+	returnScorerData: z.boolean().optional(),
 	/** Tracing options for starting new traces */
-	tracingOptions: z$1.object({
-		traceName: z$1.string().optional(),
-		attributes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-		spanId: z$1.string().optional(),
-		traceId: z$1.string().optional()
+	tracingOptions: z.object({
+		traceName: z.string().optional(),
+		attributes: z.record(z.string(), z.unknown()).optional(),
+		spanId: z.string().optional(),
+		traceId: z.string().optional()
 	}).optional(),
 	/** Require approval for all tool calls */
-	requireToolApproval: z$1.boolean().optional(),
+	requireToolApproval: z.boolean().optional(),
 	/** Automatically resume suspended tools */
-	autoResumeSuspendedTools: z$1.boolean().optional(),
+	autoResumeSuspendedTools: z.boolean().optional(),
 	/** Tool-call concurrency limit and strategy */
-	toolCallConcurrency: z$1.union([z$1.number(), z$1.object({
-		limit: z$1.number().optional(),
-		strategy: z$1.enum(["available", "called"]).optional()
+	toolCallConcurrency: z.union([z.number(), z.object({
+		limit: z.number().optional(),
+		strategy: z.enum(["available", "called"]).optional()
 	})]).optional(),
 	/** Whether to include raw chunks in the stream output */
-	includeRawChunks: z$1.boolean().optional()
+	includeRawChunks: z.boolean().optional()
 }).passthrough().describe("Default options for agent execution");
 
 //#region ../_internal-core/dist/error/index.js
@@ -15099,19 +15392,19 @@ function createRoute(config) {
 }
 //#endregion
 //#region ../_internals/voice/dist/routes/index.js
-const voiceSpeakersResponseSchema = z$1.array(z$1.object({ voiceId: z$1.string() }).passthrough());
-const generateSpeechBodySchema = z$1.object({
-	text: z$1.string(),
-	speakerId: z$1.string().optional()
+const voiceSpeakersResponseSchema = z.array(z.object({ voiceId: z.string() }).passthrough());
+const generateSpeechBodySchema = z.object({
+	text: z.string(),
+	speakerId: z.string().optional()
 });
-const transcribeSpeechBodySchema = z$1.object({
-	audio: z$1.unknown(),
-	options: z$1.record(z$1.string(), z$1.unknown()).optional()
+const transcribeSpeechBodySchema = z.object({
+	audio: z.unknown(),
+	options: z.record(z.string(), z.unknown()).optional()
 });
-const transcribeSpeechResponseSchema = z$1.object({ text: z$1.string() });
-const getListenerResponseSchema = z$1.unknown();
-const speakResponseSchema = z$1.unknown();
-const agentIdPathParams$1 = z$1.object({ agentId: z$1.string().describe("Agent ID") });
+const transcribeSpeechResponseSchema = z.object({ text: z.string() });
+const getListenerResponseSchema = z.unknown();
+const speakResponseSchema = z.unknown();
+const agentIdPathParams$1 = z.object({ agentId: z.string().describe("Agent ID") });
 var HTTPException$1 = class HTTPException extends Error {
 	status;
 	constructor(status, options = {}) {
@@ -15331,235 +15624,235 @@ const GET_LISTENER_ROUTE$1 = createRoute({
 });
 
 //#region src/server/schemas/agents.ts
-const jsonValueSchema = z$1.lazy(() => z$1.union([
-	z$1.string(),
-	z$1.number(),
-	z$1.boolean(),
-	z$1.null(),
-	z$1.array(jsonValueSchema),
-	z$1.record(z$1.string(), jsonValueSchema)
+const jsonValueSchema = z.lazy(() => z.union([
+	z.string(),
+	z.number(),
+	z.boolean(),
+	z.null(),
+	z.array(jsonValueSchema),
+	z.record(z.string(), jsonValueSchema)
 ]));
-const jsonRecordSchema = z$1.record(z$1.string(), jsonValueSchema);
-const signalAttributesSchema$1 = z$1.record(z$1.string(), z$1.union([
-	z$1.string(),
-	z$1.number(),
-	z$1.boolean(),
-	z$1.null(),
-	z$1.undefined()
+const jsonRecordSchema = z.record(z.string(), jsonValueSchema);
+const signalAttributesSchema$1 = z.record(z.string(), z.union([
+	z.string(),
+	z.number(),
+	z.boolean(),
+	z.null(),
+	z.undefined()
 ]));
-const baseSignalSchema = z$1.object({
-	id: z$1.string().optional(),
-	createdAt: z$1.union([z$1.string(), z$1.date()]).optional(),
+const baseSignalSchema = z.object({
+	id: z.string().optional(),
+	createdAt: z.union([z.string(), z.date()]).optional(),
 	metadata: jsonRecordSchema.optional(),
 	attributes: signalAttributesSchema$1.optional()
 });
-const partProviderOptionsSchema = z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema)).optional();
-const signalTextPartSchema = z$1.object({
-	type: z$1.literal("text"),
-	text: z$1.string(),
+const partProviderOptionsSchema = z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional();
+const signalTextPartSchema = z.object({
+	type: z.literal("text"),
+	text: z.string(),
 	providerOptions: partProviderOptionsSchema
 });
-const signalFilePartSchema = z$1.object({
-	type: z$1.literal("file"),
-	data: z$1.string(),
-	mediaType: z$1.string(),
-	filename: z$1.string().optional(),
+const signalFilePartSchema = z.object({
+	type: z.literal("file"),
+	data: z.string(),
+	mediaType: z.string(),
+	filename: z.string().optional(),
 	providerOptions: partProviderOptionsSchema
 });
-const userMessageSignalContentsSchema = z$1.union([z$1.string(), z$1.array(z$1.union([signalTextPartSchema, signalFilePartSchema]))]);
-const agentMessageInputObjectSchema = z$1.object({
+const userMessageSignalContentsSchema = z.union([z.string(), z.array(z.union([signalTextPartSchema, signalFilePartSchema]))]);
+const agentMessageInputObjectSchema = z.object({
 	contents: userMessageSignalContentsSchema,
 	attributes: signalAttributesSchema$1.optional(),
 	metadata: jsonRecordSchema.optional(),
-	providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema)).optional()
+	providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional()
 });
-const agentMessageInputSchema = z$1.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
+const agentMessageInputSchema = z.union([userMessageSignalContentsSchema, agentMessageInputObjectSchema]);
 const agentSignalBaseSchema = baseSignalSchema.extend({
-	tagName: z$1.string().optional(),
+	tagName: z.string().optional(),
 	contents: userMessageSignalContentsSchema,
-	providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema)).optional()
+	providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional()
 });
-const agentSignalSchema = z$1.discriminatedUnion("type", [agentSignalBaseSchema.extend({
-	type: z$1.literal("state"),
-	transient: z$1.never().optional()
+const agentSignalSchema = z.discriminatedUnion("type", [agentSignalBaseSchema.extend({
+	type: z.literal("state"),
+	transient: z.never().optional()
 }), agentSignalBaseSchema.extend({
-	type: z$1.enum([
+	type: z.enum([
 		"user",
 		"reactive",
 		"notification",
 		"user-message",
 		"system-reminder"
 	]),
-	transient: z$1.boolean().optional()
+	transient: z.boolean().optional()
 })]);
-const agentIdPathParams = z$1.object({ agentId: z$1.string().describe("Unique identifier for the agent") });
+const agentIdPathParams = z.object({ agentId: z.string().describe("Unique identifier for the agent") });
 /**
 * Query params for GET /agents/:agentId — controls which stored config version is used for overrides.
 * When `status` and `versionId` are both provided, `versionId` takes precedence.
 * - `status` — 'draft' (latest version) or 'published' (active published version, default).
 * - `versionId` — Resolve with a specific version ID.
 */
-const agentVersionQuerySchema = z$1.object({
-	status: z$1.enum(["draft", "published"]).optional().describe("Which stored config version to resolve: draft (latest version) or published (active version, default). When both status and versionId are provided, versionId takes precedence."),
-	versionId: z$1.string().optional().describe("Specific version ID to resolve. Takes precedence over status when both are provided.")
+const agentVersionQuerySchema = z.object({
+	status: z.enum(["draft", "published"]).optional().describe("Which stored config version to resolve: draft (latest version) or published (active version, default). When both status and versionId are provided, versionId takes precedence."),
+	versionId: z.string().optional().describe("Specific version ID to resolve. Takes precedence over status when both are provided.")
 });
-const agentPlanQuerySchema = agentVersionQuerySchema.extend({ path: z$1.string().describe("Relative path to a markdown plan under .mastracode/plans/") });
-const agentPlanResponseSchema = z$1.object({
-	path: z$1.string(),
-	content: z$1.string()
+const agentPlanQuerySchema = agentVersionQuerySchema.extend({ path: z.string().describe("Relative path to a markdown plan under .mastracode/plans/") });
+const agentPlanResponseSchema = z.object({
+	path: z.string(),
+	content: z.string()
 });
-const toolIdPathParams = z$1.object({ toolId: z$1.string().describe("Unique identifier for the tool") });
-const agentToolPathParams = agentIdPathParams.extend({ toolId: z$1.string().describe("Unique identifier for the tool") });
-const agentSkillPathParams = agentIdPathParams.extend({ skillName: z$1.string().describe("Name of the skill") });
-const modelConfigIdPathParams = agentIdPathParams.extend({ modelConfigId: z$1.string().describe("Unique identifier for the model configuration") });
+const toolIdPathParams = z.object({ toolId: z.string().describe("Unique identifier for the tool") });
+const agentToolPathParams = agentIdPathParams.extend({ toolId: z.string().describe("Unique identifier for the tool") });
+const agentSkillPathParams = agentIdPathParams.extend({ skillName: z.string().describe("Name of the skill") });
+const modelConfigIdPathParams = agentIdPathParams.extend({ modelConfigId: z.string().describe("Unique identifier for the model configuration") });
 /**
 * Schema for serialized processor metadata
 */
-const serializedProcessorSchema$1 = z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional()
+const serializedProcessorSchema$1 = z.object({
+	id: z.string(),
+	name: z.string().optional()
 });
 /**
 * Schema for serialized tool with JSON schemas
 * Uses passthrough() to allow additional tool properties beyond core fields
 */
-const serializedToolSchema = z$1.object({
-	id: z$1.string(),
-	description: z$1.string().optional(),
-	inputSchema: z$1.string().optional(),
-	outputSchema: z$1.string().optional(),
-	requireApproval: z$1.boolean().optional()
+const serializedToolSchema = z.object({
+	id: z.string(),
+	description: z.string().optional(),
+	inputSchema: z.string().optional(),
+	outputSchema: z.string().optional(),
+	requireApproval: z.boolean().optional()
 });
 /**
 * Schema for serialized workflow with steps
 */
-const serializedWorkflowSchema = z$1.object({
-	name: z$1.string(),
-	steps: z$1.record(z$1.string(), z$1.object({
-		id: z$1.string(),
-		description: z$1.string().optional()
+const serializedWorkflowSchema = z.object({
+	name: z.string(),
+	steps: z.record(z.string(), z.object({
+		id: z.string(),
+		description: z.string().optional()
 	})).optional()
 });
 /**
 * Schema for serialized agent definition (referenced by other agents)
 */
-const serializedAgentDefinitionSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string()
+const serializedAgentDefinitionSchema = z.object({
+	id: z.string(),
+	name: z.string()
 });
 /**
 * Schema for SystemMessage type
 * Can be string, string[], or various message objects
 */
-const systemMessageSchema = typedPermissive(z$1.union([
-	z$1.string(),
-	z$1.array(z$1.string()),
-	z$1.unknown(),
-	z$1.array(z$1.unknown())
+const systemMessageSchema = typedPermissive(z.union([
+	z.string(),
+	z.array(z.string()),
+	z.unknown(),
+	z.array(z.unknown())
 ]));
 /**
 * Schema for model configuration in model list
 */
-const modelConfigSchema$1 = z$1.object({ model: z$1.object({
-	modelId: z$1.string(),
-	provider: z$1.string(),
-	modelVersion: z$1.string()
+const modelConfigSchema$1 = z.object({ model: z.object({
+	modelId: z.string(),
+	provider: z.string(),
+	modelVersion: z.string()
 }) });
-const agentEditorConfigSchema = z$1.union([z$1.literal(false), z$1.object({
-	instructions: z$1.boolean().optional(),
-	tools: z$1.union([z$1.boolean(), z$1.object({ description: z$1.boolean().optional() })]).optional()
+const agentEditorConfigSchema = z.union([z.literal(false), z.object({
+	instructions: z.boolean().optional(),
+	tools: z.union([z.boolean(), z.object({ description: z.boolean().optional() })]).optional()
 })]);
 /**
 * Main schema for serialized agent representation
 */
-const serializedAgentSchema = z$1.object({
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const serializedAgentSchema = z.object({
+	name: z.string(),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
 	instructions: systemMessageSchema.optional(),
-	tools: z$1.record(z$1.string(), serializedToolSchema),
-	agents: z$1.record(z$1.string(), serializedAgentDefinitionSchema),
-	workflows: z$1.record(z$1.string(), serializedWorkflowSchema),
-	inputProcessors: z$1.array(serializedProcessorSchema$1),
-	outputProcessors: z$1.array(serializedProcessorSchema$1),
-	provider: z$1.string().optional(),
-	modelId: z$1.string().optional(),
-	modelVersion: z$1.string().optional(),
-	supportsMemory: z$1.boolean().optional(),
-	modelList: z$1.array(modelConfigSchema$1).optional(),
+	tools: z.record(z.string(), serializedToolSchema),
+	agents: z.record(z.string(), serializedAgentDefinitionSchema),
+	workflows: z.record(z.string(), serializedWorkflowSchema),
+	inputProcessors: z.array(serializedProcessorSchema$1),
+	outputProcessors: z.array(serializedProcessorSchema$1),
+	provider: z.string().optional(),
+	modelId: z.string().optional(),
+	modelVersion: z.string().optional(),
+	supportsMemory: z.boolean().optional(),
+	modelList: z.array(modelConfigSchema$1).optional(),
 	defaultOptions: defaultOptionsSchema.optional(),
-	defaultGenerateOptionsLegacy: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	defaultStreamOptionsLegacy: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	source: z$1.enum([
+	defaultGenerateOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
+	defaultStreamOptionsLegacy: z.record(z.string(), z.unknown()).optional(),
+	source: z.enum([
 		"code",
 		"stored",
 		"fs"
 	]).optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional(),
-	activeVersionId: z$1.string().optional(),
-	hasDraft: z$1.boolean().optional(),
+	activeVersionId: z.string().optional(),
+	hasDraft: z.boolean().optional(),
 	editor: agentEditorConfigSchema.optional()
 });
 /**
 * Schema for agent with ID
 */
-serializedAgentSchema.extend({ id: z$1.string() });
+serializedAgentSchema.extend({ id: z.string() });
 /**
 * Schema for individual provider information
 */
-const providerSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	label: z$1.string().optional(),
-	description: z$1.string().optional(),
-	envVar: z$1.union([z$1.string(), z$1.array(z$1.string())]),
-	connected: z$1.boolean(),
-	docUrl: z$1.string().optional(),
-	models: z$1.array(z$1.string())
+const providerSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	label: z.string().optional(),
+	description: z.string().optional(),
+	envVar: z.union([z.string(), z.array(z.string())]),
+	connected: z.boolean(),
+	docUrl: z.string().optional(),
+	models: z.array(z.string())
 });
 /**
 * Schema for providers endpoint response
 */
-const providersResponseSchema = z$1.object({ providers: z$1.array(providerSchema) });
+const providersResponseSchema = z.object({ providers: z.array(providerSchema) });
 /**
 * Schema for list agents endpoint response
 * Returns a record of agent ID to serialized agent
 */
-const listAgentsResponseSchema = z$1.record(z$1.string(), serializedAgentSchema);
+const listAgentsResponseSchema = z.record(z.string(), serializedAgentSchema);
 /**
 * Schema for list tools endpoint response
 * Returns a record of tool ID to serialized tool
 */
-const listToolsResponseSchema = z$1.record(z$1.string(), serializedToolSchema);
+const listToolsResponseSchema = z.record(z.string(), serializedToolSchema);
 /**
 * Schema for agent memory option
 */
-const agentMemoryOptionSchema = z$1.object({
-	thread: z$1.union([z$1.string(), z$1.object({ id: z$1.string() }).passthrough()]),
+const agentMemoryOptionSchema = z.object({
+	thread: z.union([z.string(), z.object({ id: z.string() }).passthrough()]),
 	/**
 	* Optional so authenticated setups can rely on the server-derived resource ID
 	* (`mapUserToResourceId` sets MASTRA_RESOURCE_ID_KEY in the request context, which
 	* takes precedence over this value). Handlers return a 400 when neither the body
 	* nor the request context provides a resource ID.
 	*/
-	resource: z$1.string().optional(),
-	options: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	readOnly: z$1.boolean().optional()
+	resource: z.string().optional(),
+	options: z.record(z.string(), z.unknown()).optional(),
+	readOnly: z.boolean().optional()
 });
 /**
 * Schema for tool choice configuration
 */
-const toolChoiceSchema = z$1.union([z$1.enum([
+const toolChoiceSchema = z.union([z.enum([
 	"auto",
 	"none",
 	"required"
-]), z$1.object({
-	type: z$1.literal("tool"),
-	toolName: z$1.string()
+]), z.object({
+	type: z.literal("tool"),
+	toolName: z.string()
 })]);
 /**
 * Comprehensive body schema for agent generate and stream endpoints
@@ -15570,70 +15863,70 @@ const toolChoiceSchema = z$1.union([z$1.enum([
 * - Class instances: inputProcessors, outputProcessors
 * - Non-serializable: abortSignal, tracingContext
 */
-const agentExecutionBodySchema$1 = z$1.object({
-	messages: z$1.union([z$1.array(coreMessageSchema), z$1.string()]),
+const agentExecutionBodySchema$1 = z.object({
+	messages: z.union([z.array(coreMessageSchema), z.string()]),
 	instructions: systemMessageSchema.optional(),
 	system: systemMessageSchema.optional(),
-	context: z$1.array(coreMessageSchema).optional(),
+	context: z.array(coreMessageSchema).optional(),
 	memory: agentMemoryOptionSchema.optional(),
-	runId: z$1.string().optional(),
-	savePerStep: z$1.boolean().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	versions: z$1.object({
-		agents: z$1.record(z$1.string(), z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])).optional(),
-		defaultStatus: z$1.enum(["draft", "published"]).optional()
+	runId: z.string().optional(),
+	savePerStep: z.boolean().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	versions: z.object({
+		agents: z.record(z.string(), z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])).optional(),
+		defaultStatus: z.enum(["draft", "published"]).optional()
 	}).optional(),
-	maxSteps: z$1.number().optional(),
-	stopWhen: typedPermissive(z$1.unknown()).optional(),
-	model: z$1.string().optional(),
-	providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), jsonValueSchema)).optional(),
-	modelSettings: typedPermissive(z$1.unknown()).optional(),
-	activeTools: z$1.array(z$1.string()).optional(),
-	toolsets: typedPermissive(z$1.record(z$1.string(), z$1.unknown())).optional(),
-	clientTools: typedPermissive(z$1.record(z$1.string(), z$1.unknown())).optional(),
+	maxSteps: z.number().optional(),
+	stopWhen: typedPermissive(z.unknown()).optional(),
+	model: z.string().optional(),
+	providerOptions: z.record(z.string(), z.record(z.string(), jsonValueSchema)).optional(),
+	modelSettings: typedPermissive(z.unknown()).optional(),
+	activeTools: z.array(z.string()).optional(),
+	toolsets: typedPermissive(z.record(z.string(), z.unknown())).optional(),
+	clientTools: typedPermissive(z.record(z.string(), z.unknown())).optional(),
 	toolChoice: toolChoiceSchema.optional(),
-	requireToolApproval: z$1.boolean().optional(),
-	scorers: typedPermissive(z$1.union([z$1.record(z$1.string(), z$1.unknown()), z$1.record(z$1.string(), z$1.object({
-		scorer: z$1.string(),
-		sampling: z$1.unknown().optional()
+	requireToolApproval: z.boolean().optional(),
+	scorers: typedPermissive(z.union([z.record(z.string(), z.unknown()), z.record(z.string(), z.object({
+		scorer: z.string(),
+		sampling: z.unknown().optional()
 	}))])).optional(),
-	returnScorerData: z$1.boolean().optional(),
+	returnScorerData: z.boolean().optional(),
 	tracingOptions: tracingOptionsSchema.optional(),
-	output: typedPermissive(z$1.unknown()).optional(),
-	structuredOutput: typedPermissive(z$1.object({
-		schema: z$1.object({}).passthrough(),
-		model: z$1.union([z$1.string(), z$1.unknown()]).optional(),
-		instructions: z$1.string().optional(),
-		jsonPromptInjection: z$1.boolean().optional(),
-		errorStrategy: z$1.enum([
+	output: typedPermissive(z.unknown()).optional(),
+	structuredOutput: typedPermissive(z.object({
+		schema: z.object({}).passthrough(),
+		model: z.union([z.string(), z.unknown()]).optional(),
+		instructions: z.string().optional(),
+		jsonPromptInjection: z.boolean().optional(),
+		errorStrategy: z.enum([
 			"strict",
 			"warn",
 			"fallback"
 		]).optional(),
-		fallbackValue: z$1.unknown().optional()
+		fallbackValue: z.unknown().optional()
 	})).optional(),
-	untilIdle: z$1.union([z$1.boolean(), z$1.object({ maxIdleMs: z$1.number().int().positive().optional() })]).optional()
+	untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional()
 }).passthrough();
 /**
 * Legacy body schema for deprecated endpoints that still use threadId/resourceId
 * Used by /agents/:agentId/generate-legacy and /agents/:agentId/stream-legacy
 */
 const agentExecutionLegacyBodySchema = agentExecutionBodySchema$1.extend({
-	resourceId: z$1.string().optional(),
-	resourceid: z$1.string().optional(),
-	threadId: z$1.string().optional(),
-	context: typedPermissive(z$1.array(coreMessageSchema)).optional(),
+	resourceId: z.string().optional(),
+	resourceid: z.string().optional(),
+	threadId: z.string().optional(),
+	context: typedPermissive(z.array(coreMessageSchema)).optional(),
 	system: typedPermissive(systemMessageSchema).optional()
 });
 const streamUntilIdleBodySchema = agentExecutionBodySchema$1.extend({
-	maxIdleMs: z$1.number().int().positive().optional(),
-	untilIdle: z$1.union([z$1.boolean(), z$1.object({ maxIdleMs: z$1.number().int().positive().optional() })]).optional()
+	maxIdleMs: z.number().int().positive().optional(),
+	untilIdle: z.union([z.boolean(), z.object({ maxIdleMs: z.number().int().positive().optional() })]).optional()
 });
 const resumeStreamUntilIdleBodySchema = agentExecutionBodySchema$1.omit({ messages: true }).extend({
-	runId: z$1.string(),
-	resumeData: z$1.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
-	toolCallId: z$1.string().optional(),
-	maxIdleMs: z$1.number().int().positive().optional()
+	runId: z.string(),
+	resumeData: z.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
+	toolCallId: z.string().optional(),
+	maxIdleMs: z.number().int().positive().optional()
 });
 /**
 * Body schema for tool execute endpoint
@@ -15641,25 +15934,25 @@ const resumeStreamUntilIdleBodySchema = agentExecutionBodySchema$1.omit({ messag
 * Note: The .refine() ensures data is required
 * (bare z.unknown() is treated as optional by Zod)
 */
-const executeToolDataBodySchema = z$1.object({ data: z$1.unknown().refine((x) => x !== void 0, { message: "data is required" }) });
-const executeToolBodySchema$1 = executeToolDataBodySchema.extend({ requestContext: z$1.record(z$1.string(), z$1.unknown()).optional() });
-const executeToolContextBodySchema = executeToolDataBodySchema.extend({ requestContext: z$1.record(z$1.string(), z$1.unknown()).optional() });
+const executeToolDataBodySchema = z.object({ data: z.unknown().refine((x) => x !== void 0, { message: "data is required" }) });
+const executeToolBodySchema$1 = executeToolDataBodySchema.extend({ requestContext: z.record(z.string(), z.unknown()).optional() });
+const executeToolContextBodySchema = executeToolDataBodySchema.extend({ requestContext: z.record(z.string(), z.unknown()).optional() });
 /**
 * Base schema for tool approval/decline operations
 * Both approve and decline use the same parameters
 */
-const toolCallActionBodySchema = z$1.object({
-	runId: z$1.string(),
-	model: z$1.string().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	toolCallId: z$1.string(),
-	format: z$1.string().optional()
+const toolCallActionBodySchema = z.object({
+	runId: z.string(),
+	model: z.string().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	toolCallId: z.string(),
+	format: z.string().optional()
 });
-const networkToolCallActionBodySchema = z$1.object({
-	runId: z$1.string(),
-	model: z$1.string().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	format: z$1.string().optional()
+const networkToolCallActionBodySchema = z.object({
+	runId: z.string(),
+	model: z.string().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	format: z.string().optional()
 });
 /**
 * Body schema for approving tool call
@@ -15670,7 +15963,7 @@ const approveToolCallBodySchema = toolCallActionBodySchema;
 */
 const declineToolCallBodySchema = toolCallActionBodySchema.extend({ 
 /** Optional explanation surfaced to the model in place of the default decline message. */
-reason: z$1.string().optional() });
+reason: z.string().optional() });
 /**
 * Body schema for approving network tool call
 */
@@ -15680,26 +15973,26 @@ const approveNetworkToolCallBodySchema = networkToolCallActionBodySchema;
 */
 const declineNetworkToolCallBodySchema = networkToolCallActionBodySchema.extend({ 
 /** Optional explanation surfaced in place of the default decline message. */
-reason: z$1.string().optional() });
+reason: z.string().optional() });
 /**
 * Response schema for tool approval/decline
 */
-const toolCallResponseSchema = z$1.object({ fullStream: z$1.unknown() });
-const sendToolApprovalResponseSchema = z$1.object({
-	accepted: z$1.literal(true),
-	runId: z$1.string(),
-	toolCallId: z$1.string().optional()
+const toolCallResponseSchema = z.object({ fullStream: z.unknown() });
+const sendToolApprovalResponseSchema = z.object({
+	accepted: z.literal(true),
+	runId: z.string(),
+	toolCallId: z.string().optional()
 });
 /**
 * Query schema for listing suspended agent runs
 */
-const listSuspendedRunsQuerySchema = z$1.object({
-	threadId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
-	fromDate: z$1.coerce.date().optional(),
-	toDate: z$1.coerce.date().optional(),
-	perPage: z$1.coerce.number().int().positive().optional(),
-	page: z$1.coerce.number().int().nonnegative().optional()
+const listSuspendedRunsQuerySchema = z.object({
+	threadId: z.string().optional(),
+	resourceId: z.string().optional(),
+	fromDate: z.coerce.date().optional(),
+	toDate: z.coerce.date().optional(),
+	perPage: z.coerce.number().int().positive().optional(),
+	page: z.coerce.number().int().nonnegative().optional()
 }).refine((data) => !data.fromDate || !data.toDate || data.fromDate <= data.toDate, {
 	message: "fromDate must be less than or equal to toDate",
 	path: ["fromDate"]
@@ -15707,22 +16000,22 @@ const listSuspendedRunsQuerySchema = z$1.object({
 /**
 * Response schema for listing suspended agent runs
 */
-const listSuspendedRunsResponseSchema = z$1.object({
-	runs: z$1.array(z$1.object({
-		runId: z$1.string(),
-		status: z$1.literal("suspended"),
-		threadId: z$1.string().optional(),
-		resourceId: z$1.string().optional(),
-		suspendedAt: z$1.date(),
-		toolCalls: z$1.array(z$1.object({
-			toolCallId: z$1.string().optional(),
-			toolName: z$1.string().optional(),
-			args: z$1.unknown().optional(),
-			requiresApproval: z$1.boolean(),
-			suspendPayload: z$1.unknown().optional()
+const listSuspendedRunsResponseSchema = z.object({
+	runs: z.array(z.object({
+		runId: z.string(),
+		status: z.literal("suspended"),
+		threadId: z.string().optional(),
+		resourceId: z.string().optional(),
+		suspendedAt: z.date(),
+		toolCalls: z.array(z.object({
+			toolCallId: z.string().optional(),
+			toolName: z.string().optional(),
+			args: z.unknown().optional(),
+			requiresApproval: z.boolean(),
+			suspendPayload: z.unknown().optional()
 		}))
 	})),
-	total: z$1.number().int().nonnegative()
+	total: z.number().int().nonnegative()
 });
 /**
 * Body schema for resuming a suspended agent stream with custom data.
@@ -15730,9 +16023,9 @@ const listSuspendedRunsResponseSchema = z$1.object({
 * continues from a prior suspension point rather than starting fresh.
 */
 const resumeStreamBodySchema = agentExecutionBodySchema$1.omit({ messages: true }).extend({
-	runId: z$1.string(),
-	resumeData: z$1.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
-	toolCallId: z$1.string().optional()
+	runId: z.string(),
+	resumeData: z.unknown().refine((x) => x !== void 0, { message: "resumeData is required" }),
+	toolCallId: z.string().optional()
 });
 /**
 * Body schema for recovering an orphaned RUNNING durable-agent run.
@@ -15740,118 +16033,118 @@ const resumeStreamBodySchema = agentExecutionBodySchema$1.omit({ messages: true 
 * the runId plus request-context / version overrides needed for auth and
 * routing.
 */
-const recoverBodySchema = z$1.object({
-	runId: z$1.string(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	versions: z$1.object({
-		agents: z$1.record(z$1.string(), z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])).optional(),
-		defaultStatus: z$1.enum(["draft", "published"]).optional()
+const recoverBodySchema = z.object({
+	runId: z.string(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	versions: z.object({
+		agents: z.record(z.string(), z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])).optional(),
+		defaultStatus: z.enum(["draft", "published"]).optional()
 	}).optional()
 });
 /**
 * Body schema for updating agent model
 */
-const updateAgentModelBodySchema = z$1.object({
-	modelId: z$1.string(),
-	provider: z$1.string()
+const updateAgentModelBodySchema = z.object({
+	modelId: z.string(),
+	provider: z.string()
 });
 /**
 * Body schema for reordering agent model list
 */
-const reorderAgentModelListBodySchema = z$1.object({ reorderedModelIds: z$1.array(z$1.string()) });
+const reorderAgentModelListBodySchema = z.object({ reorderedModelIds: z.array(z.string()) });
 /**
 * Body schema for updating model in model list
 */
-const updateAgentModelInModelListBodySchema = z$1.object({
-	model: z$1.object({
-		modelId: z$1.string(),
-		provider: z$1.string()
+const updateAgentModelInModelListBodySchema = z.object({
+	model: z.object({
+		modelId: z.string(),
+		provider: z.string()
 	}).optional(),
-	maxRetries: z$1.number().optional(),
-	enabled: z$1.boolean().optional()
+	maxRetries: z.number().optional(),
+	enabled: z.boolean().optional()
 });
 /**
 * Response schema for model management operations
 */
 const modelManagementResponseSchema = messageResponseSchema;
-const generateResponseSchema = z$1.unknown();
-const streamResponseSchema = z$1.unknown();
-const executeToolResponseSchema$1 = z$1.unknown();
+const generateResponseSchema = z.unknown();
+const streamResponseSchema = z.unknown();
+const executeToolResponseSchema$1 = z.unknown();
 /**
 * Body schema for enhancing agent instructions
 */
-const enhanceInstructionsBodySchema = z$1.object({
-	instructions: z$1.string().describe("The current agent instructions to enhance"),
-	comment: z$1.string().describe("User comment describing how to enhance the instructions")
+const enhanceInstructionsBodySchema = z.object({
+	instructions: z.string().describe("The current agent instructions to enhance"),
+	comment: z.string().describe("User comment describing how to enhance the instructions")
 });
 /**
 * Response schema for enhanced instructions
 */
-const enhanceInstructionsResponseSchema = z$1.object({
-	explanation: z$1.string().describe("Explanation of the changes made"),
-	new_prompt: z$1.string().describe("The enhanced instructions")
+const enhanceInstructionsResponseSchema = z.object({
+	explanation: z.string().describe("Explanation of the changes made"),
+	new_prompt: z.string().describe("The enhanced instructions")
 });
 /**
 * Body schema for observing an agent stream
 * Used to reconnect to an existing stream and receive missed events
 */
-const observeAgentBodySchema = z$1.object({
-	runId: z$1.string().describe("The run ID to observe/reconnect to"),
-	offset: z$1.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
+const observeAgentBodySchema = z.object({
+	runId: z.string().describe("The run ID to observe/reconnect to"),
+	offset: z.number().optional().describe("Resume from this event index (0-based). If omitted, replays all events.")
 });
-const signalActiveBehaviorSchema = z$1.enum([
+const signalActiveBehaviorSchema = z.enum([
 	"deliver",
 	"persist",
 	"discard"
 ]);
-const signalIdleBehaviorSchema = z$1.enum([
+const signalIdleBehaviorSchema = z.enum([
 	"wake",
 	"persist",
 	"discard"
 ]);
-const signalTargetBaseBodySchema = z$1.object({ ifActive: z$1.object({
+const signalTargetBaseBodySchema = z.object({ ifActive: z.object({
 	behavior: signalActiveBehaviorSchema.optional(),
 	attributes: signalAttributesSchema$1.optional()
 }).optional() });
-const signalTargetBodySchema = z$1.union([signalTargetBaseBodySchema.extend({
-	runId: z$1.string(),
-	resourceId: z$1.string().optional(),
-	threadId: z$1.string().optional(),
-	ifIdle: z$1.undefined().optional()
+const signalTargetBodySchema = z.union([signalTargetBaseBodySchema.extend({
+	runId: z.string(),
+	resourceId: z.string().optional(),
+	threadId: z.string().optional(),
+	ifIdle: z.undefined().optional()
 }), signalTargetBaseBodySchema.extend({
-	runId: z$1.undefined().optional(),
-	resourceId: z$1.string(),
-	threadId: z$1.string(),
-	ifIdle: z$1.object({
+	runId: z.undefined().optional(),
+	resourceId: z.string(),
+	threadId: z.string(),
+	ifIdle: z.object({
 		behavior: signalIdleBehaviorSchema.optional(),
 		streamOptions: agentExecutionBodySchema$1.omit({ messages: true }).optional(),
 		attributes: signalAttributesSchema$1.optional()
 	}).optional()
 })]);
-const sendAgentSignalBodySchema = z$1.union([signalTargetBodySchema.options[0].extend({ signal: agentSignalSchema }), signalTargetBodySchema.options[1].extend({ signal: agentSignalSchema })]);
-const sendAgentMessageBodySchema = z$1.union([signalTargetBodySchema.options[0].extend({ message: agentMessageInputSchema }), signalTargetBodySchema.options[1].extend({ message: agentMessageInputSchema })]);
+const sendAgentSignalBodySchema = z.union([signalTargetBodySchema.options[0].extend({ signal: agentSignalSchema }), signalTargetBodySchema.options[1].extend({ signal: agentSignalSchema })]);
+const sendAgentMessageBodySchema = z.union([signalTargetBodySchema.options[0].extend({ message: agentMessageInputSchema }), signalTargetBodySchema.options[1].extend({ message: agentMessageInputSchema })]);
 const queueAgentMessageBodySchema = sendAgentMessageBodySchema;
-const subscribeAgentThreadBodySchema = z$1.object({
-	resourceId: z$1.string().optional(),
-	threadId: z$1.string()
+const subscribeAgentThreadBodySchema = z.object({
+	resourceId: z.string().optional(),
+	threadId: z.string()
 });
 const abortAgentThreadBodySchema = subscribeAgentThreadBodySchema;
-const sendToolApprovalBodySchema = z$1.object({
-	resourceId: z$1.string(),
-	threadId: z$1.string(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	toolCallId: z$1.string(),
-	approved: z$1.boolean(),
-	resumeData: z$1.unknown().optional(),
-	format: z$1.string().optional(),
-	messages: z$1.array(coreMessageSchema).optional(),
-	streamOptions: typedPermissive(z$1.unknown()).optional()
+const sendToolApprovalBodySchema = z.object({
+	resourceId: z.string(),
+	threadId: z.string(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	toolCallId: z.string(),
+	approved: z.boolean(),
+	resumeData: z.unknown().optional(),
+	format: z.string().optional(),
+	messages: z.array(coreMessageSchema).optional(),
+	streamOptions: typedPermissive(z.unknown()).optional()
 });
-const abortAgentThreadResponseSchema = z$1.object({ aborted: z$1.boolean() });
+const abortAgentThreadResponseSchema = z.object({ aborted: z.boolean() });
 /**
 * Response schema for observe endpoint (streaming response)
 */
-const observeAgentResponseSchema = z$1.unknown();
+const observeAgentResponseSchema = z.unknown();
 
 //#region src/server/fga-permissions.ts
 /**
@@ -16081,7 +16374,7 @@ const LIST_WORKFLOWS_ROUTE = createRoute$1({
 	method: "GET",
 	path: "/workflows",
 	responseType: "json",
-	queryParamSchema: z$1.object({ partial: z$1.string().optional() }),
+	queryParamSchema: z.object({ partial: z.string().optional() }),
 	responseSchema: listWorkflowsResponseSchema,
 	summary: "List all workflows",
 	description: "Returns a list of all available workflows in the system",
@@ -17053,19 +17346,19 @@ const OBSERVE_STREAM_LEGACY_WORKFLOW_ROUTE = createRoute$1({
 		}
 	}
 });
-const stepExecutionBodySchema = z$1.object({
-	stepId: z$1.string(),
-	executionPath: z$1.array(z$1.number().int().nonnegative()),
-	stepResults: z$1.record(z$1.string(), z$1.unknown()),
-	state: z$1.record(z$1.string(), z$1.unknown()),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()),
-	input: z$1.unknown().optional(),
-	resumeData: z$1.unknown().optional(),
-	retryCount: z$1.number().int().nonnegative().optional(),
-	foreachIdx: z$1.number().int().nonnegative().optional(),
-	format: z$1.enum(["legacy", "vnext"]).optional(),
-	perStep: z$1.boolean().optional(),
-	validateInputs: z$1.boolean().optional()
+const stepExecutionBodySchema = z.object({
+	stepId: z.string(),
+	executionPath: z.array(z.number().int().nonnegative()),
+	stepResults: z.record(z.string(), z.unknown()),
+	state: z.record(z.string(), z.unknown()),
+	requestContext: z.record(z.string(), z.unknown()),
+	input: z.unknown().optional(),
+	resumeData: z.unknown().optional(),
+	retryCount: z.number().int().nonnegative().optional(),
+	foreachIdx: z.number().int().nonnegative().optional(),
+	format: z.enum(["legacy", "vnext"]).optional(),
+	perStep: z.boolean().optional(),
+	validateInputs: z.boolean().optional()
 });
 const strategyByMastra = /* @__PURE__ */ new WeakMap();
 async function getStepStrategy(mastra) {
@@ -17083,7 +17376,7 @@ const EXECUTE_WORKFLOW_STEP_ROUTE = createRoute$1({
 	responseType: "json",
 	pathParamSchema: workflowRunPathParams,
 	bodySchema: stepExecutionBodySchema,
-	responseSchema: z$1.unknown(),
+	responseSchema: z.unknown(),
 	summary: "Execute a workflow step",
 	description: "Internal endpoint used by standalone OrchestrationWorker instances to execute workflow steps remotely via HttpRemoteStrategy.",
 	tags: ["Workflows", "Worker"],
@@ -17111,14 +17404,14 @@ const EXECUTE_WORKFLOW_STEP_ROUTE = createRoute$1({
 		}
 	})
 });
-const workflowEventSchema = z$1.object({
-	id: z$1.string(),
-	type: z$1.string(),
-	data: z$1.unknown(),
-	runId: z$1.string(),
-	createdAt: z$1.string(),
-	index: z$1.number().optional(),
-	deliveryAttempt: z$1.number().optional()
+const workflowEventSchema = z.object({
+	id: z.string(),
+	type: z.string(),
+	data: z.unknown(),
+	runId: z.string(),
+	createdAt: z.string(),
+	index: z.number().optional(),
+	deliveryAttempt: z.number().optional()
 });
 /**
 * Generic push receive endpoint for workflow events. A push-mode broker
@@ -17140,10 +17433,10 @@ const RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute$1({
 	method: "POST",
 	path: "/workflows/events",
 	responseType: "json",
-	bodySchema: z$1.object({ event: workflowEventSchema.passthrough() }),
-	responseSchema: z$1.object({
-		ok: z$1.boolean(),
-		retry: z$1.boolean().optional()
+	bodySchema: z.object({ event: workflowEventSchema.passthrough() }),
+	responseSchema: z.object({
+		ok: z.boolean(),
+		retry: z.boolean().optional()
 	}),
 	summary: "Receive a workflow event from a push-mode broker",
 	description: "Push-mode entry point for workflow events. Brokers (GCP Pub/Sub push, SNS, EventBridge) POST each event here; Mastra processes it through the same pipeline as pull-mode workers.",
@@ -17166,10 +17459,10 @@ const RECEIVE_WORKFLOW_EVENT_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/agent-builder.ts
-const actionIdPathParams = z$1.object({ actionId: z$1.string().describe("Unique identifier for the agent-builder action") });
-const actionRunPathParams = z$1.object({
-	actionId: z$1.string().describe("Unique identifier for the agent-builder action"),
-	runId: z$1.string().describe("Unique identifier for the action run")
+const actionIdPathParams = z.object({ actionId: z.string().describe("Unique identifier for the agent-builder action") });
+const actionRunPathParams = z.object({
+	actionId: z.string().describe("Unique identifier for the agent-builder action"),
+	runId: z.string().describe("Unique identifier for the action run")
 });
 /**
 * Agent-builder schemas use the same body schemas as workflows
@@ -17794,9 +18087,9 @@ const OBSERVE_STREAM_LEGACY_AGENT_BUILDER_ACTION_ROUTE = createRoute$1({
 * Uses a fixed nesting depth (3 levels) to avoid infinite recursion
 * when converting to JSON Schema / OpenAPI.
 */
-const ruleSchema = z$1.object({
-	field: z$1.string(),
-	operator: z$1.enum([
+const ruleSchema = z.object({
+	field: z.string(),
+	operator: z.enum([
 		"equals",
 		"not_equals",
 		"contains",
@@ -17810,116 +18103,116 @@ const ruleSchema = z$1.object({
 		"exists",
 		"not_exists"
 	]),
-	value: z$1.unknown().optional()
+	value: z.unknown().optional()
 });
-const ruleGroupDepth2 = z$1.object({
-	operator: z$1.enum(["AND", "OR"]),
-	conditions: z$1.array(ruleSchema)
+const ruleGroupDepth2 = z.object({
+	operator: z.enum(["AND", "OR"]),
+	conditions: z.array(ruleSchema)
 });
-const ruleGroupDepth1 = z$1.object({
-	operator: z$1.enum(["AND", "OR"]),
-	conditions: z$1.array(z$1.union([ruleSchema, ruleGroupDepth2]))
+const ruleGroupDepth1 = z.object({
+	operator: z.enum(["AND", "OR"]),
+	conditions: z.array(z.union([ruleSchema, ruleGroupDepth2]))
 });
-const ruleGroupSchema = z$1.object({
-	operator: z$1.enum(["AND", "OR"]),
-	conditions: z$1.array(z$1.union([ruleSchema, ruleGroupDepth1]))
+const ruleGroupSchema = z.object({
+	operator: z.enum(["AND", "OR"]),
+	conditions: z.array(z.union([ruleSchema, ruleGroupDepth1]))
 });
 
 //#region src/server/schemas/stored-workspaces.ts
-const storedWorkspaceIdPathParams = z$1.object({ storedWorkspaceId: z$1.string().describe("Unique identifier for the stored workspace") });
-const storageOrderBySchema$6 = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storedWorkspaceIdPathParams = z.object({ storedWorkspaceId: z.string().describe("Unique identifier for the stored workspace") });
+const storageOrderBySchema$6 = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 const listStoredWorkspacesQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema$6.optional(),
-	authorId: z$1.string().optional().describe("Filter workspaces by author identifier"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter workspaces by metadata key-value pairs")
+	authorId: z.string().optional().describe("Filter workspaces by author identifier"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter workspaces by metadata key-value pairs")
 });
-const filesystemConfigSchema = z$1.object({
-	provider: z$1.string().describe("Filesystem provider name"),
-	config: z$1.record(z$1.string(), z$1.unknown()).describe("Filesystem provider configuration")
+const filesystemConfigSchema = z.object({
+	provider: z.string().describe("Filesystem provider name"),
+	config: z.record(z.string(), z.unknown()).describe("Filesystem provider configuration")
 });
-const sandboxConfigSchema = z$1.object({
-	provider: z$1.string().describe("Sandbox provider name"),
-	config: z$1.record(z$1.string(), z$1.unknown()).describe("Sandbox provider configuration")
+const sandboxConfigSchema = z.object({
+	provider: z.string().describe("Sandbox provider name"),
+	config: z.record(z.string(), z.unknown()).describe("Sandbox provider configuration")
 });
-const searchConfigSchema = z$1.object({
-	vectorProvider: z$1.string().optional().describe("Vector store provider identifier"),
-	vectorConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Vector store provider-specific configuration"),
-	embedderProvider: z$1.string().optional().describe("Embedder provider identifier"),
-	embedderModel: z$1.string().optional().describe("Embedder model name"),
-	embedderConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Embedder provider-specific configuration"),
-	bm25: z$1.union([z$1.boolean(), z$1.object({
-		k1: z$1.number().optional(),
-		b: z$1.number().optional()
+const searchConfigSchema = z.object({
+	vectorProvider: z.string().optional().describe("Vector store provider identifier"),
+	vectorConfig: z.record(z.string(), z.unknown()).optional().describe("Vector store provider-specific configuration"),
+	embedderProvider: z.string().optional().describe("Embedder provider identifier"),
+	embedderModel: z.string().optional().describe("Embedder model name"),
+	embedderConfig: z.record(z.string(), z.unknown()).optional().describe("Embedder provider-specific configuration"),
+	bm25: z.union([z.boolean(), z.object({
+		k1: z.number().optional(),
+		b: z.number().optional()
 	})]).optional().describe("BM25 keyword search config"),
-	searchIndexName: z$1.string().optional().describe("Custom index name for the vector store"),
-	autoIndexPaths: z$1.array(z$1.string()).optional().describe("Paths to auto-index on init")
+	searchIndexName: z.string().optional().describe("Custom index name for the vector store"),
+	autoIndexPaths: z.array(z.string()).optional().describe("Paths to auto-index on init")
 });
-const workspaceToolConfigSchema = z$1.object({
-	enabled: z$1.boolean().optional().describe("Whether the tool is enabled"),
-	requireApproval: z$1.boolean().optional().describe("Whether the tool requires user approval before execution"),
-	requireReadBeforeWrite: z$1.boolean().optional().describe("For write tools: require reading a file before writing to it")
+const workspaceToolConfigSchema = z.object({
+	enabled: z.boolean().optional().describe("Whether the tool is enabled"),
+	requireApproval: z.boolean().optional().describe("Whether the tool requires user approval before execution"),
+	requireReadBeforeWrite: z.boolean().optional().describe("For write tools: require reading a file before writing to it")
 });
-const workspaceToolsConfigSchema = z$1.object({
-	enabled: z$1.boolean().optional().describe("Default: whether all tools are enabled"),
-	requireApproval: z$1.boolean().optional().describe("Default: whether all tools require user approval"),
-	tools: z$1.record(z$1.string(), workspaceToolConfigSchema).optional().describe("Per-tool overrides keyed by workspace tool name")
+const workspaceToolsConfigSchema = z.object({
+	enabled: z.boolean().optional().describe("Default: whether all tools are enabled"),
+	requireApproval: z.boolean().optional().describe("Default: whether all tools require user approval"),
+	tools: z.record(z.string(), workspaceToolConfigSchema).optional().describe("Per-tool overrides keyed by workspace tool name")
 });
-const snapshotConfigSchema$5 = z$1.object({
-	name: z$1.string().describe("Name of the workspace"),
-	description: z$1.string().optional().describe("Description of the workspace"),
+const snapshotConfigSchema$5 = z.object({
+	name: z.string().describe("Name of the workspace"),
+	description: z.string().optional().describe("Description of the workspace"),
 	filesystem: filesystemConfigSchema.optional().describe("Filesystem configuration"),
 	sandbox: sandboxConfigSchema.optional().describe("Sandbox configuration"),
-	mounts: z$1.record(z$1.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
+	mounts: z.record(z.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
 	search: searchConfigSchema.optional().describe("Search configuration"),
-	skills: z$1.array(z$1.string()).optional().describe("Array of skill IDs"),
+	skills: z.array(z.string()).optional().describe("Array of skill IDs"),
 	tools: workspaceToolsConfigSchema.optional().describe("Workspace tool configuration"),
-	autoSync: z$1.boolean().optional().describe("Whether to automatically sync the workspace"),
-	operationTimeout: z$1.number().optional().describe("Operation timeout in milliseconds")
+	autoSync: z.boolean().optional().describe("Whether to automatically sync the workspace"),
+	operationTimeout: z.number().optional().describe("Operation timeout in milliseconds")
 });
-const createStoredWorkspaceBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the workspace")
+const createStoredWorkspaceBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the workspace")
 }).merge(snapshotConfigSchema$5);
-const updateStoredWorkspaceBodySchema = z$1.object({ metadata: z$1.record(z$1.string(), z$1.unknown()).optional() }).partial().merge(snapshotConfigSchema$5.partial());
-const storedWorkspaceSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("Workspace status: draft, published, or archived"),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Name of the workspace"),
-	description: z$1.string().optional().describe("Description of the workspace"),
+const updateStoredWorkspaceBodySchema = z.object({ metadata: z.record(z.string(), z.unknown()).optional() }).partial().merge(snapshotConfigSchema$5.partial());
+const storedWorkspaceSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("Workspace status: draft, published, or archived"),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Name of the workspace"),
+	description: z.string().optional().describe("Description of the workspace"),
 	filesystem: filesystemConfigSchema.optional().describe("Filesystem configuration"),
 	sandbox: sandboxConfigSchema.optional().describe("Sandbox configuration"),
-	mounts: z$1.record(z$1.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
+	mounts: z.record(z.string(), filesystemConfigSchema).optional().describe("Mounted filesystems keyed by mount path"),
 	search: searchConfigSchema.optional().describe("Search configuration"),
-	skills: z$1.array(z$1.string()).optional().describe("Array of skill IDs"),
+	skills: z.array(z.string()).optional().describe("Array of skill IDs"),
 	tools: workspaceToolsConfigSchema.optional().describe("Workspace tool configuration"),
-	autoSync: z$1.boolean().optional().describe("Whether to automatically sync the workspace"),
-	operationTimeout: z$1.number().optional().describe("Operation timeout in milliseconds")
+	autoSync: z.boolean().optional().describe("Whether to automatically sync the workspace"),
+	operationTimeout: z.number().optional().describe("Operation timeout in milliseconds")
 });
-const listedWorkspaceSchema = storedWorkspaceSchema.extend({ runtimeRegistered: z$1.boolean().optional().describe("Whether this workspace is registered at runtime") });
-const listStoredWorkspacesResponseSchema = paginationInfoSchema$1.extend({ workspaces: z$1.array(listedWorkspaceSchema) });
+const listedWorkspaceSchema = storedWorkspaceSchema.extend({ runtimeRegistered: z.boolean().optional().describe("Whether this workspace is registered at runtime") });
+const listStoredWorkspacesResponseSchema = paginationInfoSchema$1.extend({ workspaces: z.array(listedWorkspaceSchema) });
 const getStoredWorkspaceResponseSchema = storedWorkspaceSchema;
 const createStoredWorkspaceResponseSchema = storedWorkspaceSchema;
-const updateStoredWorkspaceResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredWorkspaceResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedWorkspaceSchema]);
-const deleteStoredWorkspaceResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredWorkspaceResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 
 //#region src/server/schemas/tool-providers.ts
@@ -17936,7 +18229,7 @@ const deleteStoredWorkspaceResponseSchema = z$1.object({
 *  - `kind` accepts all three values for forward-compat; v1 only writes
 *    `'author'`.
 */
-const labelSchema = z$1.string().min(1, "Connection label is required").max(32, "Connection label must be ≤ 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -");
+const labelSchema = z.string().min(1, "Connection label is required").max(32, "Connection label must be ≤ 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -");
 /**
 * Per-pin identity bucketing.
 *
@@ -17946,25 +18239,25 @@ const labelSchema = z$1.string().min(1, "Connection label is required").max(32, 
 *
 * Optional for back-compat with pre-scope stored pins.
 */
-const connectionScopeSchema = z$1.enum([
+const connectionScopeSchema = z.enum([
 	"shared",
 	"per-author",
 	"caller-supplied"
 ]);
-const connectionSchema = z$1.object({
-	kind: z$1.enum([
+const connectionSchema = z.object({
+	kind: z.enum([
 		"author",
 		"invoker",
 		"platform"
 	]),
-	toolkit: z$1.string().min(1),
-	connectionId: z$1.string(),
+	toolkit: z.string().min(1),
+	connectionId: z.string(),
 	label: labelSchema.optional(),
 	scope: connectionScopeSchema.optional()
 });
-const toolMetaSchema = z$1.object({
-	toolkit: z$1.string().min(1).optional(),
-	description: z$1.string().optional()
+const toolMetaSchema = z.object({
+	toolkit: z.string().min(1).optional(),
+	description: z.string().optional()
 });
 /**
 * Stored shape for one provider's configuration on one agent.
@@ -17972,9 +18265,9 @@ const toolMetaSchema = z$1.object({
 * `superRefine` enforces case-insensitive uniqueness of `label` within
 * each `connections[toolkit]` array.
 */
-const toolProviderConfigSchema = z$1.object({
-	tools: z$1.record(z$1.string(), toolMetaSchema),
-	connections: z$1.record(z$1.string(), z$1.array(connectionSchema))
+const toolProviderConfigSchema = z.object({
+	tools: z.record(z.string(), toolMetaSchema),
+	connections: z.record(z.string(), z.array(connectionSchema))
 }).superRefine((value, ctx) => {
 	for (const [toolkit, connections] of Object.entries(value.connections)) {
 		if (connections.length < 2) continue;
@@ -18013,139 +18306,139 @@ const toolProviderConfigSchema = z$1.object({
 /**
 * Full v1 tool providers payload: keyed by provider id.
 */
-const toolProvidersSchema = z$1.record(z$1.string(), toolProviderConfigSchema);
-const toolProviderIdPathParams = z$1.object({ providerId: z$1.string().describe("Unique identifier for the tool provider") });
-const toolSlugPathParams = toolProviderIdPathParams.extend({ toolSlug: z$1.string().describe("Slug identifier for the tool") });
-const toolProviderAuthStatusPathParams = toolProviderIdPathParams.extend({ authId: z$1.string().describe("Opaque auth handle returned by authorize") });
-const toolProviderConnectionPathParams = toolProviderIdPathParams.extend({ connectionId: z$1.string().describe("Adapter-native connection id (e.g. Composio ca_...)") });
-const listToolProviderToolsQuerySchema = z$1.object({
-	toolkit: z$1.string().optional().describe("Filter tools by toolkit slug"),
-	search: z$1.string().optional().describe("Search tools by name or description"),
-	page: z$1.coerce.number().optional().describe("Page number for pagination (1-indexed)"),
-	perPage: z$1.coerce.number().optional().describe("Number of items per page")
+const toolProvidersSchema = z.record(z.string(), toolProviderConfigSchema);
+const toolProviderIdPathParams = z.object({ providerId: z.string().describe("Unique identifier for the tool provider") });
+const toolSlugPathParams = toolProviderIdPathParams.extend({ toolSlug: z.string().describe("Slug identifier for the tool") });
+const toolProviderAuthStatusPathParams = toolProviderIdPathParams.extend({ authId: z.string().describe("Opaque auth handle returned by authorize") });
+const toolProviderConnectionPathParams = toolProviderIdPathParams.extend({ connectionId: z.string().describe("Adapter-native connection id (e.g. Composio ca_...)") });
+const listToolProviderToolsQuerySchema = z.object({
+	toolkit: z.string().optional().describe("Filter tools by toolkit slug"),
+	search: z.string().optional().describe("Search tools by name or description"),
+	page: z.coerce.number().optional().describe("Page number for pagination (1-indexed)"),
+	perPage: z.coerce.number().optional().describe("Number of items per page")
 });
-const listConnectionFieldsQuerySchema = z$1.object({ toolkit: z$1.string().describe("Toolkit slug whose connection field schema to list") });
-const listConnectionsQuerySchema = z$1.object({
-	toolkit: z$1.string().describe("Toolkit slug whose connections to list"),
-	authorId: z$1.string().optional().describe("Admin-only: restrict listing to a specific author. Silently ignored for non-admin callers."),
+const listConnectionFieldsQuerySchema = z.object({ toolkit: z.string().describe("Toolkit slug whose connection field schema to list") });
+const listConnectionsQuerySchema = z.object({
+	toolkit: z.string().describe("Toolkit slug whose connections to list"),
+	authorId: z.string().optional().describe("Admin-only: restrict listing to a specific author. Silently ignored for non-admin callers."),
 	scope: connectionScopeSchema.optional().describe("Filter results by scope. Omit to include shared + per-author pins for the caller."),
-	page: z$1.coerce.number().int().positive().optional().describe("Page number for pagination (1-indexed)"),
-	perPage: z$1.coerce.number().int().positive().max(200).optional().describe("Number of items per page (default 50, max 200)")
+	page: z.coerce.number().int().positive().optional().describe("Page number for pagination (1-indexed)"),
+	perPage: z.coerce.number().int().positive().max(200).optional().describe("Number of items per page (default 50, max 200)")
 });
-const disconnectConnectionQuerySchema = z$1.object({
-	force: z$1.union([z$1.boolean(), z$1.enum(["true", "false"])]).optional().describe("When true, revoke at the provider and drop the row even if pinned by agents"),
-	toolkit: z$1.string().optional().describe("Toolkit slug for the connection (used when the row was upserted with one)")
+const disconnectConnectionQuerySchema = z.object({
+	force: z.union([z.boolean(), z.enum(["true", "false"])]).optional().describe("When true, revoke at the provider and drop the row even if pinned by agents"),
+	toolkit: z.string().optional().describe("Toolkit slug for the connection (used when the row was upserted with one)")
 });
-const connectionUsageQuerySchema = z$1.object({ toolkit: z$1.string().optional().describe("Optional toolkit slug to scope the usage scan") });
-const authorizeToolProviderBodySchema = z$1.object({
-	toolkit: z$1.string().describe("Toolkit slug being authorized"),
-	connectionId: z$1.string().optional().describe("Existing connection bucket id when re-authorizing; omit for a brand-new connection"),
-	toolName: z$1.string().optional().describe("Optional tool slug for tool-scoped authorization"),
-	config: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Provider-specific user-supplied connection fields (e.g. subdomain)"),
-	label: z$1.string().min(1, "Connection label is required").max(32, "Connection label must be ≤ 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -").nullish().describe("Optional human label to persist on the resulting tool_provider_connections row. Must match the stored connection label rules (≤ 32 chars, [A-Za-z0-9 _-]+)."),
+const connectionUsageQuerySchema = z.object({ toolkit: z.string().optional().describe("Optional toolkit slug to scope the usage scan") });
+const authorizeToolProviderBodySchema = z.object({
+	toolkit: z.string().describe("Toolkit slug being authorized"),
+	connectionId: z.string().optional().describe("Existing connection bucket id when re-authorizing; omit for a brand-new connection"),
+	toolName: z.string().optional().describe("Optional tool slug for tool-scoped authorization"),
+	config: z.record(z.string(), z.unknown()).optional().describe("Provider-specific user-supplied connection fields (e.g. subdomain)"),
+	label: z.string().min(1, "Connection label is required").max(32, "Connection label must be ≤ 32 characters").regex(/^[A-Za-z0-9 _-]+$/, "Connection label may only contain letters, digits, spaces, _ and -").nullish().describe("Optional human label to persist on the resulting tool_provider_connections row. Must match the stored connection label rules (≤ 32 chars, [A-Za-z0-9 _-]+)."),
 	scope: connectionScopeSchema.optional().describe("Identity bucket. \"shared\" pins under SHARED_BUCKET_ID. \"caller-supplied\" pins under the request-context resourceId (returns 400 when missing). Defaults to \"per-author\".")
 });
-const connectionStatusToolProviderBodySchema = z$1.object({ items: z$1.array(z$1.object({
-	connectionId: z$1.string(),
-	toolkit: z$1.string()
+const connectionStatusToolProviderBodySchema = z.object({ items: z.array(z.object({
+	connectionId: z.string(),
+	toolkit: z.string()
 })).describe("Connection tuples to batch-check") });
-const paginationSchema = z$1.object({
-	total: z$1.number().optional(),
-	page: z$1.number().optional(),
-	perPage: z$1.number().optional(),
-	hasMore: z$1.boolean()
+const paginationSchema = z.object({
+	total: z.number().optional(),
+	page: z.number().optional(),
+	perPage: z.number().optional(),
+	hasMore: z.boolean()
 }).optional();
-const capabilitiesSchema = z$1.object({
-	multipleConnectionsPerToolkit: z$1.boolean(),
-	batchConnectionStatus: z$1.boolean(),
-	reauthorizeReusesConnectionId: z$1.boolean(),
-	supportsRevoke: z$1.boolean().optional()
+const capabilitiesSchema = z.object({
+	multipleConnectionsPerToolkit: z.boolean(),
+	batchConnectionStatus: z.boolean(),
+	reauthorizeReusesConnectionId: z.boolean(),
+	supportsRevoke: z.boolean().optional()
 });
-const listToolProvidersResponseSchema = z$1.object({ providers: z$1.array(z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	displayName: z$1.string().optional(),
+const listToolProvidersResponseSchema = z.object({ providers: z.array(z.object({
+	id: z.string(),
+	name: z.string(),
+	description: z.string().optional(),
+	displayName: z.string().optional(),
 	capabilities: capabilitiesSchema.optional()
 })) });
-const listToolProviderToolkitsResponseSchema = z$1.object({
-	data: z$1.array(z$1.object({
-		slug: z$1.string(),
-		name: z$1.string(),
-		description: z$1.string().optional(),
-		icon: z$1.string().optional()
+const listToolProviderToolkitsResponseSchema = z.object({
+	data: z.array(z.object({
+		slug: z.string(),
+		name: z.string(),
+		description: z.string().optional(),
+		icon: z.string().optional()
 	})),
 	pagination: paginationSchema
 });
-const listToolProviderToolsResponseSchema = z$1.object({
-	data: z$1.array(z$1.object({
-		slug: z$1.string(),
-		name: z$1.string(),
-		description: z$1.string().optional(),
-		toolkit: z$1.string().optional()
+const listToolProviderToolsResponseSchema = z.object({
+	data: z.array(z.object({
+		slug: z.string(),
+		name: z.string(),
+		description: z.string().optional(),
+		toolkit: z.string().optional()
 	})),
 	pagination: paginationSchema
 });
-const getToolProviderToolSchemaResponseSchema = z$1.record(z$1.string(), z$1.unknown());
-const authorizeToolProviderResponseSchema = z$1.object({
-	url: z$1.string(),
-	authId: z$1.string()
+const getToolProviderToolSchemaResponseSchema = z.record(z.string(), z.unknown());
+const authorizeToolProviderResponseSchema = z.object({
+	url: z.string(),
+	authId: z.string()
 });
-const authStatusToolProviderResponseSchema = z$1.object({ status: z$1.enum([
+const authStatusToolProviderResponseSchema = z.object({ status: z.enum([
 	"pending",
 	"completed",
 	"failed"
 ]) });
-const connectionStatusToolProviderResponseSchema = z$1.object({ items: z$1.record(z$1.string(), z$1.object({ connected: z$1.boolean() })) });
-const listConnectionsResponseSchema = z$1.object({
-	items: z$1.array(z$1.object({
-		connectionId: z$1.string(),
-		status: z$1.enum([
+const connectionStatusToolProviderResponseSchema = z.object({ items: z.record(z.string(), z.object({ connected: z.boolean() })) });
+const listConnectionsResponseSchema = z.object({
+	items: z.array(z.object({
+		connectionId: z.string(),
+		status: z.enum([
 			"active",
 			"pending",
 			"failed",
 			"inactive"
 		]),
-		createdAt: z$1.string().optional(),
-		label: z$1.string().nullish().describe("Persisted display label from tool_provider_connections, if any"),
-		authorId: z$1.string().optional().describe("Owner of the connection (when known)"),
+		createdAt: z.string().optional(),
+		label: z.string().nullish().describe("Persisted display label from tool_provider_connections, if any"),
+		authorId: z.string().optional().describe("Owner of the connection (when known)"),
 		scope: connectionScopeSchema.optional().describe("Persisted scope from tool_provider_connections. Missing for rows that predate the scope field.")
 	})),
 	pagination: paginationSchema
 });
-const listConnectionFieldsResponseSchema = z$1.object({ fields: z$1.array(z$1.object({
-	name: z$1.string(),
-	displayName: z$1.string().optional(),
-	description: z$1.string().optional(),
-	type: z$1.enum([
+const listConnectionFieldsResponseSchema = z.object({ fields: z.array(z.object({
+	name: z.string(),
+	displayName: z.string().optional(),
+	description: z.string().optional(),
+	type: z.enum([
 		"string",
 		"number",
 		"boolean"
 	]),
-	required: z$1.boolean(),
-	default: z$1.unknown().optional()
+	required: z.boolean(),
+	default: z.unknown().optional()
 })) });
-const disconnectConnectionResponseSchema = z$1.object({
-	ok: z$1.literal(true),
-	revoked: z$1.boolean().describe("Whether the provider-side connection was revoked")
+const disconnectConnectionResponseSchema = z.object({
+	ok: z.literal(true),
+	revoked: z.boolean().describe("Whether the provider-side connection was revoked")
 });
-const updateConnectionBodySchema = z$1.object({ label: z$1.union([
+const updateConnectionBodySchema = z.object({ label: z.union([
 	labelSchema,
-	z$1.literal(""),
-	z$1.null()
+	z.literal(""),
+	z.null()
 ]).describe("New display label for the connection. Pass null (or empty string) to clear the existing label.") });
-const updateConnectionResponseSchema = z$1.object({
-	ok: z$1.literal(true),
-	label: z$1.string().nullable().describe("The persisted label after the update (null when cleared)")
+const updateConnectionResponseSchema = z.object({
+	ok: z.literal(true),
+	label: z.string().nullable().describe("The persisted label after the update (null when cleared)")
 });
-const connectionUsageResponseSchema = z$1.object({ agents: z$1.array(z$1.object({
-	id: z$1.string(),
-	name: z$1.string()
+const connectionUsageResponseSchema = z.object({ agents: z.array(z.object({
+	id: z.string(),
+	name: z.string()
 })) });
-const toolProviderHealthResponseSchema = z$1.object({
-	ok: z$1.boolean(),
-	message: z$1.string().optional(),
-	details: z$1.record(z$1.string(), z$1.unknown()).optional()
+const toolProviderHealthResponseSchema = z.object({
+	ok: z.boolean(),
+	message: z.string().optional(),
+	details: z.record(z.string(), z.unknown()).optional()
 });
 
 //#region src/server/schemas/memory-config.ts
@@ -18156,75 +18449,75 @@ const toolProviderHealthResponseSchema = z$1.object({
 /**
 * Semantic recall configuration for vector-based memory retrieval
 */
-const semanticRecallSchema = z$1.object({
-	topK: z$1.number().describe("Number of semantically similar messages to retrieve"),
-	messageRange: z$1.union([z$1.number(), z$1.object({
-		before: z$1.number(),
-		after: z$1.number()
+const semanticRecallSchema = z.object({
+	topK: z.number().describe("Number of semantically similar messages to retrieve"),
+	messageRange: z.union([z.number(), z.object({
+		before: z.number(),
+		after: z.number()
 	})]).describe("Amount of surrounding context to include with each retrieved message"),
-	scope: z$1.enum(["thread", "resource"]).optional().describe("Scope for semantic search queries"),
-	threshold: z$1.number().min(0).max(1).optional().describe("Minimum similarity score threshold"),
-	indexName: z$1.string().optional().describe("Index name for the vector store")
+	scope: z.enum(["thread", "resource"]).optional().describe("Scope for semantic search queries"),
+	threshold: z.number().min(0).max(1).optional().describe("Minimum similarity score threshold"),
+	indexName: z.string().optional().describe("Index name for the vector store")
 });
 /**
 * Title generation configuration
 * When stored, the model is serialized as a ModelRouterModelId string (provider/model-name format)
 */
-const titleGenerationSchema = z$1.union([z$1.boolean(), z$1.object({
-	model: z$1.string().describe("Model ID in format provider/model-name (ModelRouterModelId)"),
-	instructions: z$1.string().optional().describe("Custom instructions for title generation")
+const titleGenerationSchema = z.union([z.boolean(), z.object({
+	model: z.string().describe("Model ID in format provider/model-name (ModelRouterModelId)"),
+	instructions: z.string().optional().describe("Custom instructions for title generation")
 })]);
 /**
 * Observation step configuration for observational memory
 */
-const serializedObservationConfigSchema = z$1.object({
-	model: z$1.string().optional().describe("Observer model ID"),
-	messageTokens: z$1.number().optional().describe("Token threshold that triggers observation"),
-	modelSettings: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Model settings (temperature, etc.)"),
-	providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.unknown()).optional()).optional().describe("Provider-specific options"),
-	maxTokensPerBatch: z$1.number().optional().describe("Maximum tokens per batch"),
-	bufferTokens: z$1.union([z$1.number(), z$1.literal(false)]).optional().describe("Async buffering interval or false"),
-	bufferActivation: z$1.number().optional().describe("Ratio of buffered observations to activate"),
-	blockAfter: z$1.number().optional().describe("Token threshold for synchronous blocking")
+const serializedObservationConfigSchema = z.object({
+	model: z.string().optional().describe("Observer model ID"),
+	messageTokens: z.number().optional().describe("Token threshold that triggers observation"),
+	modelSettings: z.record(z.string(), z.unknown()).optional().describe("Model settings (temperature, etc.)"),
+	providerOptions: z.record(z.string(), z.record(z.string(), z.unknown()).optional()).optional().describe("Provider-specific options"),
+	maxTokensPerBatch: z.number().optional().describe("Maximum tokens per batch"),
+	bufferTokens: z.union([z.number(), z.literal(false)]).optional().describe("Async buffering interval or false"),
+	bufferActivation: z.number().optional().describe("Ratio of buffered observations to activate"),
+	blockAfter: z.number().optional().describe("Token threshold for synchronous blocking")
 });
 /**
 * Reflection step configuration for observational memory
 */
-const serializedReflectionConfigSchema = z$1.object({
-	model: z$1.string().optional().describe("Reflector model ID"),
-	observationTokens: z$1.number().optional().describe("Token threshold that triggers reflection"),
-	modelSettings: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Model settings (temperature, etc.)"),
-	providerOptions: z$1.record(z$1.string(), z$1.record(z$1.string(), z$1.unknown()).optional()).optional().describe("Provider-specific options"),
-	blockAfter: z$1.number().optional().describe("Token threshold for synchronous blocking"),
-	bufferActivation: z$1.number().optional().describe("Ratio for async reflection buffering")
+const serializedReflectionConfigSchema = z.object({
+	model: z.string().optional().describe("Reflector model ID"),
+	observationTokens: z.number().optional().describe("Token threshold that triggers reflection"),
+	modelSettings: z.record(z.string(), z.unknown()).optional().describe("Model settings (temperature, etc.)"),
+	providerOptions: z.record(z.string(), z.record(z.string(), z.unknown()).optional()).optional().describe("Provider-specific options"),
+	blockAfter: z.number().optional().describe("Token threshold for synchronous blocking"),
+	bufferActivation: z.number().optional().describe("Ratio for async reflection buffering")
 });
 /**
 * Serialized observational memory configuration
 */
-const serializedObservationalMemoryConfigObjectSchema = z$1.object({
-	model: z$1.string().optional().describe("Model ID for both Observer and Reflector"),
-	scope: z$1.enum(["resource", "thread"]).optional().describe("Memory scope"),
-	shareTokenBudget: z$1.boolean().optional().describe("Share token budget between messages and observations"),
+const serializedObservationalMemoryConfigObjectSchema = z.object({
+	model: z.string().optional().describe("Model ID for both Observer and Reflector"),
+	scope: z.enum(["resource", "thread"]).optional().describe("Memory scope"),
+	shareTokenBudget: z.boolean().optional().describe("Share token budget between messages and observations"),
 	observation: serializedObservationConfigSchema.optional().describe("Observation step configuration"),
 	reflection: serializedReflectionConfigSchema.optional().describe("Reflection step configuration")
 });
-const serializedObservationalMemoryConfigSchema = z$1.union([z$1.boolean(), serializedObservationalMemoryConfigObjectSchema]);
+const serializedObservationalMemoryConfigSchema = z.union([z.boolean(), serializedObservationalMemoryConfigObjectSchema]);
 /**
 * Serialized memory configuration matching SerializedMemoryConfig from @mastra/core
 *
 * Note: workingMemory and threads are omitted as they are not part of SerializedMemoryConfig
 * @see packages/core/src/memory/types.ts
 */
-const serializedMemoryConfigSchema = z$1.object({
-	vector: z$1.union([z$1.string(), z$1.literal(false)]).optional().describe("Vector database identifier or false to disable"),
-	options: z$1.object({
-		readOnly: z$1.boolean().optional(),
-		lastMessages: z$1.union([z$1.number(), z$1.literal(false)]).optional(),
-		semanticRecall: z$1.union([z$1.boolean(), semanticRecallSchema]).optional(),
+const serializedMemoryConfigSchema = z.object({
+	vector: z.union([z.string(), z.literal(false)]).optional().describe("Vector database identifier or false to disable"),
+	options: z.object({
+		readOnly: z.boolean().optional(),
+		lastMessages: z.union([z.number(), z.literal(false)]).optional(),
+		semanticRecall: z.union([z.boolean(), semanticRecallSchema]).optional(),
 		generateTitle: titleGenerationSchema.optional()
 	}).optional().describe("Memory behavior configuration, excluding workingMemory and threads"),
-	embedder: z$1.string().optional().describe("Embedding model ID in the format \"provider/model\" (e.g., \"openai/text-embedding-3-small\")"),
-	embedderOptions: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Options to pass to the embedder, omitting telemetry"),
+	embedder: z.string().optional().describe("Embedding model ID in the format \"provider/model\" (e.g., \"openai/text-embedding-3-small\")"),
+	embedderOptions: z.record(z.string(), z.unknown()).optional().describe("Options to pass to the embedder, omitting telemetry"),
 	observationalMemory: serializedObservationalMemoryConfigSchema.optional().describe("Serialized observational memory configuration")
 }).refine((data) => {
 	const semanticRecall = data.options?.semanticRecall;
@@ -18243,56 +18536,56 @@ const serializedMemoryConfigSchema = z$1.object({
 /**
 * Path parameter for stored agent ID
 */
-const storedAgentIdPathParams = z$1.object({ storedAgentId: z$1.string().describe("Unique identifier for the stored agent") });
+const storedAgentIdPathParams = z.object({ storedAgentId: z.string().describe("Unique identifier for the stored agent") });
 /**
 * Storage order by configuration
 */
-const storageOrderBySchema$5 = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storageOrderBySchema$5 = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 /**
 * GET /stored/agents - List stored agents
 */
 const listStoredAgentsQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema$5.optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional().default("published").describe("Filter agents by status (defaults to published)"),
-	authorId: z$1.string().optional().describe("Filter agents by author identifier"),
-	visibility: z$1.enum(["public"]).optional().describe("Filter to only public agents"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter agents by metadata key-value pairs"),
-	favoritedOnly: z$1.stringbool().optional().describe("When true, return only agents favorited by the caller (requires the `favorites` EE feature)"),
-	pinFavoritedFor: z$1.string().optional().describe("When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller")
+	authorId: z.string().optional().describe("Filter agents by author identifier"),
+	visibility: z.enum(["public"]).optional().describe("Filter to only public agents"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter agents by metadata key-value pairs"),
+	favoritedOnly: z.stringbool().optional().describe("When true, return only agents favorited by the caller (requires the `favorites` EE feature)"),
+	pinFavoritedFor: z.string().optional().describe("When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller")
 });
 /**
 * Scorer config schema with optional sampling and rules
 */
-const scorerConfigSchema = z$1.object({
-	description: z$1.string().optional(),
-	sampling: z$1.union([z$1.object({ type: z$1.literal("none") }), z$1.object({
-		type: z$1.literal("ratio"),
-		rate: z$1.number().min(0).max(1)
+const scorerConfigSchema = z.object({
+	description: z.string().optional(),
+	sampling: z.union([z.object({ type: z.literal("none") }), z.object({
+		type: z.literal("ratio"),
+		rate: z.number().min(0).max(1)
 	})]).optional(),
 	rules: ruleGroupSchema.optional()
 });
 /**
 * Agent instruction block schema for prompt-block-based instructions.
 */
-const agentInstructionBlockSchema = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("text"),
-		content: z$1.string()
+const agentInstructionBlockSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("text"),
+		content: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("prompt_block_ref"),
-		id: z$1.string()
+	z.object({
+		type: z.literal("prompt_block_ref"),
+		id: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("prompt_block"),
-		content: z$1.string(),
+	z.object({
+		type: z.literal("prompt_block"),
+		content: z.string(),
 		rules: ruleGroupSchema.optional()
 	})
 ]);
@@ -18301,83 +18594,83 @@ const agentInstructionBlockSchema = z$1.discriminatedUnion("type", [
 * Each variant has a `value` and an optional `rules` (RuleGroup) that determines when it applies.
 */
 function conditionalFieldSchema(valueSchema) {
-	const variantSchema = z$1.object({
+	const variantSchema = z.object({
 		value: valueSchema,
 		rules: ruleGroupSchema.optional()
 	});
-	return z$1.union([valueSchema, z$1.array(variantSchema)]);
+	return z.union([valueSchema, z.array(variantSchema)]);
 }
 /**
 * Instructions can be a plain string or an array of instruction blocks (text + prompt_block references).
 */
-const instructionsSchema = z$1.union([z$1.string(), z$1.array(agentInstructionBlockSchema)]).describe("System instructions for the agent (string or array of instruction blocks)");
+const instructionsSchema = z.union([z.string(), z.array(agentInstructionBlockSchema)]).describe("System instructions for the agent (string or array of instruction blocks)");
 /** Base model config schema (reused across snapshot and response schemas) */
-const modelConfigSchema = z$1.object({
-	provider: z$1.string().describe("Model provider (e.g., openai, anthropic)"),
-	name: z$1.string().describe("Model name (e.g., gpt-4o, claude-3-opus)")
+const modelConfigSchema = z.object({
+	provider: z.string().describe("Model provider (e.g., openai, anthropic)"),
+	name: z.string().describe("Model name (e.g., gpt-4o, claude-3-opus)")
 }).passthrough();
 /** Per-tool config schema */
-const toolConfigSchema = z$1.object({
-	description: z$1.string().optional(),
+const toolConfigSchema = z.object({
+	description: z.string().optional(),
 	rules: ruleGroupSchema.optional()
 });
 /** Base tools config schema */
-const toolsConfigSchema = z$1.record(z$1.string(), toolConfigSchema);
+const toolsConfigSchema = z.record(z.string(), toolConfigSchema);
 /** MCP client tools config schema — specifies which tools to use from an MCP client/server */
-const mcpClientToolsConfigSchema$1 = z$1.object({ tools: z$1.record(z$1.string(), toolConfigSchema).optional() });
+const mcpClientToolsConfigSchema$1 = z.object({ tools: z.record(z.string(), toolConfigSchema).optional() });
 /** Per-skill config schema */
-const skillConfigSchema = z$1.object({
-	description: z$1.string().optional(),
-	instructions: z$1.string().optional(),
-	pin: z$1.string().optional(),
-	strategy: z$1.enum(["latest", "live"]).optional()
+const skillConfigSchema = z.object({
+	description: z.string().optional(),
+	instructions: z.string().optional(),
+	pin: z.string().optional(),
+	strategy: z.enum(["latest", "live"]).optional()
 });
 /** Skills config: skill IDs mapped to per-skill config */
-const skillsConfigSchema = z$1.record(z$1.string(), skillConfigSchema);
+const skillsConfigSchema = z.record(z.string(), skillConfigSchema);
 /** Workspace reference: a stored workspace ID, inline config, or a registered workspace provider */
-const workspaceRefSchema = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("id"),
-		workspaceId: z$1.string()
+const workspaceRefSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("id"),
+		workspaceId: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("inline"),
+	z.object({
+		type: z.literal("inline"),
 		config: snapshotConfigSchema$5
 	}),
-	z$1.object({
-		type: z$1.literal("provider"),
-		provider: z$1.string().describe("Workspace provider identifier"),
-		config: z$1.record(z$1.string(), z$1.unknown()).describe("Provider-specific configuration")
+	z.object({
+		type: z.literal("provider"),
+		provider: z.string().describe("Workspace provider identifier"),
+		config: z.record(z.string(), z.unknown()).describe("Provider-specific configuration")
 	})
 ]);
 /** Screencast options for streaming browser frames */
-const screencastOptionsSchema = z$1.object({
-	format: z$1.enum(["jpeg", "png"]).optional().describe("Image format (default: jpeg)"),
-	quality: z$1.number().min(0).max(100).optional().describe("JPEG quality 0-100 (default: 80)"),
-	maxWidth: z$1.number().optional().describe("Max width in pixels (default: 1280)"),
-	maxHeight: z$1.number().optional().describe("Max height in pixels (default: 720)"),
-	everyNthFrame: z$1.number().optional().describe("Capture every Nth frame (default: 1)")
+const screencastOptionsSchema = z.object({
+	format: z.enum(["jpeg", "png"]).optional().describe("Image format (default: jpeg)"),
+	quality: z.number().min(0).max(100).optional().describe("JPEG quality 0-100 (default: 80)"),
+	maxWidth: z.number().optional().describe("Max width in pixels (default: 1280)"),
+	maxHeight: z.number().optional().describe("Max height in pixels (default: 720)"),
+	everyNthFrame: z.number().optional().describe("Capture every Nth frame (default: 1)")
 });
 /** Browser config: serializable browser configuration for stored agents */
-const browserConfigSchema = z$1.object({
-	provider: z$1.string().describe("Browser provider type (e.g., stagehand, playwright)"),
-	headless: z$1.boolean().optional().describe("Run browser in headless mode (default: true)"),
-	viewport: z$1.object({
-		width: z$1.number().describe("Viewport width in pixels"),
-		height: z$1.number().describe("Viewport height in pixels")
+const browserConfigSchema = z.object({
+	provider: z.string().describe("Browser provider type (e.g., stagehand, playwright)"),
+	headless: z.boolean().optional().describe("Run browser in headless mode (default: true)"),
+	viewport: z.object({
+		width: z.number().describe("Viewport width in pixels"),
+		height: z.number().describe("Viewport height in pixels")
 	}).optional().describe("Browser viewport dimensions"),
-	timeout: z$1.number().optional().describe("Default timeout in milliseconds (default: 10000)"),
+	timeout: z.number().optional().describe("Default timeout in milliseconds (default: 10000)"),
 	screencast: screencastOptionsSchema.optional().describe("Screencast options for streaming browser frames")
 });
 /** Browser reference: inline browser configuration */
-const browserRefSchema = z$1.object({
-	type: z$1.literal("inline"),
+const browserRefSchema = z.object({
+	type: z.literal("inline"),
 	config: browserConfigSchema
 });
 /**
 * Processor phase enum matching ProcessorPhase type
 */
-const processorPhaseSchema$1 = z$1.enum([
+const processorPhaseSchema$1 = z.enum([
 	"processInput",
 	"processInputStep",
 	"processOutputStream",
@@ -18388,11 +18681,11 @@ const processorPhaseSchema$1 = z$1.enum([
 /**
 * A single processor step in a stored processor graph.
 */
-const processorGraphStepSchema = z$1.object({
-	id: z$1.string().describe("Unique ID for this step within the graph"),
-	providerId: z$1.string().describe("ProcessorProvider ID that creates this processor"),
-	config: z$1.record(z$1.string(), z$1.unknown()).describe("Configuration matching the provider configSchema"),
-	enabledPhases: z$1.array(processorPhaseSchema$1).min(1).describe("Which processor phases to enable")
+const processorGraphStepSchema = z.object({
+	id: z.string().describe("Unique ID for this step within the graph"),
+	providerId: z.string().describe("ProcessorProvider ID that creates this processor"),
+	config: z.record(z.string(), z.unknown()).describe("Configuration matching the provider configSchema"),
+	enabledPhases: z.array(processorPhaseSchema$1).min(1).describe("Which processor phases to enable")
 });
 /**
 * Processor graph entry schema.
@@ -18402,42 +18695,42 @@ const processorGraphStepSchema = z$1.object({
 * when converting to JSON Schema / OpenAPI.
 */
 /** Depth 3 (leaf): only step entries allowed */
-const processorGraphEntryDepth3 = z$1.discriminatedUnion("type", [z$1.object({
-	type: z$1.literal("step"),
+const processorGraphEntryDepth3 = z.discriminatedUnion("type", [z.object({
+	type: z.literal("step"),
 	step: processorGraphStepSchema
 })]);
 /** Depth 2: step, parallel, and conditional — children limited to depth 3 */
-const processorGraphEntryDepth2 = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("step"),
+const processorGraphEntryDepth2 = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("step"),
 		step: processorGraphStepSchema
 	}),
-	z$1.object({
-		type: z$1.literal("parallel"),
-		branches: z$1.array(z$1.array(processorGraphEntryDepth3))
+	z.object({
+		type: z.literal("parallel"),
+		branches: z.array(z.array(processorGraphEntryDepth3))
 	}),
-	z$1.object({
-		type: z$1.literal("conditional"),
-		conditions: z$1.array(z$1.object({
-			steps: z$1.array(processorGraphEntryDepth3),
+	z.object({
+		type: z.literal("conditional"),
+		conditions: z.array(z.object({
+			steps: z.array(processorGraphEntryDepth3),
 			rules: ruleGroupSchema.optional()
 		}))
 	})
 ]);
 /** Depth 1 (top-level): step, parallel, and conditional — children limited to depth 2 */
-const processorGraphEntrySchema = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("step"),
+const processorGraphEntrySchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("step"),
 		step: processorGraphStepSchema
 	}),
-	z$1.object({
-		type: z$1.literal("parallel"),
-		branches: z$1.array(z$1.array(processorGraphEntryDepth2))
+	z.object({
+		type: z.literal("parallel"),
+		branches: z.array(z.array(processorGraphEntryDepth2))
 	}),
-	z$1.object({
-		type: z$1.literal("conditional"),
-		conditions: z$1.array(z$1.object({
-			steps: z$1.array(processorGraphEntryDepth2),
+	z.object({
+		type: z.literal("conditional"),
+		conditions: z.array(z.object({
+			steps: z.array(processorGraphEntryDepth2),
 			rules: ruleGroupSchema.optional()
 		}))
 	})
@@ -18445,7 +18738,7 @@ const processorGraphEntrySchema = z$1.discriminatedUnion("type", [
 /**
 * A stored processor graph representing a pipeline of processors.
 */
-const storedProcessorGraphSchema = z$1.object({ steps: z$1.array(processorGraphEntrySchema).describe("Ordered list of processor graph entries") });
+const storedProcessorGraphSchema = z.object({ steps: z.array(processorGraphEntrySchema).describe("Ordered list of processor graph entries") });
 /**
 * Agent snapshot config fields (name, description, instructions, model, tools, etc.)
 * These live in version snapshots, not on the thin agent record.
@@ -18459,43 +18752,43 @@ const storedProcessorGraphSchema = z$1.object({ steps: z$1.array(processorGraphE
 * not accepted here. Intentionally not a conditional field — durability is
 * decided when the agent is registered, not per request.
 */
-const durableConfigSchema = z$1.union([z$1.boolean(), z$1.object({
-	maxSteps: z$1.number().int().positive().optional(),
-	cleanupTimeoutMs: z$1.number().int().nonnegative().optional()
+const durableConfigSchema = z.union([z.boolean(), z.object({
+	maxSteps: z.number().int().positive().optional(),
+	cleanupTimeoutMs: z.number().int().nonnegative().optional()
 })]);
-const snapshotConfigSchema$4 = z$1.object({
-	name: z$1.string().describe("Name of the agent"),
-	description: z$1.string().optional().describe("Description of the agent"),
+const snapshotConfigSchema$4 = z.object({
+	name: z.string().describe("Name of the agent"),
+	description: z.string().optional().describe("Description of the agent"),
 	instructions: instructionsSchema,
 	model: conditionalFieldSchema(modelConfigSchema).describe("Model configuration — static value or array of conditional variants"),
 	tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config — static or conditional"),
 	defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls — static or conditional"),
-	workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
-	agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
-	integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
+	workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
+	agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
+	integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
 	toolProviders: conditionalFieldSchema(toolProvidersSchema).optional().describe("Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field."),
-	mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
+	mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
 	inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph — static or conditional"),
 	outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph — static or conditional"),
 	memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration — static or conditional"),
-	scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
+	scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
 	skills: conditionalFieldSchema(skillsConfigSchema).optional().describe("Skill IDs mapped to per-skill config — static or conditional"),
 	workspace: conditionalFieldSchema(workspaceRefSchema).optional().describe("Workspace reference (stored ID or inline config) — static or conditional"),
-	browser: z$1.union([
+	browser: z.union([
 		conditionalFieldSchema(browserRefSchema),
-		z$1.boolean(),
-		z$1.null()
+		z.boolean(),
+		z.null()
 	]).optional().describe("Browser configuration — object config, true (apply default), false/null (disable)"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables for conditional rule evaluation"),
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables for conditional rule evaluation"),
 	durable: durableConfigSchema.optional().describe("Opt this agent into durable execution when it is hydrated. Cache and pubsub are inherited from the Mastra instance; without distributed backends durability is process-local. Does not enable automatic recovery — that stays `recovery.durableAgents`.")
 });
 /**
 * Agent metadata fields (authorId, metadata, visibility) that live on the thin agent record.
 */
-const agentMetadataSchema = z$1.object({
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the agent"),
-	visibility: z$1.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
+const agentMetadataSchema = z.object({
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the agent"),
+	visibility: z.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)")
 });
 /**
 * Snapshot config schema for create where `model` is optional. When omitted, the
@@ -18507,30 +18800,30 @@ const snapshotConfigCreateSchema = snapshotConfigSchema$4.extend({ model: condit
 * Flat union of agent-record fields + config fields
 * The id is optional — if not provided, it will be derived from the agent name via slugify.
 */
-const createStoredAgentBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier for the agent. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the agent"),
-	visibility: z$1.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)"),
-	autoPublish: z$1.boolean().optional().describe("Publish the initial version so the agent resolves at status=\"published\". Defaults to true when omitted. Pass false to stage the agent as an unpublished draft — useful when overriding a code-defined agent, whose code definition keeps serving traffic until the override is published.")
+const createStoredAgentBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier for the agent. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the agent"),
+	visibility: z.enum(["private", "public"]).optional().describe("Agent visibility: private (owner/admin only) or public (any reader)"),
+	autoPublish: z.boolean().optional().describe("Publish the initial version so the agent resolves at status=\"published\". Defaults to true when omitted. Pass false to stage the agent as an unpublished draft — useful when overriding a code-defined agent, whose code definition keeps serving traffic until the override is published.")
 }).merge(snapshotConfigCreateSchema);
 /**
 * Snapshot config schema for updates where nullable fields (like memory) can be set to null to clear them.
 */
-const snapshotConfigUpdateSchema = snapshotConfigSchema$4.extend({ memory: z$1.union([conditionalFieldSchema(serializedMemoryConfigSchema), z$1.null()]).optional().describe("Memory configuration — static, conditional, or null to disable memory") });
+const snapshotConfigUpdateSchema = snapshotConfigSchema$4.extend({ memory: z.union([conditionalFieldSchema(serializedMemoryConfigSchema), z.null()]).optional().describe("Memory configuration — static, conditional, or null to disable memory") });
 /**
 * PATCH /stored/agents/:storedAgentId - Update stored agent body
 * Optional metadata-level fields + optional config fields
 */
 const updateStoredAgentBodySchema = agentMetadataSchema.partial().merge(snapshotConfigUpdateSchema.partial()).extend({
-	changeMessage: z$1.string().trim().max(500).optional().describe("Optional message describing the changes for the auto-created version"),
-	autoPublish: z$1.boolean().optional().describe("Immediately activate the auto-created version. Defaults to false when omitted.")
+	changeMessage: z.string().trim().max(500).optional().describe("Optional message describing the changes for the auto-created version"),
+	autoPublish: z.boolean().optional().describe("Immediately activate the auto-created version. Defaults to false when omitted.")
 });
 const exportStoredAgentBodySchema = snapshotConfigUpdateSchema.partial();
 const openStoredAgentChangeRequestBodySchema = exportStoredAgentBodySchema.extend({
-	changeMessage: z$1.string().trim().max(500).optional(),
-	userName: z$1.string().trim().min(1).max(120).optional(),
-	inspectOnly: z$1.boolean().optional()
+	changeMessage: z.string().trim().max(500).optional(),
+	userName: z.string().trim().min(1).max(120).optional(),
+	inspectOnly: z.boolean().optional()
 });
 /**
 * Resolved author object — server-side enrichment of `authorId` against the
@@ -18538,57 +18831,57 @@ const openStoredAgentChangeRequestBodySchema = exportStoredAgentBodySchema.exten
 * what `/auth/me` exposes and are optional because providers may not return
 * every field.
 */
-const resolvedAuthorSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional(),
-	email: z$1.string().optional(),
-	avatarUrl: z$1.string().optional()
+const resolvedAuthorSchema = z.object({
+	id: z.string(),
+	name: z.string().optional(),
+	email: z.string().optional(),
+	avatarUrl: z.string().optional()
 });
 /**
 * Stored agent object schema (resolved response: thin record + version config)
 * Represents StorageResolvedAgentType
 */
-const storedAgentSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("Agent status: draft or published"),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
+const storedAgentSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("Agent status: draft or published"),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
 	author: resolvedAuthorSchema.optional().describe("Resolved author identity (when an auth provider is configured)"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	visibility: z$1.enum(["private", "public"]).optional(),
-	favoriteCount: z$1.number().int().nonnegative().optional().describe("Number of users who have favorited this agent"),
-	isFavorited: z$1.boolean().optional().describe("Whether the requesting user has favorited this agent"),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Name of the agent"),
-	description: z$1.string().optional().describe("Description of the agent"),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	visibility: z.enum(["private", "public"]).optional(),
+	favoriteCount: z.number().int().nonnegative().optional().describe("Number of users who have favorited this agent"),
+	isFavorited: z.boolean().optional().describe("Whether the requesting user has favorited this agent"),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Name of the agent"),
+	description: z.string().optional().describe("Description of the agent"),
 	instructions: instructionsSchema,
 	model: conditionalFieldSchema(modelConfigSchema).describe("Model configuration — static value or array of conditional variants"),
 	tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config — static or conditional"),
 	defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls — static or conditional"),
-	workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
-	agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
-	integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
+	workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
+	agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
+	integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
 	toolProviders: conditionalFieldSchema(toolProvidersSchema).optional().describe("Tool provider connections and per-tool config (provider-agnostic). Coexists with the deprecated `integrationTools` field."),
-	mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
+	mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema$1)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
 	inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph — static or conditional"),
 	outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph — static or conditional"),
 	memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration — static or conditional"),
-	scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
+	scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
 	skills: conditionalFieldSchema(skillsConfigSchema).optional().describe("Skill IDs mapped to per-skill config — static or conditional"),
 	workspace: conditionalFieldSchema(workspaceRefSchema).optional().describe("Workspace reference (stored ID or inline config) — static or conditional"),
-	browser: z$1.union([
+	browser: z.union([
 		conditionalFieldSchema(browserRefSchema),
-		z$1.boolean(),
-		z$1.null()
+		z.boolean(),
+		z.null()
 	]).optional().describe("Browser configuration — object config, true (apply default), false/null (disable)"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables"),
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables"),
 	durable: durableConfigSchema.optional().describe("Whether this agent is hydrated with durable execution enabled")
 });
 /**
 * Response for GET /stored/agents
 */
-const listStoredAgentsResponseSchema = paginationInfoSchema$1.extend({ agents: z$1.array(storedAgentSchema) });
+const listStoredAgentsResponseSchema = paginationInfoSchema$1.extend({ agents: z.array(storedAgentSchema) });
 /**
 * Response for GET /stored/agents/:storedAgentId
 */
@@ -18606,22 +18899,22 @@ const createStoredAgentResponseSchema = storedAgentSchema;
 *
 * We use a union to handle both cases properly.
 */
-const updateStoredAgentResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	visibility: z$1.enum(["private", "public"]).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredAgentResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	visibility: z.enum(["private", "public"]).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedAgentSchema]);
 /**
 * Response for DELETE /stored/agents/:storedAgentId
 */
-const deleteStoredAgentResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredAgentResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 /**
 * Response for GET /stored/agents/:storedAgentId/dependents
@@ -18633,35 +18926,35 @@ const deleteStoredAgentResponseSchema = z$1.object({
 * (cross-workspace private agents). Only populated when the target agent is
 * public, to avoid leaking cross-workspace structure for private targets.
 */
-const getStoredAgentDependentsResponseSchema = z$1.object({
-	dependents: z$1.array(z$1.object({
-		id: z$1.string(),
-		name: z$1.string()
+const getStoredAgentDependentsResponseSchema = z.object({
+	dependents: z.array(z.object({
+		id: z.string(),
+		name: z.string()
 	})),
-	hiddenCount: z$1.number().int().nonnegative()
+	hiddenCount: z.number().int().nonnegative()
 });
-const exportStoredAgentResponseSchema = z$1.object({
-	agentId: z$1.string(),
-	fileName: z$1.string(),
-	content: z$1.string(),
-	config: z$1.record(z$1.string(), z$1.unknown())
+const exportStoredAgentResponseSchema = z.object({
+	agentId: z.string(),
+	fileName: z.string(),
+	content: z.string(),
+	config: z.record(z.string(), z.unknown())
 });
-const openStoredAgentChangeRequestResponseSchema = z$1.object({
-	id: z$1.union([z$1.string(), z$1.number()]).optional(),
-	url: z$1.string(),
-	ref: z$1.string().optional()
+const openStoredAgentChangeRequestResponseSchema = z.object({
+	id: z.union([z.string(), z.number()]).optional(),
+	url: z.string(),
+	ref: z.string().optional()
 });
 /**
 * POST /stored/agents/preview-instructions - Preview resolved instructions
 */
-const previewInstructionsBodySchema = z$1.object({
-	blocks: z$1.array(agentInstructionBlockSchema).describe("Array of instruction blocks to resolve"),
-	context: z$1.record(z$1.string(), z$1.unknown()).optional().default({}).describe("Request context for variable interpolation and rule evaluation")
+const previewInstructionsBodySchema = z.object({
+	blocks: z.array(agentInstructionBlockSchema).describe("Array of instruction blocks to resolve"),
+	context: z.record(z.string(), z.unknown()).optional().default({}).describe("Request context for variable interpolation and rule evaluation")
 });
 /**
 * Response for POST /stored/agents/preview-instructions
 */
-const previewInstructionsResponseSchema = z$1.object({ result: z$1.string().describe("The resolved instructions string") });
+const previewInstructionsResponseSchema = z.object({ result: z.string().describe("The resolved instructions string") });
 
 //#region src/server/schemas/workspace.ts
 /**
@@ -18672,42 +18965,42 @@ const previewInstructionsResponseSchema = z$1.object({ result: z$1.string().desc
 * - Search operations (search, index)
 * - Skills operations (list, get, search, references)
 */
-z$1.object({ path: z$1.string().describe("File or directory path (URL encoded)") });
-const workspaceIdPathParams = z$1.object({ workspaceId: z$1.string().describe("Workspace ID") });
-const fsReadQuerySchema = z$1.object({
-	path: z$1.string().describe("Path to the file to read"),
-	encoding: z$1.string().optional().describe("Encoding for text files (default: utf-8)")
+z.object({ path: z.string().describe("File or directory path (URL encoded)") });
+const workspaceIdPathParams = z.object({ workspaceId: z.string().describe("Workspace ID") });
+const fsReadQuerySchema = z.object({
+	path: z.string().describe("Path to the file to read"),
+	encoding: z.string().optional().describe("Encoding for text files (default: utf-8)")
 });
-const fsListQuerySchema = z$1.object({
-	path: z$1.string().describe("Path to the directory to list"),
-	recursive: z$1.coerce.boolean().optional().describe("Include subdirectories")
+const fsListQuerySchema = z.object({
+	path: z.string().describe("Path to the directory to list"),
+	recursive: z.coerce.boolean().optional().describe("Include subdirectories")
 });
-const fsStatQuerySchema = z$1.object({ path: z$1.string().describe("Path to get info about") });
-const fsDeleteQuerySchema = z$1.object({
-	path: z$1.string().describe("Path to delete"),
-	recursive: z$1.coerce.boolean().optional().describe("Delete directories recursively"),
-	force: z$1.coerce.boolean().optional().describe("Don't error if path doesn't exist")
+const fsStatQuerySchema = z.object({ path: z.string().describe("Path to get info about") });
+const fsDeleteQuerySchema = z.object({
+	path: z.string().describe("Path to delete"),
+	recursive: z.coerce.boolean().optional().describe("Delete directories recursively"),
+	force: z.coerce.boolean().optional().describe("Don't error if path doesn't exist")
 });
-const fsWriteBodySchema = z$1.object({
-	path: z$1.string().describe("Path to write to"),
-	content: z$1.string().describe("Content to write (text or base64-encoded binary)"),
-	encoding: z$1.enum(["utf-8", "base64"]).optional().default("utf-8").describe("Content encoding"),
-	recursive: z$1.coerce.boolean().optional().describe("Create parent directories if needed")
+const fsWriteBodySchema = z.object({
+	path: z.string().describe("Path to write to"),
+	content: z.string().describe("Content to write (text or base64-encoded binary)"),
+	encoding: z.enum(["utf-8", "base64"]).optional().default("utf-8").describe("Content encoding"),
+	recursive: z.coerce.boolean().optional().describe("Create parent directories if needed")
 });
-const fsMkdirBodySchema = z$1.object({
-	path: z$1.string().describe("Directory path to create"),
-	recursive: z$1.coerce.boolean().optional().describe("Create parent directories if needed")
+const fsMkdirBodySchema = z.object({
+	path: z.string().describe("Directory path to create"),
+	recursive: z.coerce.boolean().optional().describe("Create parent directories if needed")
 });
-const fileEntrySchema = z$1.object({
-	name: z$1.string(),
-	type: z$1.enum(["file", "directory"]),
-	size: z$1.number().optional(),
-	mount: z$1.object({
-		provider: z$1.string(),
-		icon: z$1.string().optional(),
-		displayName: z$1.string().optional(),
-		description: z$1.string().optional(),
-		status: z$1.enum([
+const fileEntrySchema = z.object({
+	name: z.string(),
+	type: z.enum(["file", "directory"]),
+	size: z.number().optional(),
+	mount: z.object({
+		provider: z.string(),
+		icon: z.string().optional(),
+		displayName: z.string().optional(),
+		description: z.string().optional(),
+		status: z.enum([
 			"pending",
 			"initializing",
 			"ready",
@@ -18719,186 +19012,186 @@ const fileEntrySchema = z$1.object({
 			"destroyed",
 			"error"
 		]).optional(),
-		error: z$1.string().optional()
+		error: z.string().optional()
 	}).optional()
 });
-const fsReadResponseSchema = z$1.object({
-	path: z$1.string(),
-	content: z$1.string(),
-	type: z$1.enum(["file", "directory"]),
-	size: z$1.number().optional(),
-	mimeType: z$1.string().optional()
+const fsReadResponseSchema = z.object({
+	path: z.string(),
+	content: z.string(),
+	type: z.enum(["file", "directory"]),
+	size: z.number().optional(),
+	mimeType: z.string().optional()
 });
-const fsWriteResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	path: z$1.string()
+const fsWriteResponseSchema = z.object({
+	success: z.boolean(),
+	path: z.string()
 });
-const fsListResponseSchema = z$1.object({
-	path: z$1.string(),
-	entries: z$1.array(fileEntrySchema)
+const fsListResponseSchema = z.object({
+	path: z.string(),
+	entries: z.array(fileEntrySchema)
 });
-const fsDeleteResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	path: z$1.string()
+const fsDeleteResponseSchema = z.object({
+	success: z.boolean(),
+	path: z.string()
 });
-const fsMkdirResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	path: z$1.string()
+const fsMkdirResponseSchema = z.object({
+	success: z.boolean(),
+	path: z.string()
 });
-const fsStatResponseSchema = z$1.object({
-	path: z$1.string(),
-	type: z$1.enum(["file", "directory"]),
-	size: z$1.number().optional(),
-	createdAt: z$1.string().optional(),
-	modifiedAt: z$1.string().optional(),
-	mimeType: z$1.string().optional()
+const fsStatResponseSchema = z.object({
+	path: z.string(),
+	type: z.enum(["file", "directory"]),
+	size: z.number().optional(),
+	createdAt: z.string().optional(),
+	modifiedAt: z.string().optional(),
+	mimeType: z.string().optional()
 });
-const searchQuerySchema = z$1.object({
-	query: z$1.string().describe("Search query text"),
-	topK: z$1.coerce.number().optional().default(5).describe("Maximum number of results"),
-	mode: z$1.enum([
+const searchQuerySchema = z.object({
+	query: z.string().describe("Search query text"),
+	topK: z.coerce.number().optional().default(5).describe("Maximum number of results"),
+	mode: z.enum([
 		"bm25",
 		"vector",
 		"hybrid"
 	]).optional().describe("Search mode"),
-	minScore: z$1.coerce.number().optional().describe("Minimum relevance score threshold")
+	minScore: z.coerce.number().optional().describe("Minimum relevance score threshold")
 });
-const searchResultSchema = z$1.object({
-	id: z$1.string().describe("Document ID (file path)"),
-	content: z$1.string(),
-	score: z$1.number(),
-	lineRange: z$1.object({
-		start: z$1.number(),
-		end: z$1.number()
+const searchResultSchema = z.object({
+	id: z.string().describe("Document ID (file path)"),
+	content: z.string(),
+	score: z.number(),
+	lineRange: z.object({
+		start: z.number(),
+		end: z.number()
 	}).optional(),
-	scoreDetails: z$1.object({
-		vector: z$1.number().optional(),
-		bm25: z$1.number().optional()
+	scoreDetails: z.object({
+		vector: z.number().optional(),
+		bm25: z.number().optional()
 	}).optional()
 });
-const searchResponseSchema = z$1.object({
-	results: z$1.array(searchResultSchema),
-	query: z$1.string(),
-	mode: z$1.enum([
+const searchResponseSchema = z.object({
+	results: z.array(searchResultSchema),
+	query: z.string(),
+	mode: z.enum([
 		"bm25",
 		"vector",
 		"hybrid"
 	])
 });
-const indexBodySchema = z$1.object({
-	path: z$1.string().describe("Path to use as document ID"),
-	content: z$1.string().describe("Content to index"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata")
+const indexBodySchema = z.object({
+	path: z.string().describe("Path to use as document ID"),
+	content: z.string().describe("Content to index"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata")
 });
-const indexResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	path: z$1.string()
+const indexResponseSchema = z.object({
+	success: z.boolean(),
+	path: z.string()
 });
-const mountInfoSchema = z$1.object({
-	path: z$1.string().describe("Mount path"),
-	provider: z$1.string().describe("Filesystem provider type"),
-	readOnly: z$1.boolean().describe("Whether the mount is read-only"),
-	displayName: z$1.string().optional().describe("Human-readable name"),
-	icon: z$1.string().optional().describe("UI icon identifier"),
-	name: z$1.string().optional().describe("Filesystem instance name")
+const mountInfoSchema = z.object({
+	path: z.string().describe("Mount path"),
+	provider: z.string().describe("Filesystem provider type"),
+	readOnly: z.boolean().describe("Whether the mount is read-only"),
+	displayName: z.string().optional().describe("Human-readable name"),
+	icon: z.string().optional().describe("UI icon identifier"),
+	name: z.string().optional().describe("Filesystem instance name")
 });
-const workspaceInfoResponseSchema = z$1.object({
-	isWorkspaceConfigured: z$1.boolean(),
-	id: z$1.string().optional(),
-	name: z$1.string().optional(),
-	status: z$1.string().optional(),
-	capabilities: z$1.object({
-		hasFilesystem: z$1.boolean(),
-		hasSandbox: z$1.boolean(),
-		canBM25: z$1.boolean(),
-		canVector: z$1.boolean(),
-		canHybrid: z$1.boolean(),
-		hasSkills: z$1.boolean()
+const workspaceInfoResponseSchema = z.object({
+	isWorkspaceConfigured: z.boolean(),
+	id: z.string().optional(),
+	name: z.string().optional(),
+	status: z.string().optional(),
+	capabilities: z.object({
+		hasFilesystem: z.boolean(),
+		hasSandbox: z.boolean(),
+		canBM25: z.boolean(),
+		canVector: z.boolean(),
+		canHybrid: z.boolean(),
+		hasSkills: z.boolean()
 	}).optional(),
-	safety: z$1.object({ readOnly: z$1.boolean() }).optional(),
-	filesystem: z$1.object({
-		id: z$1.string(),
-		name: z$1.string(),
-		provider: z$1.string(),
-		status: z$1.string().optional(),
-		error: z$1.string().optional(),
-		readOnly: z$1.boolean().optional(),
-		icon: z$1.string().optional(),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	safety: z.object({ readOnly: z.boolean() }).optional(),
+	filesystem: z.object({
+		id: z.string(),
+		name: z.string(),
+		provider: z.string(),
+		status: z.string().optional(),
+		error: z.string().optional(),
+		readOnly: z.boolean().optional(),
+		icon: z.string().optional(),
+		metadata: z.record(z.string(), z.unknown()).optional()
 	}).optional(),
-	mounts: z$1.array(mountInfoSchema).optional().describe("Mount points (only present for CompositeFilesystem)")
+	mounts: z.array(mountInfoSchema).optional().describe("Mount points (only present for CompositeFilesystem)")
 });
-const workspaceItemSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	status: z$1.string(),
-	source: z$1.enum(["mastra", "agent"]),
-	agentId: z$1.string().optional(),
-	agentName: z$1.string().optional(),
-	capabilities: z$1.object({
-		hasFilesystem: z$1.boolean(),
-		hasSandbox: z$1.boolean(),
-		canBM25: z$1.boolean(),
-		canVector: z$1.boolean(),
-		canHybrid: z$1.boolean(),
-		hasSkills: z$1.boolean()
+const workspaceItemSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	status: z.string(),
+	source: z.enum(["mastra", "agent"]),
+	agentId: z.string().optional(),
+	agentName: z.string().optional(),
+	capabilities: z.object({
+		hasFilesystem: z.boolean(),
+		hasSandbox: z.boolean(),
+		canBM25: z.boolean(),
+		canVector: z.boolean(),
+		canHybrid: z.boolean(),
+		hasSkills: z.boolean()
 	}),
-	safety: z$1.object({ readOnly: z$1.boolean() })
+	safety: z.object({ readOnly: z.boolean() })
 });
-const listWorkspacesResponseSchema = z$1.object({ workspaces: z$1.array(workspaceItemSchema) });
-const skillNamePathParams = workspaceIdPathParams.extend({ skillName: z$1.string().describe("Skill name identifier") });
-const skillReferencePathParams = skillNamePathParams.extend({ referencePath: z$1.string().describe("Reference file path (URL encoded)") });
-const skillDisambiguationQuerySchema = z$1.object({ path: z$1.string().optional().describe("Skill path for disambiguation when multiple skills share the same name") });
-const searchSkillsQuerySchema = z$1.object({
-	query: z$1.string().describe("Search query text"),
-	topK: z$1.coerce.number().optional().default(5).describe("Maximum number of results"),
-	minScore: z$1.coerce.number().optional().describe("Minimum relevance score threshold"),
-	skillNames: z$1.string().optional().describe("Comma-separated list of skill names to search within"),
-	includeReferences: z$1.coerce.boolean().optional().default(true).describe("Include reference files in search")
+const listWorkspacesResponseSchema = z.object({ workspaces: z.array(workspaceItemSchema) });
+const skillNamePathParams = workspaceIdPathParams.extend({ skillName: z.string().describe("Skill name identifier") });
+const skillReferencePathParams = skillNamePathParams.extend({ referencePath: z.string().describe("Reference file path (URL encoded)") });
+const skillDisambiguationQuerySchema = z.object({ path: z.string().optional().describe("Skill path for disambiguation when multiple skills share the same name") });
+const searchSkillsQuerySchema = z.object({
+	query: z.string().describe("Search query text"),
+	topK: z.coerce.number().optional().default(5).describe("Maximum number of results"),
+	minScore: z.coerce.number().optional().describe("Minimum relevance score threshold"),
+	skillNames: z.string().optional().describe("Comma-separated list of skill names to search within"),
+	includeReferences: z.coerce.boolean().optional().default(true).describe("Include reference files in search")
 });
-const skillMetadataSchema = z$1.object({
-	name: z$1.string(),
-	description: z$1.string(),
-	license: z$1.string().optional(),
-	compatibility: z$1.unknown().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	path: z$1.string()
+const skillMetadataSchema = z.object({
+	name: z.string(),
+	description: z.string(),
+	license: z.string().optional(),
+	compatibility: z.unknown().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	path: z.string()
 });
-const skillSourceSchema = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("external"),
-		packagePath: z$1.string()
+const skillSourceSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("external"),
+		packagePath: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("local"),
-		projectPath: z$1.string()
+	z.object({
+		type: z.literal("local"),
+		projectPath: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("managed"),
-		mastraPath: z$1.string()
+	z.object({
+		type: z.literal("managed"),
+		mastraPath: z.string()
 	})
 ]);
 const skillSchema = skillMetadataSchema.extend({
-	instructions: z$1.string(),
+	instructions: z.string(),
 	source: skillSourceSchema,
-	references: z$1.array(z$1.string()),
-	scripts: z$1.array(z$1.string()),
-	assets: z$1.array(z$1.string())
+	references: z.array(z.string()),
+	scripts: z.array(z.string()),
+	assets: z.array(z.string())
 });
 /**
 * Source info for skills installed via skills.sh
 * Stored in .meta.json when a skill is installed
 */
-const skillsShSourceSchema = z$1.object({
-	owner: z$1.string().describe("GitHub owner/org"),
-	repo: z$1.string().describe("GitHub repository")
+const skillsShSourceSchema = z.object({
+	owner: z.string().describe("GitHub owner/org"),
+	repo: z.string().describe("GitHub repository")
 });
 const skillMetadataWithPathSchema = skillMetadataSchema.extend({ 
 /** Source info for skills installed via skills.sh (from .meta.json) */
 skillsShSource: skillsShSourceSchema.optional() });
-const listSkillsResponseSchema = z$1.object({
-	skills: z$1.array(skillMetadataWithPathSchema),
-	isSkillsConfigured: z$1.boolean().describe("Whether skills are configured in the workspace")
+const listSkillsResponseSchema = z.object({
+	skills: z.array(skillMetadataWithPathSchema),
+	isSkillsConfigured: z.boolean().describe("Whether skills are configured in the workspace")
 });
 const getSkillResponseSchema = skillSchema;
 /**
@@ -18907,97 +19200,97 @@ const getSkillResponseSchema = skillSchema;
 * direct access to the Skills instance).
 */
 const getAgentSkillResponseSchema = skillMetadataSchema.extend({
-	path: z$1.string().optional(),
-	instructions: z$1.string().optional(),
+	path: z.string().optional(),
+	instructions: z.string().optional(),
 	source: skillSourceSchema.optional(),
-	references: z$1.array(z$1.string()).optional(),
-	scripts: z$1.array(z$1.string()).optional(),
-	assets: z$1.array(z$1.string()).optional()
+	references: z.array(z.string()).optional(),
+	scripts: z.array(z.string()).optional(),
+	assets: z.array(z.string()).optional()
 });
-const skillReferenceResponseSchema = z$1.object({
-	skillName: z$1.string(),
-	referencePath: z$1.string(),
-	content: z$1.string()
+const skillReferenceResponseSchema = z.object({
+	skillName: z.string(),
+	referencePath: z.string(),
+	content: z.string()
 });
-const listReferencesResponseSchema = z$1.object({
-	skillName: z$1.string(),
-	references: z$1.array(z$1.string())
+const listReferencesResponseSchema = z.object({
+	skillName: z.string(),
+	references: z.array(z.string())
 });
-const skillSearchResultSchema = z$1.object({
-	skillName: z$1.string(),
-	skillPath: z$1.string(),
-	source: z$1.string(),
-	content: z$1.string(),
-	score: z$1.number(),
-	lineRange: z$1.object({
-		start: z$1.number(),
-		end: z$1.number()
+const skillSearchResultSchema = z.object({
+	skillName: z.string(),
+	skillPath: z.string(),
+	source: z.string(),
+	content: z.string(),
+	score: z.number(),
+	lineRange: z.object({
+		start: z.number(),
+		end: z.number()
 	}).optional(),
-	scoreDetails: z$1.object({
-		vector: z$1.number().optional(),
-		bm25: z$1.number().optional()
+	scoreDetails: z.object({
+		vector: z.number().optional(),
+		bm25: z.number().optional()
 	}).optional()
 });
-const searchSkillsResponseSchema = z$1.object({
-	results: z$1.array(skillSearchResultSchema),
-	query: z$1.string()
+const searchSkillsResponseSchema = z.object({
+	results: z.array(skillSearchResultSchema),
+	query: z.string()
 });
-const skillsShSearchQuerySchema = z$1.object({
-	q: z$1.string().describe("Search query"),
-	limit: z$1.coerce.number().optional().default(10).describe("Maximum number of results")
+const skillsShSearchQuerySchema = z.object({
+	q: z.string().describe("Search query"),
+	limit: z.coerce.number().optional().default(10).describe("Maximum number of results")
 });
-const skillsShPopularQuerySchema = z$1.object({
-	limit: z$1.coerce.number().optional().default(10).describe("Maximum number of results"),
-	offset: z$1.coerce.number().optional().default(0).describe("Offset for pagination")
+const skillsShPopularQuerySchema = z.object({
+	limit: z.coerce.number().optional().default(10).describe("Maximum number of results"),
+	offset: z.coerce.number().optional().default(0).describe("Offset for pagination")
 });
-const skillsShSkillSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	installs: z$1.number(),
-	topSource: z$1.string()
+const skillsShSkillSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	installs: z.number(),
+	topSource: z.string()
 });
-const skillsShSearchResponseSchema = z$1.object({
-	query: z$1.string(),
-	searchType: z$1.string(),
-	skills: z$1.array(skillsShSkillSchema),
-	count: z$1.number()
+const skillsShSearchResponseSchema = z.object({
+	query: z.string(),
+	searchType: z.string(),
+	skills: z.array(skillsShSkillSchema),
+	count: z.number()
 });
-const skillsShListResponseSchema = z$1.object({
-	skills: z$1.array(skillsShSkillSchema),
-	count: z$1.number(),
-	limit: z$1.number(),
-	offset: z$1.number()
+const skillsShListResponseSchema = z.object({
+	skills: z.array(skillsShSkillSchema),
+	count: z.number(),
+	limit: z.number(),
+	offset: z.number()
 });
-const skillsShPreviewQuerySchema = z$1.object({
-	owner: z$1.string().describe("GitHub repository owner"),
-	repo: z$1.string().describe("GitHub repository name"),
-	path: z$1.string().describe("Path to skill within repo")
+const skillsShPreviewQuerySchema = z.object({
+	owner: z.string().describe("GitHub repository owner"),
+	repo: z.string().describe("GitHub repository name"),
+	path: z.string().describe("Path to skill within repo")
 });
-const skillsShPreviewResponseSchema = z$1.object({ content: z$1.string() });
-const skillsShInstallBodySchema = z$1.object({
-	owner: z$1.string().describe("GitHub repository owner"),
-	repo: z$1.string().describe("GitHub repository name"),
-	skillName: z$1.string().describe("Skill name from skills.sh"),
-	mount: z$1.string().optional().describe("Mount path to install into (for CompositeFilesystem)")
+const skillsShPreviewResponseSchema = z.object({ content: z.string() });
+const skillsShInstallBodySchema = z.object({
+	owner: z.string().describe("GitHub repository owner"),
+	repo: z.string().describe("GitHub repository name"),
+	skillName: z.string().describe("Skill name from skills.sh"),
+	mount: z.string().optional().describe("Mount path to install into (for CompositeFilesystem)")
 });
-const skillsShInstallResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	skillName: z$1.string(),
-	installedPath: z$1.string(),
-	filesWritten: z$1.number()
+const skillsShInstallResponseSchema = z.object({
+	success: z.boolean(),
+	skillName: z.string(),
+	installedPath: z.string(),
+	filesWritten: z.number()
 });
-const skillsShRemoveBodySchema = z$1.object({ skillName: z$1.string().describe("Name of the installed skill to remove") });
-const skillsShRemoveResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	skillName: z$1.string(),
-	removedPath: z$1.string()
+const skillsShRemoveBodySchema = z.object({ skillName: z.string().describe("Name of the installed skill to remove") });
+const skillsShRemoveResponseSchema = z.object({
+	success: z.boolean(),
+	skillName: z.string(),
+	removedPath: z.string()
 });
-const skillsShUpdateBodySchema = z$1.object({ skillName: z$1.string().optional().describe("Specific skill to update, or omit to update all") });
-const skillsShUpdateResponseSchema = z$1.object({ updated: z$1.array(z$1.object({
-	skillName: z$1.string(),
-	success: z$1.boolean(),
-	filesWritten: z$1.number().optional(),
-	error: z$1.string().optional()
+const skillsShUpdateBodySchema = z.object({ skillName: z.string().optional().describe("Specific skill to update, or omit to update all") });
+const skillsShUpdateResponseSchema = z.object({ updated: z.array(z.object({
+	skillName: z.string(),
+	success: z.boolean(),
+	filesWritten: z.number().optional(),
+	error: z.string().optional()
 })) });
 
 //#region src/server/handlers/tool-schema-overrides.ts
@@ -19712,7 +20005,7 @@ const LIST_AGENTS_ROUTE = createRoute$1({
 	method: "GET",
 	path: "/agents",
 	responseType: "json",
-	queryParamSchema: z$1.object({ partial: z$1.string().optional() }),
+	queryParamSchema: z.object({ partial: z.string().optional() }),
 	responseSchema: listAgentsResponseSchema,
 	summary: "List all agents",
 	description: "Returns a list of all available agents in the system (both code-defined and stored)",
@@ -19844,11 +20137,11 @@ const CLONE_AGENT_ROUTE = createRoute$1({
 	path: "/agents/:agentId/clone",
 	responseType: "json",
 	pathParamSchema: agentIdPathParams,
-	bodySchema: z$1.object({
-		newId: z$1.string().optional().describe("ID for the cloned agent. If not provided, derived from agent ID."),
-		newName: z$1.string().optional().describe("Name for the cloned agent. Defaults to \"{name} (Clone)\"."),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-		authorId: z$1.string().optional()
+	bodySchema: z.object({
+		newId: z.string().optional().describe("ID for the cloned agent. If not provided, derived from agent ID."),
+		newName: z.string().optional().describe("Name for the cloned agent. Defaults to \"{name} (Clone)\"."),
+		metadata: z.record(z.string(), z.unknown()).optional(),
+		authorId: z.string().optional()
 	}),
 	responseSchema: createStoredAgentResponseSchema,
 	summary: "Clone agent",
@@ -20198,10 +20491,10 @@ const STREAM_GENERATE_ROUTE = createRoute$1({
 		}
 	}
 });
-const sendAgentSignalResponseSchema = z$1.object({
-	accepted: z$1.literal(true),
-	runId: z$1.string(),
-	signal: z$1.unknown().optional()
+const sendAgentSignalResponseSchema = z.object({
+	accepted: z.literal(true),
+	runId: z.string(),
+	signal: z.unknown().optional()
 });
 /**
 * Maps a rejected `result.accepted` (signal/message routing) to an HTTP error.
@@ -21678,301 +21971,301 @@ var InMemoryTaskStore = class {
 };
 
 //#region src/server/schemas/a2a.ts
-const a2aAgentIdPathParams = z$1.object({ agentId: z$1.string().describe("Unique identifier for the agent") });
-a2aAgentIdPathParams.extend({ taskId: z$1.string().describe("Unique identifier for the task") });
-const pushNotificationAuthenticationInfoSchema = z$1.object({
-	schemes: z$1.array(z$1.string()).describe("Supported authentication schemes - e.g. Basic, Bearer"),
-	credentials: z$1.string().optional().describe("Optional credentials")
+const a2aAgentIdPathParams = z.object({ agentId: z.string().describe("Unique identifier for the agent") });
+a2aAgentIdPathParams.extend({ taskId: z.string().describe("Unique identifier for the task") });
+const pushNotificationAuthenticationInfoSchema = z.object({
+	schemes: z.array(z.string()).describe("Supported authentication schemes - e.g. Basic, Bearer"),
+	credentials: z.string().optional().describe("Optional credentials")
 });
-const pushNotificationConfigSchema = z$1.object({
-	url: z$1.string().describe("URL for sending the push notifications"),
-	id: z$1.string().optional().describe("Push Notification ID - created by server to support multiple callbacks"),
-	token: z$1.string().optional().describe("Token unique to this task/session"),
+const pushNotificationConfigSchema = z.object({
+	url: z.string().describe("URL for sending the push notifications"),
+	id: z.string().optional().describe("Push Notification ID - created by server to support multiple callbacks"),
+	token: z.string().optional().describe("Token unique to this task/session"),
 	authentication: pushNotificationAuthenticationInfoSchema.optional()
 });
-const messageSendConfigurationSchema = z$1.object({
-	acceptedOutputModes: z$1.array(z$1.string()).optional().describe("Accepted output modalities by the client"),
-	blocking: z$1.boolean().optional().describe("If the server should treat the client as a blocking request"),
-	returnImmediately: z$1.boolean().optional().describe("If the v1 server should return before task completion"),
-	historyLength: z$1.number().optional().describe("Number of recent messages to be retrieved"),
+const messageSendConfigurationSchema = z.object({
+	acceptedOutputModes: z.array(z.string()).optional().describe("Accepted output modalities by the client"),
+	blocking: z.boolean().optional().describe("If the server should treat the client as a blocking request"),
+	returnImmediately: z.boolean().optional().describe("If the v1 server should return before task completion"),
+	historyLength: z.number().optional().describe("Number of recent messages to be retrieved"),
 	pushNotificationConfig: pushNotificationConfigSchema.optional(),
 	taskPushNotificationConfig: pushNotificationConfigSchema.optional()
 });
-const textPartSchema = z$1.object({
-	kind: z$1.literal("text").describe("Part type - text for TextParts"),
-	text: z$1.string().describe("Text content"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+const textPartSchema = z.object({
+	kind: z.literal("text").describe("Part type - text for TextParts"),
+	text: z.string().describe("Text content"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-const fileWithBytesSchema = z$1.object({
-	bytes: z$1.string().describe("base64 encoded content of the file"),
-	mimeType: z$1.string().optional().describe("Optional mimeType for the file"),
-	name: z$1.string().optional().describe("Optional name for the file")
+const fileWithBytesSchema = z.object({
+	bytes: z.string().describe("base64 encoded content of the file"),
+	mimeType: z.string().optional().describe("Optional mimeType for the file"),
+	name: z.string().optional().describe("Optional name for the file")
 });
-const fileWithUriSchema = z$1.object({
-	uri: z$1.string().describe("URL for the File content"),
-	mimeType: z$1.string().optional().describe("Optional mimeType for the file"),
-	name: z$1.string().optional().describe("Optional name for the file")
+const fileWithUriSchema = z.object({
+	uri: z.string().describe("URL for the File content"),
+	mimeType: z.string().optional().describe("Optional mimeType for the file"),
+	name: z.string().optional().describe("Optional name for the file")
 });
-const filePartSchema = z$1.object({
-	kind: z$1.literal("file").describe("Part type - file for FileParts"),
-	file: z$1.union([fileWithBytesSchema, fileWithUriSchema]).describe("File content either as url or bytes"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+const filePartSchema = z.object({
+	kind: z.literal("file").describe("Part type - file for FileParts"),
+	file: z.union([fileWithBytesSchema, fileWithUriSchema]).describe("File content either as url or bytes"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-const dataPartSchema = z$1.object({
-	kind: z$1.literal("data").describe("Part type - data for DataParts"),
-	data: z$1.record(z$1.string(), z$1.unknown()).describe("Structured data content"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Optional metadata associated with the part")
+const dataPartSchema = z.object({
+	kind: z.literal("data").describe("Part type - data for DataParts"),
+	data: z.record(z.string(), z.unknown()).describe("Structured data content"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Optional metadata associated with the part")
 });
-const partSchema = z$1.union([
+const partSchema = z.union([
 	textPartSchema,
 	filePartSchema,
 	dataPartSchema
 ]);
-const v1PartSchema = z$1.object({
-	text: z$1.string().optional(),
-	raw: z$1.string().optional(),
-	url: z$1.string().optional(),
-	data: z$1.unknown().optional(),
-	filename: z$1.string().optional(),
-	mediaType: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const v1PartSchema = z.object({
+	text: z.string().optional(),
+	raw: z.string().optional(),
+	url: z.string().optional(),
+	data: z.unknown().optional(),
+	filename: z.string().optional(),
+	mediaType: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 }).refine((part) => [
 	part.text,
 	part.raw,
 	part.url,
 	part.data
 ].filter((value) => value !== void 0).length === 1, { message: "A v1 part must contain exactly one of text, raw, url, or data" });
-const messageSchema$1 = z$1.object({
-	kind: z$1.literal("message").optional().describe("Event type"),
-	messageId: z$1.string().describe("Identifier created by the message creator"),
-	role: z$1.enum([
+const messageSchema$1 = z.object({
+	kind: z.literal("message").optional().describe("Event type"),
+	messageId: z.string().describe("Identifier created by the message creator"),
+	role: z.enum([
 		"user",
 		"agent",
 		"ROLE_USER",
 		"ROLE_AGENT"
 	]).describe("Message sender's role"),
-	parts: z$1.array(z$1.union([partSchema, v1PartSchema])).describe("Message content"),
-	contextId: z$1.string().optional().describe("The context the message is associated with"),
-	taskId: z$1.string().optional().describe("Identifier of task the message is related to"),
-	referenceTaskIds: z$1.array(z$1.string()).optional().describe("List of tasks referenced as context by this message"),
-	extensions: z$1.array(z$1.string()).optional().describe("The URIs of extensions that are present or contributed to this Message"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Extension metadata")
+	parts: z.array(z.union([partSchema, v1PartSchema])).describe("Message content"),
+	contextId: z.string().optional().describe("The context the message is associated with"),
+	taskId: z.string().optional().describe("Identifier of task the message is related to"),
+	referenceTaskIds: z.array(z.string()).optional().describe("List of tasks referenced as context by this message"),
+	extensions: z.array(z.string()).optional().describe("The URIs of extensions that are present or contributed to this Message"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Extension metadata")
 });
-const messageSendParamsSchema$1 = z$1.object({
+const messageSendParamsSchema$1 = z.object({
 	message: messageSchema$1,
 	configuration: messageSendConfigurationSchema.optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Extension metadata")
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Extension metadata")
 });
-const taskQueryParamsSchema = z$1.object({
-	id: z$1.string().describe("Task id"),
-	historyLength: z$1.number().optional().describe("Number of recent messages to be retrieved"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const taskQueryParamsSchema = z.object({
+	id: z.string().describe("Task id"),
+	historyLength: z.number().optional().describe("Number of recent messages to be retrieved"),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
-const taskIdParamsSchema = z$1.object({
-	id: z$1.string().describe("Task id"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const taskIdParamsSchema = z.object({
+	id: z.string().describe("Task id"),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
-const listTasksParamsSchema = z$1.object({
-	tenant: z$1.string().optional(),
-	contextId: z$1.string().optional(),
-	status: z$1.union([z$1.string(), z$1.number()]).optional(),
-	pageSize: z$1.number().int().min(1).max(100).optional(),
-	pageToken: z$1.string().optional(),
-	historyLength: z$1.number().int().min(0).optional(),
-	statusTimestampAfter: z$1.string().optional(),
-	includeArtifacts: z$1.boolean().optional()
+const listTasksParamsSchema = z.object({
+	tenant: z.string().optional(),
+	contextId: z.string().optional(),
+	status: z.union([z.string(), z.number()]).optional(),
+	pageSize: z.number().int().min(1).max(100).optional(),
+	pageToken: z.string().optional(),
+	historyLength: z.number().int().min(0).optional(),
+	statusTimestampAfter: z.string().optional(),
+	includeArtifacts: z.boolean().optional()
 });
 const taskResubscribeParamsSchema = taskIdParamsSchema;
-const setPushNotificationConfigParamsSchema = z$1.object({
-	taskId: z$1.string().describe("Task id"),
+const setPushNotificationConfigParamsSchema = z.object({
+	taskId: z.string().describe("Task id"),
 	pushNotificationConfig: pushNotificationConfigSchema
 });
-const getPushNotificationConfigParamsSchema = taskIdParamsSchema.extend({ pushNotificationConfigId: z$1.string().optional().describe("Push notification config id") });
+const getPushNotificationConfigParamsSchema = taskIdParamsSchema.extend({ pushNotificationConfigId: z.string().optional().describe("Push notification config id") });
 const listPushNotificationConfigParamsSchema = taskIdParamsSchema;
-const deletePushNotificationConfigParamsSchema = taskIdParamsSchema.extend({ pushNotificationConfigId: z$1.string().describe("Push notification config id") });
-z$1.object({
+const deletePushNotificationConfigParamsSchema = taskIdParamsSchema.extend({ pushNotificationConfigId: z.string().describe("Push notification config id") });
+z.object({
 	message: messageSchema$1,
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
-z$1.object({ id: z$1.string() });
+z.object({ id: z.string() });
 const requestBaseSchema = {
-	jsonrpc: z$1.literal("2.0"),
-	id: z$1.union([z$1.string(), z$1.number()])
+	jsonrpc: z.literal("2.0"),
+	id: z.union([z.string(), z.number()])
 };
-const agentExecutionBodySchema = z$1.discriminatedUnion("method", [
-	z$1.object({
+const agentExecutionBodySchema = z.discriminatedUnion("method", [
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("message/send"),
+		method: z.literal("message/send"),
 		params: messageSendParamsSchema$1
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("message/stream"),
+		method: z.literal("message/stream"),
 		params: messageSendParamsSchema$1
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/get"),
+		method: z.literal("tasks/get"),
 		params: taskQueryParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/list"),
+		method: z.literal("tasks/list"),
 		params: listTasksParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/cancel"),
+		method: z.literal("tasks/cancel"),
 		params: taskIdParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/resubscribe"),
+		method: z.literal("tasks/resubscribe"),
 		params: taskResubscribeParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/pushNotificationConfig/set"),
+		method: z.literal("tasks/pushNotificationConfig/set"),
 		params: setPushNotificationConfigParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/pushNotificationConfig/get"),
+		method: z.literal("tasks/pushNotificationConfig/get"),
 		params: getPushNotificationConfigParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/pushNotificationConfig/list"),
+		method: z.literal("tasks/pushNotificationConfig/list"),
 		params: listPushNotificationConfigParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("tasks/pushNotificationConfig/delete"),
+		method: z.literal("tasks/pushNotificationConfig/delete"),
 		params: deletePushNotificationConfigParamsSchema
 	}),
-	z$1.object({
+	z.object({
 		...requestBaseSchema,
-		method: z$1.literal("agent/getAuthenticatedExtendedCard")
+		method: z.literal("agent/getAuthenticatedExtendedCard")
 	})
 ]);
-const agentCardResponseSchema = z$1.object({
-	additionalInterfaces: z$1.array(z$1.unknown()).optional(),
-	name: z$1.string(),
-	description: z$1.string(),
-	url: z$1.string(),
-	protocolVersion: z$1.string(),
-	provider: z$1.object({
-		organization: z$1.string(),
-		url: z$1.string()
+const agentCardResponseSchema = z.object({
+	additionalInterfaces: z.array(z.unknown()).optional(),
+	name: z.string(),
+	description: z.string(),
+	url: z.string(),
+	protocolVersion: z.string(),
+	provider: z.object({
+		organization: z.string(),
+		url: z.string()
 	}).optional(),
-	security: z$1.array(z$1.record(z$1.string(), z$1.array(z$1.string()))).optional(),
-	securitySchemes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	version: z$1.string(),
-	capabilities: z$1.object({
-		extensions: z$1.array(z$1.unknown()).optional(),
-		streaming: z$1.boolean().optional(),
-		pushNotifications: z$1.boolean().optional(),
-		stateTransitionHistory: z$1.boolean().optional()
+	security: z.array(z.record(z.string(), z.array(z.string()))).optional(),
+	securitySchemes: z.record(z.string(), z.unknown()).optional(),
+	version: z.string(),
+	capabilities: z.object({
+		extensions: z.array(z.unknown()).optional(),
+		streaming: z.boolean().optional(),
+		pushNotifications: z.boolean().optional(),
+		stateTransitionHistory: z.boolean().optional()
 	}),
-	defaultInputModes: z$1.array(z$1.string()),
-	defaultOutputModes: z$1.array(z$1.string()),
-	supportsAuthenticatedExtendedCard: z$1.boolean().optional(),
-	signatures: z$1.array(z$1.object({
-		protected: z$1.string(),
-		signature: z$1.string(),
-		header: z$1.record(z$1.string(), z$1.unknown()).optional()
+	defaultInputModes: z.array(z.string()),
+	defaultOutputModes: z.array(z.string()),
+	supportsAuthenticatedExtendedCard: z.boolean().optional(),
+	signatures: z.array(z.object({
+		protected: z.string(),
+		signature: z.string(),
+		header: z.record(z.string(), z.unknown()).optional()
 	})).optional(),
-	skills: z$1.array(z$1.object({
-		id: z$1.string(),
-		name: z$1.string(),
-		description: z$1.string(),
-		tags: z$1.array(z$1.string()).optional()
+	skills: z.array(z.object({
+		id: z.string(),
+		name: z.string(),
+		description: z.string(),
+		tags: z.array(z.string()).optional()
 	}))
 });
-z$1.unknown();
-const agentExecutionResponseSchema = z$1.unknown();
+z.unknown();
+const agentExecutionResponseSchema = z.unknown();
 
 //#region src/server/schemas/auth.ts
-const ssoConfigSchema = z$1.object({
-	provider: z$1.string(),
-	text: z$1.string(),
-	icon: z$1.string().optional(),
-	description: z$1.string().optional(),
-	url: z$1.string()
+const ssoConfigSchema = z.object({
+	provider: z.string(),
+	text: z.string(),
+	icon: z.string().optional(),
+	description: z.string().optional(),
+	url: z.string()
 });
-const loginConfigSchema = z$1.object({
-	type: z$1.enum([
+const loginConfigSchema = z.object({
+	type: z.enum([
 		"sso",
 		"credentials",
 		"both"
 	]),
 	sso: ssoConfigSchema.optional(),
-	signUpEnabled: z$1.boolean().optional(),
-	description: z$1.string().optional()
+	signUpEnabled: z.boolean().optional(),
+	description: z.string().optional()
 }).nullable();
-const publicCapabilitiesSchema = z$1.object({
-	enabled: z$1.boolean(),
+const publicCapabilitiesSchema = z.object({
+	enabled: z.boolean(),
 	login: loginConfigSchema
 });
-const authenticatedUserSchema = z$1.object({
-	id: z$1.string(),
-	email: z$1.string().optional(),
-	name: z$1.string().optional(),
-	avatarUrl: z$1.string().optional()
+const authenticatedUserSchema = z.object({
+	id: z.string(),
+	email: z.string().optional(),
+	name: z.string().optional(),
+	avatarUrl: z.string().optional()
 });
-const capabilityFlagsSchema = z$1.object({
-	user: z$1.boolean(),
-	session: z$1.boolean(),
-	sso: z$1.boolean(),
-	rbac: z$1.boolean(),
-	acl: z$1.boolean()
+const capabilityFlagsSchema = z.object({
+	user: z.boolean(),
+	session: z.boolean(),
+	sso: z.boolean(),
+	rbac: z.boolean(),
+	acl: z.boolean()
 });
-const userAccessSchema = z$1.object({
-	roles: z$1.array(z$1.string()),
-	permissions: z$1.array(z$1.string())
+const userAccessSchema = z.object({
+	roles: z.array(z.string()),
+	permissions: z.array(z.string())
 }).nullable();
 const authenticatedCapabilitiesSchema = publicCapabilitiesSchema.extend({
 	user: authenticatedUserSchema,
 	capabilities: capabilityFlagsSchema,
 	access: userAccessSchema
 });
-const capabilitiesResponseSchema = z$1.union([authenticatedCapabilitiesSchema, publicCapabilitiesSchema]);
-const ssoLoginQuerySchema = z$1.object({ redirect_uri: z$1.string().optional() });
-const ssoCallbackQuerySchema = z$1.object({
-	code: z$1.string(),
-	state: z$1.string().optional()
+const capabilitiesResponseSchema = z.union([authenticatedCapabilitiesSchema, publicCapabilitiesSchema]);
+const ssoLoginQuerySchema = z.object({ redirect_uri: z.string().optional() });
+const ssoCallbackQuerySchema = z.object({
+	code: z.string(),
+	state: z.string().optional()
 });
-z$1.object({ url: z$1.string() });
-z$1.object({
-	success: z$1.boolean(),
+z.object({ url: z.string() });
+z.object({
+	success: z.boolean(),
 	user: authenticatedUserSchema.optional(),
-	redirectTo: z$1.string().optional()
+	redirectTo: z.string().optional()
 });
-z$1.object({
-	success: z$1.boolean(),
-	redirectTo: z$1.string().optional()
+z.object({
+	success: z.boolean(),
+	redirectTo: z.string().optional()
 });
-const refreshResponseSchema = z$1.object({ success: z$1.boolean() });
-const currentUserResponseSchema = z$1.object({
-	id: z$1.string(),
-	email: z$1.string().optional(),
-	name: z$1.string().optional(),
-	avatarUrl: z$1.string().optional(),
-	roles: z$1.array(z$1.string()).optional(),
-	permissions: z$1.array(z$1.string()).optional()
+const refreshResponseSchema = z.object({ success: z.boolean() });
+const currentUserResponseSchema = z.object({
+	id: z.string(),
+	email: z.string().optional(),
+	name: z.string().optional(),
+	avatarUrl: z.string().optional(),
+	roles: z.array(z.string()).optional(),
+	permissions: z.array(z.string()).optional()
 }).nullable();
-const credentialsSignInBodySchema = z$1.object({
-	email: z$1.string().email(),
-	password: z$1.string().min(1)
+const credentialsSignInBodySchema = z.object({
+	email: z.string().email(),
+	password: z.string().min(1)
 });
-const credentialsSignUpBodySchema = z$1.object({
-	email: z$1.string().email(),
-	password: z$1.string().min(1),
-	name: z$1.string().optional()
+const credentialsSignUpBodySchema = z.object({
+	email: z.string().email(),
+	password: z.string().min(1),
+	name: z.string().optional()
 });
-z$1.object({
+z.object({
 	user: authenticatedUserSchema,
-	token: z$1.string().optional()
+	token: z.string().optional()
 });
 /**
 * Response schema for GET /auth/permission-patterns.
@@ -21982,7 +22275,7 @@ z$1.object({
 * hardcoded route→permission literals it ships, replacing a compile-time
 * `@mastra/core/auth/ee` import in the browser bundle.
 */
-const permissionPatternsResponseSchema = z$1.object({ patterns: z$1.array(z$1.string()) });
+const permissionPatternsResponseSchema = z.object({ patterns: z.array(z.string()) });
 
 //#region src/server/handlers/auth.ts
 let _buildCapabilitiesPromise;
@@ -22452,10 +22745,10 @@ const GET_ROLE_PERMISSIONS_ROUTE = createRoute$1({
 	path: "/auth/roles/:roleId/permissions",
 	requiresAuth: true,
 	responseType: "json",
-	pathParamSchema: z$1.object({ roleId: z$1.string() }),
-	responseSchema: z$1.object({
-		roleId: z$1.string(),
-		permissions: z$1.array(z$1.string())
+	pathParamSchema: z.object({ roleId: z.string() }),
+	responseSchema: z.object({
+		roleId: z.string(),
+		permissions: z.array(z.string())
 	}),
 	summary: "Get permissions for a role",
 	description: "Returns the resolved permissions for a specific role. Only accessible by admin users. Used by the \"View as role\" feature.",
@@ -22922,55 +23215,55 @@ async function loadOrCreateTask({ agentId, taskId, taskStore, message, contextId
 	}
 	throw MastraA2AError.invalidRequest(`Task ${taskId} was updated concurrently. Retry the request.`);
 }
-const messagePartSchema$1 = z$1.discriminatedUnion("kind", [
-	z$1.object({
-		kind: z$1.literal("text"),
-		text: z$1.string(),
-		metadata: z$1.record(z$1.string(), z$1.any()).optional()
+const messagePartSchema$1 = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("text"),
+		text: z.string(),
+		metadata: z.record(z.string(), z.any()).optional()
 	}),
-	z$1.object({
-		kind: z$1.literal("file"),
-		file: z$1.union([z$1.object({
-			bytes: z$1.string(),
-			mimeType: z$1.string().optional(),
-			name: z$1.string().optional()
-		}), z$1.object({
-			uri: z$1.string(),
-			mimeType: z$1.string().optional(),
-			name: z$1.string().optional()
+	z.object({
+		kind: z.literal("file"),
+		file: z.union([z.object({
+			bytes: z.string(),
+			mimeType: z.string().optional(),
+			name: z.string().optional()
+		}), z.object({
+			uri: z.string(),
+			mimeType: z.string().optional(),
+			name: z.string().optional()
 		})]),
-		metadata: z$1.record(z$1.string(), z$1.any()).optional()
+		metadata: z.record(z.string(), z.any()).optional()
 	}),
-	z$1.object({
-		kind: z$1.literal("data"),
-		data: z$1.record(z$1.string(), z$1.any()),
-		metadata: z$1.record(z$1.string(), z$1.any()).optional()
+	z.object({
+		kind: z.literal("data"),
+		data: z.record(z.string(), z.any()),
+		metadata: z.record(z.string(), z.any()).optional()
 	})
 ]);
-const messageSendParamsSchema = z$1.object({
-	message: z$1.object({
-		role: z$1.enum(["user", "agent"]),
-		parts: z$1.array(messagePartSchema$1),
-		kind: z$1.literal("message"),
-		messageId: z$1.string(),
-		contextId: z$1.string().optional(),
-		taskId: z$1.string().optional(),
-		referenceTaskIds: z$1.array(z$1.string()).optional(),
-		extensions: z$1.array(z$1.string()).optional(),
-		metadata: z$1.record(z$1.string(), z$1.any()).optional()
+const messageSendParamsSchema = z.object({
+	message: z.object({
+		role: z.enum(["user", "agent"]),
+		parts: z.array(messagePartSchema$1),
+		kind: z.literal("message"),
+		messageId: z.string(),
+		contextId: z.string().optional(),
+		taskId: z.string().optional(),
+		referenceTaskIds: z.array(z.string()).optional(),
+		extensions: z.array(z.string()).optional(),
+		metadata: z.record(z.string(), z.any()).optional()
 	}),
-	configuration: z$1.object({
-		acceptedOutputModes: z$1.array(z$1.string()).optional(),
-		blocking: z$1.boolean().optional(),
-		returnImmediately: z$1.boolean().optional(),
-		historyLength: z$1.number().optional(),
-		pushNotificationConfig: z$1.object({
-			url: z$1.string(),
-			id: z$1.string().optional(),
-			token: z$1.string().optional(),
-			authentication: z$1.object({
-				schemes: z$1.array(z$1.string()),
-				credentials: z$1.string().optional()
+	configuration: z.object({
+		acceptedOutputModes: z.array(z.string()).optional(),
+		blocking: z.boolean().optional(),
+		returnImmediately: z.boolean().optional(),
+		historyLength: z.number().optional(),
+		pushNotificationConfig: z.object({
+			url: z.string(),
+			id: z.string().optional(),
+			token: z.string().optional(),
+			authentication: z.object({
+				schemes: z.array(z.string()),
+				credentials: z.string().optional()
 			}).optional()
 		}).optional()
 	}).optional()
@@ -23186,7 +23479,7 @@ function validateMessageSendParams(params) {
 	try {
 		messageSendParamsSchema.parse(params);
 	} catch (error) {
-		if (error instanceof z$1.ZodError) throw MastraA2AError.invalidParams(error.issues[0].message);
+		if (error instanceof z.ZodError) throw MastraA2AError.invalidParams(error.issues[0].message);
 		throw error;
 	}
 }
@@ -24493,16 +24786,16 @@ const AGENT_EXECUTION_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/memory.ts
-const threadIdPathParams = z$1.object({ threadId: z$1.string().describe("Unique identifier for the conversation thread") });
+const threadIdPathParams = z.object({ threadId: z.string().describe("Unique identifier for the conversation thread") });
 /**
 * Common query parameter: required agent ID
 */
-const agentIdQuerySchema = z$1.object({ agentId: z$1.string() });
+const agentIdQuerySchema = z.object({ agentId: z.string() });
 /**
 * Common query parameter: optional agent ID
 * Used for read operations that can fall back to storage when agentId is not provided
 */
-const optionalAgentIdQuerySchema = z$1.object({ agentId: z$1.string().optional() });
+const optionalAgentIdQuerySchema = z.object({ agentId: z.string().optional() });
 /**
 * Storage order by configuration for threads and agents (have both createdAt and updatedAt)
 * Handles JSON parsing from query strings.
@@ -24513,7 +24806,7 @@ const optionalAgentIdQuerySchema = z$1.object({ agentId: z$1.string().optional()
 * Zod error. Without that inner `.optional()`, valid optional query usage
 * regresses into a hard 400.
 */
-const storageOrderBySchema$4 = z$1.preprocess((val) => {
+const storageOrderBySchema$4 = z.preprocess((val) => {
 	if (val === void 0) return val;
 	if (typeof val === "string") try {
 		return JSON.parse(val);
@@ -24521,16 +24814,16 @@ const storageOrderBySchema$4 = z$1.preprocess((val) => {
 		return;
 	}
 	return val;
-}, z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+}, z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 }).optional()).optional();
 /**
 * Storage order by configuration for messages (only have createdAt)
 * Handles JSON parsing from query strings. See `storageOrderBySchema` for why
 * the inner object schema is also `.optional()`.
 */
-const messageOrderBySchema = z$1.preprocess((val) => {
+const messageOrderBySchema = z.preprocess((val) => {
 	if (val === void 0) return val;
 	if (typeof val === "string") try {
 		return JSON.parse(val);
@@ -24538,14 +24831,14 @@ const messageOrderBySchema = z$1.preprocess((val) => {
 		return;
 	}
 	return val;
-}, z$1.object({
-	field: z$1.enum(["createdAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+}, z.object({
+	field: z.enum(["createdAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 }).optional()).optional();
 /**
 * Include schema for message listing - handles JSON parsing from query strings
 */
-const includeSchema = z$1.preprocess((val) => {
+const includeSchema = z.preprocess((val) => {
 	if (val === void 0) return val;
 	if (typeof val === "string") try {
 		return JSON.parse(val);
@@ -24553,19 +24846,19 @@ const includeSchema = z$1.preprocess((val) => {
 		return val;
 	}
 	return val;
-}, z$1.array(z$1.object({
-	id: z$1.string(),
-	threadId: z$1.string().optional(),
-	withPreviousMessages: z$1.number().optional(),
-	withNextMessages: z$1.number().optional()
+}, z.array(z.object({
+	id: z.string(),
+	threadId: z.string().optional(),
+	withPreviousMessages: z.number().optional(),
+	withNextMessages: z.number().optional()
 }))).optional();
-const metadataFilterValueSchema = z$1.union([
-	z$1.string(),
-	z$1.number().finite(),
-	z$1.boolean(),
-	z$1.null()
+const metadataFilterValueSchema = z.union([
+	z.string(),
+	z.number().finite(),
+	z.boolean(),
+	z.null()
 ]);
-const metadataFilterKeySchema = z$1.string().max(128).regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/).refine((key) => ![
+const metadataFilterKeySchema = z.string().max(128).regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/).refine((key) => ![
 	"__proto__",
 	"prototype",
 	"constructor"
@@ -24574,11 +24867,11 @@ const metadataFilterKeySchema = z$1.string().max(128).regex(/^[a-zA-Z_][a-zA-Z0-
 * Metadata filters are deliberately shallow scalar maps so storage adapters can
 * apply exact-match AND semantics consistently.
 */
-const metadataFilterSchema = z$1.record(metadataFilterKeySchema, metadataFilterValueSchema);
+const metadataFilterSchema = z.record(metadataFilterKeySchema, metadataFilterValueSchema);
 /**
 * Filter schema for message listing - handles JSON parsing from query strings
 */
-const filterSchema = z$1.preprocess((val) => {
+const filterSchema = z.preprocess((val) => {
 	if (val === void 0) return val;
 	if (typeof val === "string") try {
 		return JSON.parse(val);
@@ -24586,20 +24879,20 @@ const filterSchema = z$1.preprocess((val) => {
 		return val;
 	}
 	return val;
-}, z$1.object({
-	dateRange: z$1.object({
-		start: z$1.coerce.date().optional(),
-		end: z$1.coerce.date().optional(),
-		startExclusive: z$1.boolean().optional(),
-		endExclusive: z$1.boolean().optional()
+}, z.object({
+	dateRange: z.object({
+		start: z.coerce.date().optional(),
+		end: z.coerce.date().optional(),
+		startExclusive: z.boolean().optional(),
+		endExclusive: z.boolean().optional()
 	}).optional(),
-	roles: z$1.array(z$1.string()).optional(),
+	roles: z.array(z.string()).optional(),
 	metadata: metadataFilterSchema.optional()
 })).optional();
 /**
 * Memory config schema - handles JSON parsing from query strings
 */
-const memoryConfigSchema = z$1.preprocess((val) => {
+const memoryConfigSchema = z.preprocess((val) => {
 	if (val === void 0) return val;
 	if (typeof val === "string") try {
 		return JSON.parse(val);
@@ -24607,30 +24900,30 @@ const memoryConfigSchema = z$1.preprocess((val) => {
 		return val;
 	}
 	return val;
-}, z$1.record(z$1.string(), z$1.unknown())).optional();
+}, z.record(z.string(), z.unknown())).optional();
 /**
 * Thread object structure
 */
-const threadSchema = z$1.object({
-	id: z$1.string(),
-	title: z$1.string().optional(),
-	resourceId: z$1.string(),
-	createdAt: z$1.date(),
-	updatedAt: z$1.date(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const threadSchema = z.object({
+	id: z.string(),
+	title: z.string().optional(),
+	resourceId: z.string(),
+	createdAt: z.date(),
+	updatedAt: z.date(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
 /**
 * Message structure for storage
 * Extends coreMessageSchema with storage-specific fields
 */
-const messageSchema = z$1.unknown();
+const messageSchema = z.unknown();
 /**
 * GET /api/memory/status
 * Includes optional resourceId and threadId for OM status lookup
 */
 const getMemoryStatusQuerySchema = agentIdQuerySchema.extend({
-	resourceId: z$1.string().optional(),
-	threadId: z$1.string().optional()
+	resourceId: z.string().optional(),
+	threadId: z.string().optional()
 });
 /**
 * GET /memory/config
@@ -24644,9 +24937,9 @@ const getMemoryConfigQuerySchema = agentIdQuerySchema;
 * current `{ orderBy: { field, direction } }` object shape.
 */
 const listThreadsQueryInnerSchema = createPagePaginationSchema(100).extend({
-	agentId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
-	metadata: z$1.preprocess((val) => {
+	agentId: z.string().optional(),
+	resourceId: z.string().optional(),
+	metadata: z.preprocess((val) => {
 		if (val === void 0) return val;
 		if (typeof val === "string") try {
 			return JSON.parse(val);
@@ -24654,7 +24947,7 @@ const listThreadsQueryInnerSchema = createPagePaginationSchema(100).extend({
 			return val;
 		}
 		return val;
-	}, z$1.record(z$1.string(), z$1.unknown())).optional(),
+	}, z.record(z.string(), z.unknown())).optional(),
 	orderBy: storageOrderBySchema$4
 });
 /**
@@ -24669,7 +24962,7 @@ const listThreadsQueryInnerSchema = createPagePaginationSchema(100).extend({
 * current shape before schema validation, so existing pinned clients continue
 * to work without server-side breakage.
 */
-const listThreadsQuerySchema$1 = z$1.preprocess((val) => {
+const listThreadsQuerySchema$1 = z.preprocess((val) => {
 	if (val === null || typeof val !== "object" || Array.isArray(val)) return val;
 	const record = val;
 	const rawOrderBy = record.orderBy;
@@ -24691,30 +24984,30 @@ const listThreadsQuerySchema$1 = z$1.preprocess((val) => {
 * agentId is optional - can use storage fallback when not provided
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const getThreadByIdQuerySchema = optionalAgentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const getThreadByIdQuerySchema = optionalAgentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * GET /memory/threads/:threadId/messages
 * agentId is optional - can use storage fallback when not provided
 */
 const listMessagesQuerySchema$1 = createPagePaginationSchema(40).extend({
-	agentId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
+	agentId: z.string().optional(),
+	resourceId: z.string().optional(),
 	orderBy: messageOrderBySchema,
 	include: includeSchema,
 	filter: filterSchema,
-	includeSystemReminders: z$1.preprocess((val) => {
+	includeSystemReminders: z.preprocess((val) => {
 		if (val === void 0) return val;
 		if (val === "true") return true;
 		if (val === "false") return false;
 		return val;
-	}, z$1.boolean()).optional()
+	}, z.boolean()).optional()
 });
 /**
 * GET /memory/threads/:threadId/working-memory
 */
-const getWorkingMemoryQuerySchema = z$1.object({
-	agentId: z$1.string(),
-	resourceId: z$1.string().optional(),
+const getWorkingMemoryQuerySchema = z.object({
+	agentId: z.string(),
+	resourceId: z.string().optional(),
 	memoryConfig: memoryConfigSchema
 });
 /**
@@ -24722,13 +25015,13 @@ const getWorkingMemoryQuerySchema = z$1.object({
 * agentId is required
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const deleteThreadQuerySchema = agentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const deleteThreadQuerySchema = agentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * POST /memory/messages/delete
 * agentId is required
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const deleteMessagesQuerySchema = agentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const deleteMessagesQuerySchema = agentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * GET /memory/network/status
 */
@@ -24740,9 +25033,9 @@ const getMemoryStatusNetworkQuerySchema = agentIdQuerySchema;
 * metadata is optional - filters threads by metadata key-value pairs (AND logic)
 */
 const listThreadsNetworkQuerySchema = createPagePaginationSchema(100).extend({
-	agentId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
-	metadata: z$1.preprocess((val) => {
+	agentId: z.string().optional(),
+	resourceId: z.string().optional(),
+	metadata: z.preprocess((val) => {
 		if (val === void 0) return val;
 		if (typeof val === "string") try {
 			return JSON.parse(val);
@@ -24750,7 +25043,7 @@ const listThreadsNetworkQuerySchema = createPagePaginationSchema(100).extend({
 			return val;
 		}
 		return val;
-	}, z$1.record(z$1.string(), z$1.unknown())).optional(),
+	}, z.record(z.string(), z.unknown())).optional(),
 	orderBy: storageOrderBySchema$4
 });
 /**
@@ -24758,14 +25051,14 @@ const listThreadsNetworkQuerySchema = createPagePaginationSchema(100).extend({
 * agentId is optional - can use storage fallback when not provided
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const getThreadByIdNetworkQuerySchema = optionalAgentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const getThreadByIdNetworkQuerySchema = optionalAgentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * GET /memory/network/threads/:threadId/messages
 * agentId is optional - can use storage fallback when not provided
 */
 const listMessagesNetworkQuerySchema = createPagePaginationSchema(40).extend({
-	agentId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
+	agentId: z.string().optional(),
+	resourceId: z.string().optional(),
 	orderBy: messageOrderBySchema,
 	include: includeSchema,
 	filter: filterSchema
@@ -24786,50 +25079,50 @@ const updateThreadNetworkQuerySchema = agentIdQuerySchema;
 * DELETE /memory/network/threads/:threadId
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const deleteThreadNetworkQuerySchema = agentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const deleteThreadNetworkQuerySchema = agentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * POST /memory/network/messages/delete
 * resourceId is optional - used for ownership validation fallback when not set via middleware
 */
-const deleteMessagesNetworkQuerySchema = agentIdQuerySchema.extend({ resourceId: z$1.string().optional() });
+const deleteMessagesNetworkQuerySchema = agentIdQuerySchema.extend({ resourceId: z.string().optional() });
 /**
 * Response for GET /memory/status
 */
-const memoryStatusResponseSchema = z$1.object({
-	result: z$1.boolean(),
-	memoryType: z$1.enum(["local", "gateway"]).optional(),
-	observationalMemory: z$1.object({
-		enabled: z$1.boolean(),
-		hasRecord: z$1.boolean().optional(),
-		originType: z$1.string().optional(),
-		lastObservedAt: z$1.date().optional(),
-		tokenCount: z$1.number().optional(),
-		observationTokenCount: z$1.number().optional(),
-		isObserving: z$1.boolean().optional(),
-		isReflecting: z$1.boolean().optional()
+const memoryStatusResponseSchema = z.object({
+	result: z.boolean(),
+	memoryType: z.enum(["local", "gateway"]).optional(),
+	observationalMemory: z.object({
+		enabled: z.boolean(),
+		hasRecord: z.boolean().optional(),
+		originType: z.string().optional(),
+		lastObservedAt: z.date().optional(),
+		tokenCount: z.number().optional(),
+		observationTokenCount: z.number().optional(),
+		isObserving: z.boolean().optional(),
+		isReflecting: z.boolean().optional()
 	}).optional()
 });
 /**
 * Observational Memory config schema for API responses
 */
-const observationalMemoryModelRoutingSchema = z$1.array(z$1.object({
-	upTo: z$1.number(),
-	model: z$1.string()
+const observationalMemoryModelRoutingSchema = z.array(z.object({
+	upTo: z.number(),
+	model: z.string()
 }));
-const observationalMemoryConfigSchema = z$1.object({
-	enabled: z$1.boolean(),
-	scope: z$1.enum(["thread", "resource"]).optional(),
-	shareTokenBudget: z$1.boolean().optional(),
-	messageTokens: z$1.union([z$1.number(), z$1.object({
-		min: z$1.number(),
-		max: z$1.number()
+const observationalMemoryConfigSchema = z.object({
+	enabled: z.boolean(),
+	scope: z.enum(["thread", "resource"]).optional(),
+	shareTokenBudget: z.boolean().optional(),
+	messageTokens: z.union([z.number(), z.object({
+		min: z.number(),
+		max: z.number()
 	})]).optional(),
-	observationTokens: z$1.union([z$1.number(), z$1.object({
-		min: z$1.number(),
-		max: z$1.number()
+	observationTokens: z.union([z.number(), z.object({
+		min: z.number(),
+		max: z.number()
 	})]).optional(),
-	observationModel: z$1.string().optional(),
-	reflectionModel: z$1.string().optional(),
+	observationModel: z.string().optional(),
+	reflectionModel: z.string().optional(),
 	observationModelRouting: observationalMemoryModelRoutingSchema.optional(),
 	reflectionModelRouting: observationalMemoryModelRoutingSchema.optional()
 });
@@ -24837,17 +25130,17 @@ const observationalMemoryConfigSchema = z$1.object({
 * Response for GET /memory/config
 * MemoryConfig is complex with many optional fields - using passthrough
 */
-const memoryConfigResponseSchema = z$1.object({
-	memoryType: z$1.enum(["local", "gateway"]).optional(),
-	config: z$1.object({
-		lastMessages: z$1.union([z$1.number(), z$1.literal(false)]).optional(),
-		semanticRecall: z$1.union([z$1.boolean(), z$1.unknown()]).optional(),
-		workingMemory: z$1.object({
-			enabled: z$1.boolean().optional(),
-			scope: z$1.enum(["thread", "resource"]).optional(),
-			template: z$1.string().optional(),
-			schema: z$1.unknown().optional(),
-			version: z$1.enum(["stable", "vnext"]).optional()
+const memoryConfigResponseSchema = z.object({
+	memoryType: z.enum(["local", "gateway"]).optional(),
+	config: z.object({
+		lastMessages: z.union([z.number(), z.literal(false)]).optional(),
+		semanticRecall: z.union([z.boolean(), z.unknown()]).optional(),
+		workingMemory: z.object({
+			enabled: z.boolean().optional(),
+			scope: z.enum(["thread", "resource"]).optional(),
+			template: z.string().optional(),
+			schema: z.unknown().optional(),
+			version: z.enum(["stable", "vnext"]).optional()
 		}).passthrough().optional(),
 		observationalMemory: observationalMemoryConfigSchema.optional()
 	}).nullable()
@@ -24855,7 +25148,7 @@ const memoryConfigResponseSchema = z$1.object({
 /**
 * Response for GET /memory/threads
 */
-const listThreadsResponseSchema$1 = paginationInfoSchema$1.extend({ threads: z$1.array(threadSchema) });
+const listThreadsResponseSchema$1 = paginationInfoSchema$1.extend({ threads: z.array(threadSchema) });
 /**
 * Response for GET /memory/threads/:threadId
 */
@@ -24863,45 +25156,45 @@ const getThreadByIdResponseSchema = threadSchema;
 /**
 * Response for GET /memory/threads/:threadId/messages
 */
-const listMessagesResponseSchema$1 = z$1.object({
-	messages: z$1.array(messageSchema),
-	uiMessages: z$1.array(z$1.unknown()).nullable()
+const listMessagesResponseSchema$1 = z.object({
+	messages: z.array(messageSchema),
+	uiMessages: z.array(z.unknown()).nullable()
 });
 /**
 * Response for GET /memory/threads/:threadId/working-memory
 */
-const getWorkingMemoryResponseSchema = z$1.object({
-	workingMemory: z$1.unknown().nullable(),
-	source: z$1.enum(["thread", "resource"]),
-	workingMemoryTemplate: z$1.unknown().nullable(),
-	threadExists: z$1.boolean()
+const getWorkingMemoryResponseSchema = z.object({
+	workingMemory: z.unknown().nullable(),
+	source: z.enum(["thread", "resource"]),
+	workingMemoryTemplate: z.unknown().nullable(),
+	threadExists: z.boolean()
 });
 /**
 * Body schema for POST /memory/messages
 */
-const saveMessagesBodySchema = z$1.object({ messages: z$1.array(messageSchema) });
+const saveMessagesBodySchema = z.object({ messages: z.array(messageSchema) });
 /**
 * Body schema for POST /memory/threads
 */
-const createThreadBodySchema$1 = z$1.object({
-	resourceId: z$1.string(),
-	title: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	threadId: z$1.string().optional()
+const createThreadBodySchema$1 = z.object({
+	resourceId: z.string(),
+	title: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	threadId: z.string().optional()
 });
 /**
 * Body schema for PUT /memory/threads/:threadId
 */
-const updateThreadBodySchema = z$1.object({
-	title: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	resourceId: z$1.string().optional()
+const updateThreadBodySchema = z.object({
+	title: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	resourceId: z.string().optional()
 });
 /**
 * Body schema for POST /memory/threads/:threadId/transfer
 * Reassigns the thread (and its messages) to a different resource.
 */
-const transferThreadBodySchema = z$1.object({ resourceId: z$1.string().min(1) });
+const transferThreadBodySchema = z.object({ resourceId: z.string().min(1) });
 /**
 * Response schema for POST /memory/threads/:threadId/transfer
 */
@@ -24909,149 +25202,149 @@ const transferThreadResponseSchema = threadSchema;
 /**
 * Body schema for PUT /memory/threads/:threadId/working-memory
 */
-const updateWorkingMemoryBodySchema = z$1.object({
-	workingMemory: z$1.string(),
-	resourceId: z$1.string().optional(),
-	memoryConfig: z$1.record(z$1.string(), z$1.unknown()).optional()
+const updateWorkingMemoryBodySchema = z.object({
+	workingMemory: z.string(),
+	resourceId: z.string().optional(),
+	memoryConfig: z.record(z.string(), z.unknown()).optional()
 });
 /**
 * Body schema for POST /memory/messages/delete
 * Accepts: string | string[] | { id: string } | { id: string }[]
 */
-const deleteMessagesBodySchema = z$1.object({ messageIds: z$1.union([
-	z$1.string(),
-	z$1.array(z$1.string()),
-	z$1.object({ id: z$1.string() }),
-	z$1.array(z$1.object({ id: z$1.string() }))
+const deleteMessagesBodySchema = z.object({ messageIds: z.union([
+	z.string(),
+	z.array(z.string()),
+	z.object({ id: z.string() }),
+	z.array(z.object({ id: z.string() }))
 ]) });
 /**
 * Query schema for GET /memory/search
 */
-const searchMemoryQuerySchema = z$1.object({
-	agentId: z$1.string(),
-	searchQuery: z$1.string(),
-	resourceId: z$1.string(),
-	threadId: z$1.string().optional(),
-	limit: z$1.coerce.number().optional().default(20),
+const searchMemoryQuerySchema = z.object({
+	agentId: z.string(),
+	searchQuery: z.string(),
+	resourceId: z.string(),
+	threadId: z.string().optional(),
+	limit: z.coerce.number().optional().default(20),
 	memoryConfig: memoryConfigSchema
 });
 /**
 * Response schemas
 */
-const saveMessagesResponseSchema = z$1.object({ messages: z$1.array(messageSchema) });
-const deleteThreadResponseSchema = z$1.object({ result: z$1.string() });
+const saveMessagesResponseSchema = z.object({ messages: z.array(messageSchema) });
+const deleteThreadResponseSchema = z.object({ result: z.string() });
 const updateWorkingMemoryResponseSchema = successResponseSchema;
-const deleteMessagesResponseSchema = successResponseSchema.extend({ message: z$1.string() });
-const searchMemoryResponseSchema = z$1.object({
-	results: z$1.array(z$1.unknown()),
-	count: z$1.number(),
-	query: z$1.string(),
-	searchScope: z$1.string().optional(),
-	searchType: z$1.string().optional()
+const deleteMessagesResponseSchema = successResponseSchema.extend({ message: z.string() });
+const searchMemoryResponseSchema = z.object({
+	results: z.array(z.unknown()),
+	count: z.number(),
+	query: z.string(),
+	searchScope: z.string().optional(),
+	searchType: z.string().optional()
 });
 /**
 * Body schema for POST /memory/threads/:threadId/clone
 */
-const cloneThreadBodySchema$1 = z$1.object({
-	newThreadId: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
-	title: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	options: z$1.object({
-		messageLimit: z$1.number().optional(),
-		messageFilter: z$1.object({
-			startDate: z$1.coerce.date().optional(),
-			endDate: z$1.coerce.date().optional(),
-			messageIds: z$1.array(z$1.string()).optional()
+const cloneThreadBodySchema$1 = z.object({
+	newThreadId: z.string().optional(),
+	resourceId: z.string().optional(),
+	title: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	options: z.object({
+		messageLimit: z.number().optional(),
+		messageFilter: z.object({
+			startDate: z.coerce.date().optional(),
+			endDate: z.coerce.date().optional(),
+			messageIds: z.array(z.string()).optional()
 		}).optional()
 	}).optional()
 });
 /**
 * Response schema for POST /memory/threads/:threadId/clone
 */
-const cloneThreadResponseSchema = z$1.object({
+const cloneThreadResponseSchema = z.object({
 	thread: threadSchema,
-	clonedMessages: z$1.array(messageSchema)
+	clonedMessages: z.array(messageSchema)
 });
 /**
 * Query schema for GET /api/memory/observational-memory
 */
-const getObservationalMemoryQuerySchema = z$1.object({
-	agentId: z$1.string(),
-	resourceId: z$1.string().optional(),
-	threadId: z$1.string().optional(),
-	from: z$1.coerce.date().optional(),
-	to: z$1.coerce.date().optional(),
-	offset: z$1.coerce.number().int().min(0).optional(),
-	limit: z$1.coerce.number().int().min(1).optional()
+const getObservationalMemoryQuerySchema = z.object({
+	agentId: z.string(),
+	resourceId: z.string().optional(),
+	threadId: z.string().optional(),
+	from: z.coerce.date().optional(),
+	to: z.coerce.date().optional(),
+	offset: z.coerce.number().int().min(0).optional(),
+	limit: z.coerce.number().int().min(1).optional()
 });
 /**
 * Observational Memory record schema for API responses
 * Matches the ObservationalMemoryRecord type from @mastra/core/storage
 */
-const bufferedObservationChunkSchema = z$1.object({
-	id: z$1.string().optional(),
-	cycleId: z$1.string(),
-	observations: z$1.string(),
-	tokenCount: z$1.number(),
-	messageIds: z$1.array(z$1.string()).optional(),
-	messageTokens: z$1.number(),
-	lastObservedAt: z$1.date().optional(),
-	createdAt: z$1.date().optional(),
-	suggestedContinuation: z$1.string().optional(),
-	currentTask: z$1.string().optional(),
-	threadTitle: z$1.string().optional(),
-	extractedValues: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	extractionFailures: z$1.array(z$1.object({
-		slug: z$1.string(),
-		error: z$1.string()
+const bufferedObservationChunkSchema = z.object({
+	id: z.string().optional(),
+	cycleId: z.string(),
+	observations: z.string(),
+	tokenCount: z.number(),
+	messageIds: z.array(z.string()).optional(),
+	messageTokens: z.number(),
+	lastObservedAt: z.date().optional(),
+	createdAt: z.date().optional(),
+	suggestedContinuation: z.string().optional(),
+	currentTask: z.string().optional(),
+	threadTitle: z.string().optional(),
+	extractedValues: z.record(z.string(), z.unknown()).optional(),
+	extractionFailures: z.array(z.object({
+		slug: z.string(),
+		error: z.string()
 	})).optional()
 });
-const observationalMemoryRecordSchema = z$1.object({
-	id: z$1.string(),
-	scope: z$1.enum(["thread", "resource"]),
-	resourceId: z$1.string(),
-	threadId: z$1.string().nullable(),
-	activeObservations: z$1.string(),
-	bufferedObservations: z$1.string().optional(),
-	bufferedObservationChunks: z$1.array(bufferedObservationChunkSchema).optional(),
-	bufferedReflection: z$1.string().optional(),
-	originType: z$1.enum([
+const observationalMemoryRecordSchema = z.object({
+	id: z.string(),
+	scope: z.enum(["thread", "resource"]),
+	resourceId: z.string(),
+	threadId: z.string().nullable(),
+	activeObservations: z.string(),
+	bufferedObservations: z.string().optional(),
+	bufferedObservationChunks: z.array(bufferedObservationChunkSchema).optional(),
+	bufferedReflection: z.string().optional(),
+	originType: z.enum([
 		"initial",
 		"observation",
 		"reflection"
 	]),
-	generationCount: z$1.number(),
-	lastObservedAt: z$1.date().optional(),
-	totalTokensObserved: z$1.number(),
-	observationTokenCount: z$1.number(),
-	pendingMessageTokens: z$1.number(),
-	isObserving: z$1.boolean(),
-	isReflecting: z$1.boolean(),
-	config: z$1.record(z$1.string(), z$1.unknown()),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.date(),
-	updatedAt: z$1.date()
+	generationCount: z.number(),
+	lastObservedAt: z.date().optional(),
+	totalTokensObserved: z.number(),
+	observationTokenCount: z.number(),
+	pendingMessageTokens: z.number(),
+	isObserving: z.boolean(),
+	isReflecting: z.boolean(),
+	config: z.record(z.string(), z.unknown()),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.date(),
+	updatedAt: z.date()
 });
 /**
 * Response schema for GET /api/memory/observational-memory
 */
-const getObservationalMemoryResponseSchema = z$1.object({
+const getObservationalMemoryResponseSchema = z.object({
 	record: observationalMemoryRecordSchema.nullable(),
-	history: z$1.array(observationalMemoryRecordSchema).optional()
+	history: z.array(observationalMemoryRecordSchema).optional()
 });
 /**
 * Body schema for POST /api/memory/observational-memory/buffer-status
 */
-const awaitBufferStatusBodySchema = z$1.object({
-	agentId: z$1.string(),
-	resourceId: z$1.string().optional(),
-	threadId: z$1.string().optional()
+const awaitBufferStatusBodySchema = z.object({
+	agentId: z.string(),
+	resourceId: z.string().optional(),
+	threadId: z.string().optional()
 });
 /**
 * Response schema for POST /api/memory/observational-memory/buffer-status
 */
-const awaitBufferStatusResponseSchema = z$1.object({ record: observationalMemoryRecordSchema.nullable() });
+const awaitBufferStatusResponseSchema = z.object({ record: observationalMemoryRecordSchema.nullable() });
 
 //#region src/server/schemas/responses.ts
 const responseIdPathParams = z$2.object({ responseId: z$2.string().describe("Unique identifier for the stored response") });
@@ -26690,26 +26983,26 @@ const DELETE_CONVERSATION_ROUTE = createRoute$1({
 
 //#region src/server/schemas/logs.ts
 const listLogsQuerySchema = createPagePaginationSchema().extend({
-	fromDate: z$1.coerce.date().optional(),
-	toDate: z$1.coerce.date().optional(),
-	logLevel: z$1.enum([
+	fromDate: z.coerce.date().optional(),
+	toDate: z.coerce.date().optional(),
+	logLevel: z.enum([
 		"debug",
 		"info",
 		"warn",
 		"error",
 		"silent"
 	]).optional(),
-	filters: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional(),
-	transportId: z$1.string()
+	filters: z.union([z.string(), z.array(z.string())]).optional(),
+	transportId: z.string()
 });
-const listLogsResponseSchema$1 = z$1.object({
-	logs: z$1.array(baseLogMessageSchema),
-	total: z$1.number(),
-	page: z$1.number(),
-	perPage: z$1.union([z$1.number(), z$1.literal(false)]),
-	hasMore: z$1.boolean()
+const listLogsResponseSchema$1 = z.object({
+	logs: z.array(baseLogMessageSchema),
+	total: z.number(),
+	page: z.number(),
+	perPage: z.union([z.number(), z.literal(false)]),
+	hasMore: z.boolean()
 });
-const listLogTransportsResponseSchema = z$1.object({ transports: z$1.array(z$1.string()) });
+const listLogTransportsResponseSchema = z.object({ transports: z.array(z.string()) });
 
 const LIST_LOG_TRANSPORTS_ROUTE = createRoute$1({
 	method: "GET",
@@ -26793,72 +27086,72 @@ const LIST_LOGS_BY_RUN_ID_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/mcp.ts
-const mcpServerIdPathParams = z$1.object({ serverId: z$1.string().describe("MCP server ID") });
-const mcpServerDetailPathParams = z$1.object({ id: z$1.string().describe("MCP server ID") });
-const mcpServerToolPathParams = z$1.object({
-	serverId: z$1.string().describe("MCP server ID"),
-	toolId: z$1.string().describe("Tool ID")
+const mcpServerIdPathParams = z.object({ serverId: z.string().describe("MCP server ID") });
+const mcpServerDetailPathParams = z.object({ id: z.string().describe("MCP server ID") });
+const mcpServerToolPathParams = z.object({
+	serverId: z.string().describe("MCP server ID"),
+	toolId: z.string().describe("Tool ID")
 });
-const executeToolBodySchema = z$1.object({ data: z$1.unknown().optional() });
+const executeToolBodySchema = z.object({ data: z.unknown().optional() });
 const listMcpServersQuerySchema = createCombinedPaginationSchema();
-const getMcpServerDetailQuerySchema = z$1.object({ version: z$1.string().optional() });
-const versionDetailSchema = z$1.object({
-	version: z$1.string(),
-	release_date: z$1.string(),
-	is_latest: z$1.boolean()
+const getMcpServerDetailQuerySchema = z.object({ version: z.string().optional() });
+const versionDetailSchema = z.object({
+	version: z.string(),
+	release_date: z.string(),
+	is_latest: z.boolean()
 });
-const serverInfoSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
+const serverInfoSchema = z.object({
+	id: z.string(),
+	name: z.string(),
 	version_detail: versionDetailSchema
 });
-const listMcpServersResponseSchema = z$1.object({
-	servers: z$1.array(serverInfoSchema),
-	total_count: z$1.number(),
-	next: z$1.string().nullable()
+const listMcpServersResponseSchema = z.object({
+	servers: z.array(serverInfoSchema),
+	total_count: z.number(),
+	next: z.string().nullable()
 });
-const serverDetailSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional(),
+const serverDetailSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	description: z.string().optional(),
 	version_detail: versionDetailSchema,
-	package_canonical: z$1.string().optional(),
-	packages: z$1.array(z$1.unknown()).optional(),
-	remotes: z$1.array(z$1.unknown()).optional()
+	package_canonical: z.string().optional(),
+	packages: z.array(z.unknown()).optional(),
+	remotes: z.array(z.unknown()).optional()
 });
-const mcpToolInfoSchema = z$1.object({
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	inputSchema: z$1.unknown(),
-	outputSchema: z$1.unknown().optional(),
-	toolType: z$1.string().optional(),
-	_meta: z$1.record(z$1.string(), z$1.unknown()).optional()
+const mcpToolInfoSchema = z.object({
+	name: z.string(),
+	description: z.string().optional(),
+	inputSchema: z.unknown(),
+	outputSchema: z.unknown().optional(),
+	toolType: z.string().optional(),
+	_meta: z.record(z.string(), z.unknown()).optional()
 });
-const listMcpServerToolsResponseSchema = z$1.object({ tools: z$1.array(mcpToolInfoSchema) });
-const executeToolResponseSchema = z$1.object({ result: z$1.unknown() });
-const mcpServerResourcePathParams = z$1.object({ serverId: z$1.string().describe("MCP server ID") });
-const readResourceBodySchema = z$1.object({ uri: z$1.string().describe("Resource URI to read") });
-const resourceContentSchema = z$1.object({
-	uri: z$1.string(),
-	text: z$1.string().optional(),
-	blob: z$1.string().optional()
+const listMcpServerToolsResponseSchema = z.object({ tools: z.array(mcpToolInfoSchema) });
+const executeToolResponseSchema = z.object({ result: z.unknown() });
+const mcpServerResourcePathParams = z.object({ serverId: z.string().describe("MCP server ID") });
+const readResourceBodySchema = z.object({ uri: z.string().describe("Resource URI to read") });
+const resourceContentSchema = z.object({
+	uri: z.string(),
+	text: z.string().optional(),
+	blob: z.string().optional()
 });
-const readResourceResponseSchema = z$1.object({ contents: z$1.array(resourceContentSchema) });
-const resourceInfoSchema = z$1.object({
-	uri: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	mimeType: z$1.string().optional(),
-	_meta: z$1.record(z$1.string(), z$1.unknown()).optional()
+const readResourceResponseSchema = z.object({ contents: z.array(resourceContentSchema) });
+const resourceInfoSchema = z.object({
+	uri: z.string(),
+	name: z.string(),
+	description: z.string().optional(),
+	mimeType: z.string().optional(),
+	_meta: z.record(z.string(), z.unknown()).optional()
 });
-const listResourcesResponseSchema = z$1.object({ resources: z$1.array(resourceInfoSchema) });
-z$1.object({
-	jsonrpc: z$1.literal("2.0"),
-	error: z$1.object({
-		code: z$1.number(),
-		message: z$1.string()
+const listResourcesResponseSchema = z.object({ resources: z.array(resourceInfoSchema) });
+z.object({
+	jsonrpc: z.literal("2.0"),
+	error: z.object({
+		code: z.number(),
+		message: z.string()
 	}),
-	id: z$1.null()
+	id: z.null()
 });
 
 const LIST_MCP_SERVERS_ROUTE = createRoute$1({
@@ -28979,13 +29272,13 @@ const DELETE_MESSAGES_NETWORK_ROUTE = createRoute$1({
 * query schemas directly once server/core no longer need to tolerate older
 * mixed-version pairings.
 */
-const paginationArgsSchema$1 = z$1.object({
-	page: z$1.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
-	perPage: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
+const paginationArgsSchema$1 = z.object({
+	page: z.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
+	perPage: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
 }).describe("Pagination options for list queries");
-const deltaCursorSchema$1 = z$1.string().min(1).describe("Opaque cursor value for incremental polling");
-const listModeSchema$1 = z$1.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
-const deltaLimitSchema$1 = z$1.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
+const deltaCursorSchema$1 = z.string().min(1).describe("Opaque cursor value for incremental polling");
+const listModeSchema$1 = z.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
+const deltaLimitSchema$1 = z.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
 
 const OBSERVABILITY_DELTA_POLLING_UPGRADE_MESSAGE = "Delta polling requires a newer @mastra/core with observability delta polling support. Please upgrade.";
 const OBSERVABILITY_TRACE_QUERY_STORAGE_FEATURE = "trace-query";
@@ -29235,15 +29528,15 @@ const NEW_ROUTE_DEFS = {
 function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
 	const unwrapDefault = (schema) => {
 		const zodSchema = schema;
-		return zodSchema instanceof z$1.ZodDefault ? zodSchema.unwrap() : zodSchema;
+		return zodSchema instanceof z.ZodDefault ? zodSchema.unwrap() : zodSchema;
 	};
 	const paginationShape = paginationArgsSchema$1.shape;
 	const orderByShape = orderBySchema.shape;
 	const pageSchema = unwrapDefault(paginationShape.page);
 	const perPageSchema = unwrapDefault(paginationShape.perPage);
-	const fieldSchema = orderByShape.field ? unwrapDefault(orderByShape.field) : z$1.never().optional();
-	const directionSchema = orderByShape.direction ? unwrapDefault(orderByShape.direction) : z$1.never().optional();
-	return wrapSchemaForQueryParams(z$1.object({
+	const fieldSchema = orderByShape.field ? unwrapDefault(orderByShape.field) : z.never().optional();
+	const directionSchema = orderByShape.direction ? unwrapDefault(orderByShape.direction) : z.never().optional();
+	return wrapSchemaForQueryParams(z.object({
 		...filterSchema.shape,
 		page: pageSchema,
 		perPage: perPageSchema,
@@ -29261,24 +29554,24 @@ function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
 		if (isDelta) {
 			if (hasPagination) {
 				if (value.page !== void 0) ctx.addIssue({
-					code: z$1.ZodIssueCode.custom,
+					code: z.ZodIssueCode.custom,
 					path: ["page"],
 					message: "`page` is not allowed when `mode=delta`"
 				});
 				if (value.perPage !== void 0) ctx.addIssue({
-					code: z$1.ZodIssueCode.custom,
+					code: z.ZodIssueCode.custom,
 					path: ["perPage"],
 					message: "`perPage` is not allowed when `mode=delta`"
 				});
 			}
 			if (hasOrderBy) {
 				if (value.field !== void 0) ctx.addIssue({
-					code: z$1.ZodIssueCode.custom,
+					code: z.ZodIssueCode.custom,
 					path: ["field"],
 					message: "`field` is not allowed when `mode=delta`"
 				});
 				if (value.direction !== void 0) ctx.addIssue({
-					code: z$1.ZodIssueCode.custom,
+					code: z.ZodIssueCode.custom,
 					path: ["direction"],
 					message: "`direction` is not allowed when `mode=delta`"
 				});
@@ -29286,12 +29579,12 @@ function createObservabilityListQuerySchema(filterSchema, orderBySchema) {
 			return;
 		}
 		if (hasAfter) ctx.addIssue({
-			code: z$1.ZodIssueCode.custom,
+			code: z.ZodIssueCode.custom,
 			path: ["after"],
 			message: "`after` is only allowed when `mode=delta`"
 		});
 		if (hasLimit) ctx.addIssue({
-			code: z$1.ZodIssueCode.custom,
+			code: z.ZodIssueCode.custom,
 			path: ["limit"],
 			message: "`limit` is only allowed when `mode=delta`"
 		});
@@ -29415,31 +29708,31 @@ let EntityType$1 = /* @__PURE__ */ function(EntityType) {
 	EntityType["MEMORY"] = "memory";
 	return EntityType;
 }({});
-z$1.date().describe("Database record creation time"), z$1.date().describe("Database record last update time").nullable();
+z.date().describe("Database record creation time"), z.date().describe("Database record last update time").nullable();
 /**
 * Pagination arguments for list queries (page and perPage only)
 * Uses z.coerce to handle string → number conversion from query params
 */
-const paginationArgsSchema = z$1.object({
-	page: z$1.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
-	perPage: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
+const paginationArgsSchema = z.object({
+	page: z.coerce.number().int().min(0).optional().default(0).describe("Zero-indexed page number"),
+	perPage: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Number of items per page")
 }).describe("Pagination options for list queries");
 /**
 * Pagination response info
 * Used across all paginated endpoints
 */
-const paginationInfoSchema = z$1.object({
-	total: z$1.number().describe("Total number of items available"),
-	page: z$1.number().describe("Current page"),
-	perPage: z$1.union([z$1.number(), z$1.literal(false)]).describe("Number of items per page, or false if pagination is disabled"),
-	hasMore: z$1.boolean().describe("True if more pages are available")
+const paginationInfoSchema = z.object({
+	total: z.number().describe("Total number of items available"),
+	page: z.number().describe("Current page"),
+	perPage: z.union([z.number(), z.literal(false)]).describe("Number of items per page, or false if pagination is disabled"),
+	hasMore: z.boolean().describe("True if more pages are available")
 });
 /** Opaque cursor used to resume incremental polling for observability list endpoints. */
-const deltaCursorSchema = z$1.string().min(1).describe("Opaque cursor value for incremental polling");
+const deltaCursorSchema = z.string().min(1).describe("Opaque cursor value for incremental polling");
 /** Explicit list mode selector for observability list endpoints. */
-const listModeSchema = z$1.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
+const listModeSchema = z.enum(["page", "delta"]).describe("List mode: 'page' | 'delta', defaults to 'page' when omitted.");
 /** Max number of updates returned from a delta poll window. */
-const deltaLimitSchema = z$1.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
+const deltaLimitSchema = z.coerce.number().int().min(1).max(100).optional().describe("Maximum number of updates to return in one delta poll");
 /** Default page-mode pagination used to preserve legacy list arg behavior. */
 const defaultPaginationArgs = {
 	page: 0,
@@ -29489,23 +29782,23 @@ function normalizeObservabilityListArgs(value, defaults) {
 	};
 }
 /** Metadata returned for a delta poll window. */
-const deltaInfoSchema = z$1.object({
-	limit: z$1.number().describe("Maximum number of updates requested for this delta poll"),
-	hasMore: z$1.boolean().describe("True when more matching updates remain after this response")
+const deltaInfoSchema = z.object({
+	limit: z.number().describe("Maximum number of updates requested for this delta poll"),
+	hasMore: z.boolean().describe("True when more matching updates remain after this response")
 }).describe("Incremental polling metadata");
 /**
 * Date range for filtering by time
 * Uses z.coerce to handle ISO string → Date conversion from query params
 */
-const dateRangeSchema$1 = z$1.object({
-	start: z$1.coerce.date().optional().describe("Start of date range (inclusive by default)"),
-	end: z$1.coerce.date().optional().describe("End of date range (inclusive by default)"),
-	startExclusive: z$1.boolean().optional().describe("When true, excludes the start date from results (uses > instead of >=)"),
-	endExclusive: z$1.boolean().optional().describe("When true, excludes the end date from results (uses < instead of <=)")
+const dateRangeSchema$1 = z.object({
+	start: z.coerce.date().optional().describe("Start of date range (inclusive by default)"),
+	end: z.coerce.date().optional().describe("End of date range (inclusive by default)"),
+	startExclusive: z.boolean().optional().describe("When true, excludes the start date from results (uses > instead of >=)"),
+	endExclusive: z.boolean().optional().describe("When true, excludes the end date from results (uses < instead of <=)")
 }).describe("Date range filter for timestamps");
-const sortDirectionSchema = z$1.enum(["ASC", "DESC"]).describe("Sort direction: 'ASC' | 'DESC'");
+const sortDirectionSchema = z.enum(["ASC", "DESC"]).describe("Sort direction: 'ASC' | 'DESC'");
 /** Aggregation type schema shared across OLAP-style observability queries. */
-const aggregationTypeSchema = z$1.enum([
+const aggregationTypeSchema = z.enum([
 	"sum",
 	"avg",
 	"min",
@@ -29515,7 +29808,7 @@ const aggregationTypeSchema = z$1.enum([
 	"last"
 ]).describe("Aggregation function");
 /** Aggregation interval schema shared across OLAP-style observability queries. */
-const aggregationIntervalSchema = z$1.enum([
+const aggregationIntervalSchema = z.enum([
 	"1m",
 	"5m",
 	"15m",
@@ -29523,58 +29816,58 @@ const aggregationIntervalSchema = z$1.enum([
 	"1d"
 ]).describe("Time bucket interval");
 /** Compare period for aggregate queries with period-over-period comparison. */
-const comparePeriodSchema = z$1.enum([
+const comparePeriodSchema = z.enum([
 	"previous_period",
 	"previous_day",
 	"previous_week"
 ]).describe("Comparison period for aggregate queries");
 /** Shared groupBy schema for OLAP-style breakdown and time-series queries. */
-const groupBySchema = z$1.array(z$1.string()).min(1).describe("Fields to group by");
+const groupBySchema = z.array(z.string()).min(1).describe("Fields to group by");
 /** Shared percentiles schema for percentile queries. */
-const percentilesSchema = z$1.array(z$1.number().min(0).max(1)).min(1).describe("Percentile values (0-1)");
+const percentilesSchema = z.array(z.number().min(0).max(1)).min(1).describe("Percentile values (0-1)");
 /** Shared fields for aggregate OLAP responses across observability signals. */
 const aggregateResponseFields = {
-	value: z$1.number().nullable().describe("Aggregated value"),
-	previousValue: z$1.number().nullable().optional().describe("Value from comparison period"),
-	changePercent: z$1.number().nullable().optional().describe("Percentage change from comparison period")
+	value: z.number().nullable().describe("Aggregated value"),
+	previousValue: z.number().nullable().optional().describe("Value from comparison period"),
+	changePercent: z.number().nullable().optional().describe("Percentage change from comparison period")
 };
 /** Shared field for OLAP breakdown dimension values. */
-const dimensionsField = z$1.record(z$1.string(), z$1.string().nullable()).describe("Dimension values for this group");
+const dimensionsField = z.record(z.string(), z.string().nullable()).describe("Dimension values for this group");
 /** Shared field for non-null OLAP aggregated values. */
-const aggregatedValueField = z$1.number().describe("Aggregated value");
+const aggregatedValueField = z.number().describe("Aggregated value");
 /** Shared field for OLAP bucket timestamps. */
-const bucketTimestampField = z$1.date().describe("Bucket timestamp");
+const bucketTimestampField = z.date().describe("Bucket timestamp");
 /** Shared field for percentile identifiers in OLAP responses. */
-const percentileField = z$1.number().describe("Percentile value");
+const percentileField = z.number().describe("Percentile value");
 /** Shared field for percentile values within a time bucket. */
-const percentileBucketValueField = z$1.number().describe("Percentile value at this bucket");
-const entityTypeField = z$1.nativeEnum(EntityType$1).describe(`Entity type (e.g., 'agent' | 'processor' | 'tool' | 'workflow')`);
-const entityIdField = z$1.string().describe("ID of the entity (e.g., \"weatherAgent\", \"orderWorkflow\")");
-const entityNameField = z$1.string().describe("Name of the entity");
-const userIdField = z$1.string().describe("Human end-user who triggered execution");
-const organizationIdField = z$1.string().describe("Multi-tenant organization/account");
-const resourceIdField = z$1.string().describe("Broader resource context (Mastra memory compatibility)");
-const runIdField = z$1.string().describe("Unique execution run identifier");
-const sessionIdField = z$1.string().describe("Session identifier for grouping traces");
-const threadIdField = z$1.string().describe("Conversation thread identifier");
-const requestIdField = z$1.string().describe("HTTP request ID for log correlation");
-const environmentField = z$1.string().describe(`Environment (e.g., "production" | "staging" | "development")`);
-const sourceField = z$1.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
-const executionSourceField = z$1.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
-const serviceNameField = z$1.string().describe("Name of the service");
-const parentEntityTypeField = z$1.nativeEnum(EntityType$1).describe("Entity type of the parent entity");
-const parentEntityIdField = z$1.string().describe("ID of the parent entity");
-const parentEntityNameField = z$1.string().describe("Name of the parent entity");
-const rootEntityTypeField = z$1.nativeEnum(EntityType$1).describe("Entity type of the root entity");
-const rootEntityIdField = z$1.string().describe("ID of the root entity");
-const rootEntityNameField = z$1.string().describe("Name of the root entity");
-const entityVersionIdField = z$1.string().describe("Version ID of the entity that produced this signal (e.g., agent version, workflow version)");
-const parentEntityVersionIdField = z$1.string().describe("Version ID of the parent entity that produced this signal");
-const rootEntityVersionIdField = z$1.string().describe("Version ID of the root entity that produced this signal");
-const experimentIdField = z$1.string().describe("Experiment or eval run identifier");
-const scopeField = z$1.record(z$1.string(), z$1.unknown()).describe("Arbitrary package/app version info (e.g., {\"core\": \"1.0.0\", \"memory\": \"1.0.0\", \"gitSha\": \"abcd1234\"})");
-const metadataField = z$1.record(z$1.string(), z$1.unknown()).describe("User-defined metadata for custom filtering");
-const tagsField = z$1.array(z$1.string()).describe("Labels for filtering");
+const percentileBucketValueField = z.number().describe("Percentile value at this bucket");
+const entityTypeField = z.nativeEnum(EntityType$1).describe(`Entity type (e.g., 'agent' | 'processor' | 'tool' | 'workflow')`);
+const entityIdField = z.string().describe("ID of the entity (e.g., \"weatherAgent\", \"orderWorkflow\")");
+const entityNameField = z.string().describe("Name of the entity");
+const userIdField = z.string().describe("Human end-user who triggered execution");
+const organizationIdField = z.string().describe("Multi-tenant organization/account");
+const resourceIdField = z.string().describe("Broader resource context (Mastra memory compatibility)");
+const runIdField = z.string().describe("Unique execution run identifier");
+const sessionIdField = z.string().describe("Session identifier for grouping traces");
+const threadIdField = z.string().describe("Conversation thread identifier");
+const requestIdField = z.string().describe("HTTP request ID for log correlation");
+const environmentField = z.string().describe(`Environment (e.g., "production" | "staging" | "development")`);
+const sourceField = z.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
+const executionSourceField = z.string().describe(`Source of execution (e.g., "local" | "cloud" | "ci")`);
+const serviceNameField = z.string().describe("Name of the service");
+const parentEntityTypeField = z.nativeEnum(EntityType$1).describe("Entity type of the parent entity");
+const parentEntityIdField = z.string().describe("ID of the parent entity");
+const parentEntityNameField = z.string().describe("Name of the parent entity");
+const rootEntityTypeField = z.nativeEnum(EntityType$1).describe("Entity type of the root entity");
+const rootEntityIdField = z.string().describe("ID of the root entity");
+const rootEntityNameField = z.string().describe("Name of the root entity");
+const entityVersionIdField = z.string().describe("Version ID of the entity that produced this signal (e.g., agent version, workflow version)");
+const parentEntityVersionIdField = z.string().describe("Version ID of the parent entity that produced this signal");
+const rootEntityVersionIdField = z.string().describe("Version ID of the root entity that produced this signal");
+const experimentIdField = z.string().describe("Experiment or eval run identifier");
+const scopeField = z.record(z.string(), z.unknown()).describe("Arbitrary package/app version info (e.g., {\"core\": \"1.0.0\", \"memory\": \"1.0.0\", \"gitSha\": \"abcd1234\"})");
+const metadataField = z.record(z.string(), z.unknown()).describe("User-defined metadata for custom filtering");
+const tagsField = z.array(z.string()).describe("Labels for filtering");
 /**
 * Base context fields shared across tracing and non-tracing observability records.
 * Source/provenance is intentionally excluded because tracing uses `source`
@@ -29621,8 +29914,8 @@ sourceField.nullish();
 */
 const commonFilterFields = {
 	timestamp: dateRangeSchema$1.optional().describe("Filter by timestamp range"),
-	traceId: z$1.string().optional().describe("Filter by trace ID"),
-	spanId: z$1.string().optional().describe("Filter by span ID"),
+	traceId: z.string().optional().describe("Filter by trace ID"),
+	spanId: z.string().optional().describe("Filter by span ID"),
 	entityType: entityTypeField.optional(),
 	entityName: entityNameField.optional(),
 	entityVersionId: entityVersionIdField.optional(),
@@ -29643,29 +29936,29 @@ const commonFilterFields = {
 	threadId: threadIdField.optional(),
 	requestId: requestIdField.optional(),
 	executionSource: executionSourceField.optional(),
-	tags: z$1.array(z$1.string()).optional().describe("Filter by tags (must have all specified tags)")
+	tags: z.array(z.string()).optional().describe("Filter by tags (must have all specified tags)")
 };
 /** Zod schema for trace ID field */
-const traceIdField = z$1.string().describe("Unique trace identifier");
+const traceIdField = z.string().describe("Unique trace identifier");
 /** Zod schema for span ID field */
-const spanIdField = z$1.string().describe("Unique span identifier within a trace");
+const spanIdField = z.string().describe("Unique span identifier within a trace");
 /** Log level schema for validation */
-const logLevelSchema = z$1.enum([
+const logLevelSchema = z.enum([
 	"debug",
 	"info",
 	"warn",
 	"error",
 	"fatal"
 ]);
-const messageField = z$1.string().describe("Log message");
-const logDataField = z$1.record(z$1.string(), z$1.unknown()).describe("Structured data attached to the log");
+const messageField = z.string().describe("Log message");
+const logDataField = z.record(z.string(), z.unknown()).describe("Structured data attached to the log");
 /**
 * Schema for logs as stored in the database.
 * Includes all fields from ExportedLog plus storage-specific fields.
 */
-const logRecordSchema = z$1.object({
-	logId: z$1.string().nullish().describe("Unique id for this log event"),
-	timestamp: z$1.date().describe("When the log was created"),
+const logRecordSchema = z.object({
+	logId: z.string().nullish().describe("Unique id for this log event"),
+	timestamp: z.date().describe("When the log was created"),
 	level: logLevelSchema.describe("Log severity level"),
 	message: messageField,
 	data: logDataField.nullish(),
@@ -29675,10 +29968,10 @@ const logRecordSchema = z$1.object({
 	/**
 	* @deprecated Use `executionSource` instead.
 	*/
-	source: z$1.string().nullish().describe("Execution source"),
+	source: z.string().nullish().describe("Execution source"),
 	metadata: metadataField.nullish()
 }).describe("Log record as stored in the database");
-z$1.object({
+z.object({
 	level: logLevelSchema,
 	message: messageField,
 	data: logDataField.optional(),
@@ -29686,24 +29979,24 @@ z$1.object({
 }).describe("User-provided log input");
 /** Schema for creating a log record */
 const createLogRecordSchema = logRecordSchema;
-z$1.object({ logs: z$1.array(createLogRecordSchema) }).describe("Arguments for batch creating logs");
+z.object({ logs: z.array(createLogRecordSchema) }).describe("Arguments for batch creating logs");
 /** Schema for filtering logs in list queries */
-const logsFilterSchema = z$1.object({
+const logsFilterSchema = z.object({
 	...commonFilterFields,
 	/**
 	* @deprecated Use `executionSource` instead.
 	*/
-	source: z$1.string().optional().describe("Filter by execution source"),
-	level: z$1.union([logLevelSchema, z$1.array(logLevelSchema)]).optional().describe("Filter by log level(s)")
+	source: z.string().optional().describe("Filter by execution source"),
+	level: z.union([logLevelSchema, z.array(logLevelSchema)]).optional().describe("Filter by log level(s)")
 }).describe("Filters for querying logs");
 /** Fields available for ordering log results */
-const logsOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+const logsOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
 /** Order by configuration for log queries */
-const logsOrderBySchema = z$1.object({
+const logsOrderBySchema = z.object({
 	field: logsOrderByFieldSchema.default("timestamp").describe("Field to order by"),
 	direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
 	mode: listModeSchema.optional(),
 	filters: logsFilterSchema.optional().describe("Optional filters to apply"),
 	pagination: paginationArgsSchema.optional(),
@@ -29715,25 +30008,25 @@ z$1.object({
 	direction: "DESC"
 } })).describe("Arguments for listing logs");
 /** Schema for listLogs operation response */
-const listLogsResponseSchema = z$1.object({
+const listLogsResponseSchema = z.object({
 	pagination: paginationInfoSchema.optional(),
 	delta: deltaInfoSchema.optional(),
 	deltaCursor: deltaCursorSchema.optional(),
-	logs: z$1.array(logRecordSchema)
+	logs: z.array(logRecordSchema)
 }).describe("Response from listing logs");
-const scorerIdField = z$1.string().describe("Identifier of the scorer (e.g., relevance, accuracy)");
-const scorerNameField = z$1.string().describe("Display name of the scorer");
-const scorerVersionField = z$1.string().describe("Version of the scorer");
-const scoreSourceField = z$1.string().describe("How the score was produced (e.g., manual, automated, experiment)");
-const scoreValueField = z$1.number().describe("Score value (range defined by scorer)");
-const scoreReasonField = z$1.string().describe("Explanation for the score");
+const scorerIdField = z.string().describe("Identifier of the scorer (e.g., relevance, accuracy)");
+const scorerNameField = z.string().describe("Display name of the scorer");
+const scorerVersionField = z.string().describe("Version of the scorer");
+const scoreSourceField = z.string().describe("How the score was produced (e.g., manual, automated, experiment)");
+const scoreValueField = z.number().describe("Score value (range defined by scorer)");
+const scoreReasonField = z.string().describe("Explanation for the score");
 /**
 * Schema for scores as stored in the database.
 * Includes all fields from ExportedScore plus storage-specific fields.
 */
-const scoreRecordSchema = z$1.object({
-	scoreId: z$1.string().nullish().describe("Unique id for this score event"),
-	timestamp: z$1.date().describe("When the score was recorded"),
+const scoreRecordSchema = z.object({
+	scoreId: z.string().nullish().describe("Unique id for this score event"),
+	timestamp: z.date().describe("When the score was recorded"),
 	traceId: traceIdField.nullish().describe("Trace that anchors the scored target when available"),
 	spanId: spanIdField.nullish().describe("Span ID this score applies to"),
 	scorerId: scorerIdField,
@@ -29748,10 +30041,10 @@ const scoreRecordSchema = z$1.object({
 	reason: scoreReasonField.nullish(),
 	...contextFields,
 	/** Trace ID of the scoring run (links to trace that generated this score) */
-	scoreTraceId: z$1.string().nullish().describe("Trace ID of the scoring run for debugging score generation"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).nullish().describe("User-defined metadata")
+	scoreTraceId: z.string().nullish().describe("Trace ID of the scoring run for debugging score generation"),
+	metadata: z.record(z.string(), z.unknown()).nullish().describe("User-defined metadata")
 }).describe("Score record as stored in the database");
-z$1.object({
+z.object({
 	scorerId: scorerIdField,
 	scorerName: scorerNameField.optional(),
 	scorerVersion: scorerVersionField.optional(),
@@ -29762,32 +30055,32 @@ z$1.object({
 	source: scoreSourceField.optional(),
 	score: scoreValueField,
 	reason: scoreReasonField.optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional scorer-specific metadata"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional scorer-specific metadata"),
 	experimentId: experimentIdField.optional(),
-	scoreTraceId: z$1.string().optional().describe("Trace ID of the scoring run for debugging score generation"),
+	scoreTraceId: z.string().optional().describe("Trace ID of the scoring run for debugging score generation"),
 	targetEntityType: entityTypeField.optional().describe("Entity type the scorer evaluated when known")
 }).describe("User-provided score input");
 /** Schema for creating a score record */
 const createScoreRecordSchema = scoreRecordSchema;
-z$1.object({ score: createScoreRecordSchema }).describe("Arguments for creating a score");
+z.object({ score: createScoreRecordSchema }).describe("Arguments for creating a score");
 /** Schema for createScore operation body in client/server */
-const createScoreBodySchema = z$1.object({ score: createScoreRecordSchema.omit({ timestamp: true }) }).describe("Arguments for creating a score");
+const createScoreBodySchema = z.object({ score: createScoreRecordSchema.omit({ timestamp: true }) }).describe("Arguments for creating a score");
 /** Schema for createScore operation response */
-const createScoreResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from creating a score");
-z$1.object({ scores: z$1.array(createScoreRecordSchema) }).describe("Arguments for batch recording scores");
+const createScoreResponseSchema = z.object({ success: z.boolean() }).describe("Response from creating a score");
+z.object({ scores: z.array(createScoreRecordSchema) }).describe("Arguments for batch recording scores");
 const DELETE_SCORES_MAX_IDS = 1e3;
 /** Schema for deleteScores operation arguments */
-const deleteScoresArgsSchema = z$1.object({
-	scoreIds: z$1.array(z$1.string()).max(DELETE_SCORES_MAX_IDS).describe(`IDs of the score events to delete (maximum ${DELETE_SCORES_MAX_IDS})`),
+const deleteScoresArgsSchema = z.object({
+	scoreIds: z.array(z.string()).max(DELETE_SCORES_MAX_IDS).describe(`IDs of the score events to delete (maximum ${DELETE_SCORES_MAX_IDS})`),
 	organizationId: organizationIdField.optional().describe("Restrict deletion to scores in this organization"),
 	resourceId: resourceIdField.optional().describe("Restrict deletion to scores for this resource")
 }).describe("Arguments for deleting scores by id");
 /** Schema for deleteScores operation response */
-const deleteScoresResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from deleting scores");
+const deleteScoresResponseSchema = z.object({ success: z.boolean() }).describe("Response from deleting scores");
 /** Schema for filtering scores in list queries */
-const scoresFilterSchema = z$1.object({
+const scoresFilterSchema = z.object({
 	...commonFilterFields,
-	scorerId: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional().describe("Filter by scorer ID(s)"),
+	scorerId: z.union([z.string(), z.array(z.string())]).optional().describe("Filter by scorer ID(s)"),
 	scoreSource: scoreSourceField.optional().describe("Filter by how the score was produced"),
 	metadata: metadataField.nullish().describe("Filter by metadata key-value pairs (exact match per key)"),
 	/**
@@ -29796,13 +30089,13 @@ const scoresFilterSchema = z$1.object({
 	source: scoreSourceField.optional().describe("Filter by how the score was produced")
 }).describe("Filters for querying scores");
 /** Fields available for ordering score results */
-const scoresOrderByFieldSchema = z$1.enum(["timestamp", "score"]).describe("Field to order by: 'timestamp' | 'score'");
+const scoresOrderByFieldSchema = z.enum(["timestamp", "score"]).describe("Field to order by: 'timestamp' | 'score'");
 /** Order by configuration for score queries */
-const scoresOrderBySchema = z$1.object({
+const scoresOrderBySchema = z.object({
 	field: scoresOrderByFieldSchema.default("timestamp").describe("Field to order by"),
 	direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
 	mode: listModeSchema.optional(),
 	filters: scoresFilterSchema.optional(),
 	pagination: paginationArgsSchema.optional(),
@@ -29814,32 +30107,32 @@ z$1.object({
 	direction: "DESC"
 } })).describe("Arguments for listing scores");
 /** Schema for listScores operation response */
-const listScoresResponseSchema = z$1.object({
+const listScoresResponseSchema = z.object({
 	pagination: paginationInfoSchema.optional(),
 	delta: deltaInfoSchema.optional(),
 	deltaCursor: deltaCursorSchema.optional(),
-	scores: z$1.array(scoreRecordSchema)
+	scores: z.array(scoreRecordSchema)
 }).describe("Response from listing scores");
-const getScoreAggregateArgsSchema = z$1.object({
+const getScoreAggregateArgsSchema = z.object({
 	scorerId: scorerIdField,
 	scoreSource: scoreSourceField.optional(),
 	aggregation: aggregationTypeSchema,
 	filters: scoresFilterSchema.optional(),
 	comparePeriod: comparePeriodSchema.optional()
 }).describe("Arguments for getting a score aggregate");
-const getScoreAggregateResponseSchema = z$1.object(aggregateResponseFields);
-const getScoreBreakdownArgsSchema = z$1.object({
+const getScoreAggregateResponseSchema = z.object(aggregateResponseFields);
+const getScoreBreakdownArgsSchema = z.object({
 	scorerId: scorerIdField,
 	scoreSource: scoreSourceField.optional(),
 	groupBy: groupBySchema,
 	aggregation: aggregationTypeSchema,
 	filters: scoresFilterSchema.optional()
 }).describe("Arguments for getting a score breakdown");
-const getScoreBreakdownResponseSchema = z$1.object({ groups: z$1.array(z$1.object({
+const getScoreBreakdownResponseSchema = z.object({ groups: z.array(z.object({
 	dimensions: dimensionsField,
 	value: aggregatedValueField
 })) });
-const getScoreTimeSeriesArgsSchema = z$1.object({
+const getScoreTimeSeriesArgsSchema = z.object({
 	scorerId: scorerIdField,
 	scoreSource: scoreSourceField.optional(),
 	interval: aggregationIntervalSchema,
@@ -29847,33 +30140,33 @@ const getScoreTimeSeriesArgsSchema = z$1.object({
 	filters: scoresFilterSchema.optional(),
 	groupBy: groupBySchema.optional()
 }).describe("Arguments for getting score time series");
-const getScoreTimeSeriesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
-	name: z$1.string().describe("Series name (scorer ID or group key)"),
-	points: z$1.array(z$1.object({
+const getScoreTimeSeriesResponseSchema = z.object({ series: z.array(z.object({
+	name: z.string().describe("Series name (scorer ID or group key)"),
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: aggregatedValueField
 	}))
 })) });
-const getScorePercentilesArgsSchema = z$1.object({
+const getScorePercentilesArgsSchema = z.object({
 	scorerId: scorerIdField,
 	scoreSource: scoreSourceField.optional(),
 	percentiles: percentilesSchema,
 	interval: aggregationIntervalSchema,
 	filters: scoresFilterSchema.optional()
 }).describe("Arguments for getting score percentiles");
-const getScorePercentilesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
+const getScorePercentilesResponseSchema = z.object({ series: z.array(z.object({
 	percentile: percentileField,
-	points: z$1.array(z$1.object({
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: percentileBucketValueField
 	}))
 })) });
-const feedbackSourceField = z$1.string().describe("Source of feedback (e.g., 'user', 'system', 'manual')");
-const feedbackTypeField = z$1.string().describe("Type of feedback (e.g., 'thumbs', 'rating', 'correction')");
-const feedbackValueField = z$1.union([z$1.number(), z$1.string()]).describe("Feedback value (rating number or correction text)");
-const feedbackCommentField = z$1.string().describe("Additional comment or context");
-const feedbackUserIdField = z$1.string().describe("User who provided the feedback");
-const feedbackReviewStatusSchema = z$1.enum(["needs-review", "reviewed"]);
+const feedbackSourceField = z.string().describe("Source of feedback (e.g., 'user', 'system', 'manual')");
+const feedbackTypeField = z.string().describe("Type of feedback (e.g., 'thumbs', 'rating', 'correction')");
+const feedbackValueField = z.union([z.number(), z.string()]).describe("Feedback value (rating number or correction text)");
+const feedbackCommentField = z.string().describe("Additional comment or context");
+const feedbackUserIdField = z.string().describe("User who provided the feedback");
+const feedbackReviewStatusSchema = z.enum(["needs-review", "reviewed"]);
 function normalizeLegacyFeedbackActor(input) {
 	if (!input || typeof input !== "object" || Array.isArray(input)) return input;
 	const record = { ...input };
@@ -29887,9 +30180,9 @@ function normalizeLegacyFeedbackActor(input) {
 * Schema for feedback as stored in the database.
 * Includes all fields from ExportedFeedback plus storage-specific fields.
 */
-const feedbackRecordObjectSchema = z$1.object({
-	feedbackId: z$1.string().nullish().describe("Unique id for this feedback event"),
-	timestamp: z$1.date().describe("When the feedback was recorded"),
+const feedbackRecordObjectSchema = z.object({
+	feedbackId: z.string().nullish().describe("Unique id for this feedback event"),
+	timestamp: z.date().describe("When the feedback was recorded"),
 	traceId: traceIdField.nullish().describe("Trace that anchors the feedback target when available"),
 	spanId: spanIdField.nullish().describe("Span ID this feedback applies to"),
 	feedbackSource: feedbackSourceField.nullish(),
@@ -29902,18 +30195,18 @@ const feedbackRecordObjectSchema = z$1.object({
 	comment: feedbackCommentField.nullish(),
 	feedbackUserId: feedbackUserIdField.nullish(),
 	...contextFields,
-	sourceId: z$1.string().nullish().describe("ID of the source record this feedback is linked to (e.g. experiment result ID)"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).nullish().describe("User-defined metadata"),
+	sourceId: z.string().nullish().describe("ID of the source record this feedback is linked to (e.g. experiment result ID)"),
+	metadata: z.record(z.string(), z.unknown()).nullish().describe("User-defined metadata"),
 	reviewStatus: feedbackReviewStatusSchema.describe("Feedback review workflow status")
 });
 /** Feedback record fields accepted on creation: `reviewStatus` is optional and defaults to `needs-review` in storage */
 const createFeedbackRecordObjectSchema = feedbackRecordObjectSchema.extend({ reviewStatus: feedbackReviewStatusSchema.optional().describe("Feedback review workflow status") });
-const feedbackRecordSchema = z$1.object(feedbackRecordObjectSchema.shape).describe("Feedback record as stored in the database");
+const feedbackRecordSchema = z.object(feedbackRecordObjectSchema.shape).describe("Feedback record as stored in the database");
 /**
 * Schema for user-provided feedback input (minimal required fields).
 * The span/trace context adds traceId/spanId before emitting ExportedFeedback.
 */
-const feedbackInputObjectSchema = z$1.object({
+const feedbackInputObjectSchema = z.object({
 	feedbackSource: feedbackSourceField.optional(),
 	/**
 	* @deprecated Use `feedbackSource` instead.
@@ -29927,35 +30220,35 @@ const feedbackInputObjectSchema = z$1.object({
 	* @deprecated Use `feedbackUserId` instead.
 	*/
 	userId: feedbackUserIdField.optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional feedback-specific metadata"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional feedback-specific metadata"),
 	experimentId: experimentIdField.optional(),
-	sourceId: z$1.string().optional().describe("ID of the source record this feedback is linked to")
+	sourceId: z.string().optional().describe("ID of the source record this feedback is linked to")
 });
-z$1.object(feedbackInputObjectSchema.shape).describe("User-provided feedback input");
-z$1.object(createFeedbackRecordObjectSchema.shape).describe("Feedback record accepted on creation");
-z$1.object({ feedback: z$1.preprocess(normalizeLegacyFeedbackActor, createFeedbackRecordObjectSchema) }).describe("Arguments for creating feedback");
+z.object(feedbackInputObjectSchema.shape).describe("User-provided feedback input");
+z.object(createFeedbackRecordObjectSchema.shape).describe("Feedback record accepted on creation");
+z.object({ feedback: z.preprocess(normalizeLegacyFeedbackActor, createFeedbackRecordObjectSchema) }).describe("Arguments for creating feedback");
 /** Schema for createFeedback operation body in client/server */
-const createFeedbackBodySchema = z$1.object({ feedback: createFeedbackRecordObjectSchema.omit({ timestamp: true }) }).describe("Arguments for creating feedback");
+const createFeedbackBodySchema = z.object({ feedback: createFeedbackRecordObjectSchema.omit({ timestamp: true }) }).describe("Arguments for creating feedback");
 /** Schema for createFeedback operation response */
-const createFeedbackResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from creating feedback");
-z$1.object({ feedbacks: z$1.array(z$1.preprocess(normalizeLegacyFeedbackActor, createFeedbackRecordObjectSchema)) }).describe("Arguments for batch recording feedback");
-z$1.object({
-	feedbackId: z$1.string(),
+const createFeedbackResponseSchema = z.object({ success: z.boolean() }).describe("Response from creating feedback");
+z.object({ feedbacks: z.array(z.preprocess(normalizeLegacyFeedbackActor, createFeedbackRecordObjectSchema)) }).describe("Arguments for batch recording feedback");
+z.object({
+	feedbackId: z.string(),
 	reviewStatus: feedbackReviewStatusSchema
 }).describe("Arguments for updating a feedback record's review status");
 const DELETE_FEEDBACK_MAX_IDS = 1e3;
 /** Schema for deleteFeedback operation arguments */
-const deleteFeedbackArgsSchema = z$1.object({
-	feedbackIds: z$1.array(z$1.string()).max(DELETE_FEEDBACK_MAX_IDS).describe(`IDs of the feedback events to delete (maximum ${DELETE_FEEDBACK_MAX_IDS})`),
+const deleteFeedbackArgsSchema = z.object({
+	feedbackIds: z.array(z.string()).max(DELETE_FEEDBACK_MAX_IDS).describe(`IDs of the feedback events to delete (maximum ${DELETE_FEEDBACK_MAX_IDS})`),
 	organizationId: organizationIdField.optional().describe("Restrict deletion to feedback in this organization"),
 	resourceId: resourceIdField.optional().describe("Restrict deletion to feedback for this resource")
 }).describe("Arguments for deleting feedback by id");
 /** Schema for deleteFeedback operation response */
-const deleteFeedbackResponseSchema = z$1.object({ success: z$1.boolean() }).describe("Response from deleting feedback");
+const deleteFeedbackResponseSchema = z.object({ success: z.boolean() }).describe("Response from deleting feedback");
 /** Schema for filtering feedback in list queries */
-const feedbackFilterObjectSchema = z$1.object({
+const feedbackFilterObjectSchema = z.object({
 	...commonFilterFields,
-	feedbackType: z$1.union([z$1.string(), z$1.array(z$1.string())]).optional().describe("Filter by feedback type(s)"),
+	feedbackType: z.union([z.string(), z.array(z.string())]).optional().describe("Filter by feedback type(s)"),
 	feedbackSource: feedbackSourceField.optional(),
 	/**
 	* @deprecated Use `feedbackSource` instead.
@@ -29964,17 +30257,17 @@ const feedbackFilterObjectSchema = z$1.object({
 	feedbackUserId: feedbackUserIdField.optional(),
 	reviewStatus: feedbackReviewStatusSchema.optional()
 });
-const feedbackFilterSchema = z$1.object(feedbackFilterObjectSchema.shape).describe("Filters for querying feedback");
+const feedbackFilterSchema = z.object(feedbackFilterObjectSchema.shape).describe("Filters for querying feedback");
 /** Fields available for ordering feedback results */
-const feedbackOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+const feedbackOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
 /** Order by configuration for feedback queries */
-const feedbackOrderBySchema = z$1.object({
+const feedbackOrderBySchema = z.object({
 	field: feedbackOrderByFieldSchema.default("timestamp").describe("Field to order by"),
 	direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
 	mode: listModeSchema.optional(),
-	filters: z$1.preprocess(normalizeLegacyFeedbackActor, feedbackFilterObjectSchema).optional(),
+	filters: z.preprocess(normalizeLegacyFeedbackActor, feedbackFilterObjectSchema).optional(),
 	pagination: paginationArgsSchema.optional(),
 	orderBy: feedbackOrderBySchema.optional(),
 	after: deltaCursorSchema.optional(),
@@ -29984,32 +30277,32 @@ z$1.object({
 	direction: "DESC"
 } })).describe("Arguments for listing feedback");
 /** Schema for listFeedback operation response */
-const listFeedbackResponseSchema$1 = z$1.object({
+const listFeedbackResponseSchema$1 = z.object({
 	pagination: paginationInfoSchema.optional(),
 	delta: deltaInfoSchema.optional(),
 	deltaCursor: deltaCursorSchema.optional(),
-	feedback: z$1.array(feedbackRecordSchema)
+	feedback: z.array(feedbackRecordSchema)
 }).describe("Response from listing feedback");
-const getFeedbackAggregateArgsSchema = z$1.object({
+const getFeedbackAggregateArgsSchema = z.object({
 	feedbackType: feedbackTypeField,
 	feedbackSource: feedbackSourceField.optional(),
 	aggregation: aggregationTypeSchema,
 	filters: feedbackFilterSchema.optional(),
 	comparePeriod: comparePeriodSchema.optional()
 }).describe("Arguments for getting a feedback aggregate over numeric values");
-const getFeedbackAggregateResponseSchema = z$1.object(aggregateResponseFields);
-const getFeedbackBreakdownArgsSchema = z$1.object({
+const getFeedbackAggregateResponseSchema = z.object(aggregateResponseFields);
+const getFeedbackBreakdownArgsSchema = z.object({
 	feedbackType: feedbackTypeField,
 	feedbackSource: feedbackSourceField.optional(),
 	groupBy: groupBySchema,
 	aggregation: aggregationTypeSchema,
 	filters: feedbackFilterSchema.optional()
 }).describe("Arguments for getting a feedback breakdown over numeric values");
-const getFeedbackBreakdownResponseSchema = z$1.object({ groups: z$1.array(z$1.object({
+const getFeedbackBreakdownResponseSchema = z.object({ groups: z.array(z.object({
 	dimensions: dimensionsField,
 	value: aggregatedValueField
 })) });
-const getFeedbackTimeSeriesArgsSchema = z$1.object({
+const getFeedbackTimeSeriesArgsSchema = z.object({
 	feedbackType: feedbackTypeField,
 	feedbackSource: feedbackSourceField.optional(),
 	interval: aggregationIntervalSchema,
@@ -30017,47 +30310,47 @@ const getFeedbackTimeSeriesArgsSchema = z$1.object({
 	filters: feedbackFilterSchema.optional(),
 	groupBy: groupBySchema.optional()
 }).describe("Arguments for getting feedback time series over numeric values");
-const getFeedbackTimeSeriesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
-	name: z$1.string().describe("Series name (feedback type or group key)"),
-	points: z$1.array(z$1.object({
+const getFeedbackTimeSeriesResponseSchema = z.object({ series: z.array(z.object({
+	name: z.string().describe("Series name (feedback type or group key)"),
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: aggregatedValueField
 	}))
 })) });
-const getFeedbackPercentilesArgsSchema = z$1.object({
+const getFeedbackPercentilesArgsSchema = z.object({
 	feedbackType: feedbackTypeField,
 	feedbackSource: feedbackSourceField.optional(),
 	percentiles: percentilesSchema,
 	interval: aggregationIntervalSchema,
 	filters: feedbackFilterSchema.optional()
 }).describe("Arguments for getting feedback percentiles over numeric values");
-const getFeedbackPercentilesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
+const getFeedbackPercentilesResponseSchema = z.object({ series: z.array(z.object({
 	percentile: percentileField,
-	points: z$1.array(z$1.object({
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: percentileBucketValueField
 	}))
 })) });
-z$1.enum([
+z.enum([
 	"counter",
 	"gauge",
 	"histogram"
 ]);
-const metricNameField = z$1.string().describe("Metric name (e.g., mastra_agent_duration_ms)");
-const metricValueField = z$1.number().describe("Metric value");
-const labelsField = z$1.record(z$1.string(), z$1.string()).describe("Metric labels for dimensional filtering");
-const providerField = z$1.string().describe("Model provider");
-const modelField = z$1.string().describe("Model");
-const estimatedCostField = z$1.number().describe("Estimated cost");
-const costUnitField = z$1.string().describe("Unit for the estimated cost (e.g., usd)");
-const costMetadField = z$1.record(z$1.string(), z$1.unknown()).nullish().describe("Structured costing metadata");
+const metricNameField = z.string().describe("Metric name (e.g., mastra_agent_duration_ms)");
+const metricValueField = z.number().describe("Metric value");
+const labelsField = z.record(z.string(), z.string()).describe("Metric labels for dimensional filtering");
+const providerField = z.string().describe("Model provider");
+const modelField = z.string().describe("Model");
+const estimatedCostField = z.number().describe("Estimated cost");
+const costUnitField = z.string().describe("Unit for the estimated cost (e.g., usd)");
+const costMetadField = z.record(z.string(), z.unknown()).nullish().describe("Structured costing metadata");
 /**
 * Schema for metrics as stored in the database.
 * Each record is a single metric observation.
 */
-const metricRecordSchema = z$1.object({
-	metricId: z$1.string().nullish().describe("Unique id for this metric event"),
-	timestamp: z$1.date().describe("When the metric was recorded"),
+const metricRecordSchema = z.object({
+	metricId: z.string().nullish().describe("Unique id for this metric event"),
+	timestamp: z.date().describe("When the metric was recorded"),
 	name: metricNameField,
 	value: metricValueField,
 	traceId: traceIdField.nullish(),
@@ -30066,7 +30359,7 @@ const metricRecordSchema = z$1.object({
 	/**
 	* @deprecated Use `executionSource` instead.
 	*/
-	source: z$1.string().nullish().describe("Execution source"),
+	source: z.string().nullish().describe("Execution source"),
 	provider: providerField.nullish(),
 	model: modelField.nullish(),
 	estimatedCost: estimatedCostField.nullish(),
@@ -30075,41 +30368,41 @@ const metricRecordSchema = z$1.object({
 	labels: labelsField.default({}),
 	metadata: metadataField.nullish()
 }).describe("Metric record as stored in the database");
-z$1.object({
+z.object({
 	name: metricNameField,
 	value: metricValueField,
 	labels: labelsField.optional()
 }).describe("User-provided metric input");
 /** Schema for creating a metric record (without db timestamps) */
 const createMetricRecordSchema = metricRecordSchema;
-z$1.object({ metrics: z$1.array(createMetricRecordSchema) }).describe("Arguments for batch recording metrics");
-z$1.object({
+z.object({ metrics: z.array(createMetricRecordSchema) }).describe("Arguments for batch recording metrics");
+z.object({
 	type: aggregationTypeSchema,
 	interval: aggregationIntervalSchema.optional(),
 	groupBy: groupBySchema.optional()
 }).describe("Metrics aggregation configuration");
 /** Schema for filtering metrics in queries */
-const metricsFilterSchema = z$1.object({
+const metricsFilterSchema = z.object({
 	...commonFilterFields,
-	traceIds: z$1.array(traceIdField).nonempty().max(1e3).optional().describe("Filter by one or more trace IDs"),
-	name: z$1.array(z$1.string()).nonempty().optional().describe("Filter by metric name(s)"),
+	traceIds: z.array(traceIdField).nonempty().max(1e3).optional().describe("Filter by one or more trace IDs"),
+	name: z.array(z.string()).nonempty().optional().describe("Filter by metric name(s)"),
 	/**
 	* @deprecated Use `executionSource` instead.
 	*/
-	source: z$1.string().optional().describe("Filter by execution source"),
+	source: z.string().optional().describe("Filter by execution source"),
 	provider: providerField.optional(),
 	model: modelField.optional(),
 	costUnit: costUnitField.optional(),
-	labels: z$1.record(z$1.string(), z$1.string()).optional().describe("Exact match on label key-value pairs")
+	labels: z.record(z.string(), z.string()).optional().describe("Exact match on label key-value pairs")
 }).describe("Filters for querying metrics");
 /** Fields available for ordering metric list results */
-const metricsOrderByFieldSchema = z$1.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
+const metricsOrderByFieldSchema = z.enum(["timestamp"]).describe("Field to order by: 'timestamp'");
 /** Order by configuration for metric list queries */
-const metricsOrderBySchema = z$1.object({
+const metricsOrderBySchema = z.object({
 	field: metricsOrderByFieldSchema.default("timestamp").describe("Field to order by"),
 	direction: sortDirectionSchema.default("DESC").describe("Sort direction")
 }).describe("Order by configuration");
-z$1.object({
+z.object({
 	mode: listModeSchema.optional(),
 	filters: metricsFilterSchema.optional(),
 	pagination: paginationArgsSchema.optional(),
@@ -30121,13 +30414,13 @@ z$1.object({
 	direction: "DESC"
 } })).describe("Arguments for listing metrics");
 /** Schema for listMetrics operation response */
-const listMetricsResponseSchema = z$1.object({
+const listMetricsResponseSchema = z.object({
 	pagination: paginationInfoSchema.optional(),
 	delta: deltaInfoSchema.optional(),
 	deltaCursor: deltaCursorSchema.optional(),
-	metrics: z$1.array(metricRecordSchema)
+	metrics: z.array(metricRecordSchema)
 }).describe("Response from listing metrics");
-const distinctColumnSchema = z$1.enum([
+const distinctColumnSchema = z.enum([
 	"entityType",
 	"entityName",
 	"parentEntityType",
@@ -30150,96 +30443,96 @@ const requireDistinctColumnRefinement = {
 		path: ["distinctColumn"]
 	}
 };
-const getMetricAggregateArgsSchema = z$1.object({
-	name: z$1.array(z$1.string()).nonempty().describe("Metric name(s) to aggregate"),
+const getMetricAggregateArgsSchema = z.object({
+	name: z.array(z.string()).nonempty().describe("Metric name(s) to aggregate"),
 	aggregation: aggregationTypeSchema,
 	distinctColumn: distinctColumnSchema,
 	filters: metricsFilterSchema.optional(),
 	comparePeriod: comparePeriodSchema.optional()
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting a metric aggregate");
-const getMetricAggregateResponseSchema = z$1.object({
+const getMetricAggregateResponseSchema = z.object({
 	...aggregateResponseFields,
-	estimatedCost: z$1.number().nullable().optional().describe("Aggregated estimated cost from the same filtered row set"),
-	costUnit: z$1.string().nullable().optional().describe("Shared cost unit for the aggregated rows, or null when mixed/unknown"),
-	previousEstimatedCost: z$1.number().nullable().optional().describe("Aggregated estimated cost from the comparison period"),
-	costChangePercent: z$1.number().nullable().optional().describe("Percentage change in estimated cost from comparison period")
+	estimatedCost: z.number().nullable().optional().describe("Aggregated estimated cost from the same filtered row set"),
+	costUnit: z.string().nullable().optional().describe("Shared cost unit for the aggregated rows, or null when mixed/unknown"),
+	previousEstimatedCost: z.number().nullable().optional().describe("Aggregated estimated cost from the comparison period"),
+	costChangePercent: z.number().nullable().optional().describe("Percentage change in estimated cost from comparison period")
 });
-const getMetricBreakdownArgsSchema = z$1.object({
-	name: z$1.array(z$1.string()).nonempty().describe("Metric name(s) to break down"),
+const getMetricBreakdownArgsSchema = z.object({
+	name: z.array(z.string()).nonempty().describe("Metric name(s) to break down"),
 	groupBy: groupBySchema,
 	aggregation: aggregationTypeSchema,
 	distinctColumn: distinctColumnSchema,
 	filters: metricsFilterSchema.optional(),
-	limit: z$1.number().int().positive().max(1e3).optional().describe("Maximum number of groups to return (server-side TopK). Required for high-cardinality groupBy."),
+	limit: z.number().int().positive().max(1e3).optional().describe("Maximum number of groups to return (server-side TopK). Required for high-cardinality groupBy."),
 	orderDirection: sortDirectionSchema.optional().describe("Sort direction for the aggregated value (defaults to 'DESC' at the storage layer; pairs with limit for top/bottom-N).")
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting a metric breakdown");
-const getMetricBreakdownResponseSchema = z$1.object({ groups: z$1.array(z$1.object({
+const getMetricBreakdownResponseSchema = z.object({ groups: z.array(z.object({
 	dimensions: dimensionsField,
 	value: aggregatedValueField,
-	estimatedCost: z$1.number().nullable().optional().describe("Summed estimated cost for this group"),
-	costUnit: z$1.string().nullable().optional().describe("Shared cost unit for this group, or null when mixed/unknown")
+	estimatedCost: z.number().nullable().optional().describe("Summed estimated cost for this group"),
+	costUnit: z.string().nullable().optional().describe("Shared cost unit for this group, or null when mixed/unknown")
 })) });
-const getMetricTimeSeriesArgsSchema = z$1.object({
-	name: z$1.array(z$1.string()).nonempty().describe("Metric name(s)"),
+const getMetricTimeSeriesArgsSchema = z.object({
+	name: z.array(z.string()).nonempty().describe("Metric name(s)"),
 	interval: aggregationIntervalSchema,
 	aggregation: aggregationTypeSchema,
 	distinctColumn: distinctColumnSchema,
 	filters: metricsFilterSchema.optional(),
 	groupBy: groupBySchema.optional()
 }).refine(requireDistinctColumnRefinement.check, requireDistinctColumnRefinement.options).describe("Arguments for getting metric time series");
-const getMetricTimeSeriesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
-	name: z$1.string().describe("Series name (metric name or group key)"),
-	costUnit: z$1.string().nullable().optional().describe("Shared cost unit for this series, or null when mixed/unknown"),
-	points: z$1.array(z$1.object({
+const getMetricTimeSeriesResponseSchema = z.object({ series: z.array(z.object({
+	name: z.string().describe("Series name (metric name or group key)"),
+	costUnit: z.string().nullable().optional().describe("Shared cost unit for this series, or null when mixed/unknown"),
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: aggregatedValueField,
-		estimatedCost: z$1.number().nullable().optional().describe("Summed estimated cost in this bucket")
+		estimatedCost: z.number().nullable().optional().describe("Summed estimated cost in this bucket")
 	}))
 })) });
-const getMetricPercentilesArgsSchema = z$1.object({
-	name: z$1.string().describe("Metric name"),
+const getMetricPercentilesArgsSchema = z.object({
+	name: z.string().describe("Metric name"),
 	percentiles: percentilesSchema,
 	interval: aggregationIntervalSchema,
 	filters: metricsFilterSchema.optional()
 }).describe("Arguments for getting metric percentiles");
-const getMetricPercentilesResponseSchema = z$1.object({ series: z$1.array(z$1.object({
+const getMetricPercentilesResponseSchema = z.object({ series: z.array(z.object({
 	percentile: percentileField,
-	points: z$1.array(z$1.object({
+	points: z.array(z.object({
 		timestamp: bucketTimestampField,
 		value: percentileBucketValueField
 	}))
 })) });
-const getMetricNamesArgsSchema = z$1.object({
-	prefix: z$1.string().optional().describe("Filter metric names by prefix"),
-	limit: z$1.coerce.number().int().min(1).optional().describe("Maximum number of names to return")
+const getMetricNamesArgsSchema = z.object({
+	prefix: z.string().optional().describe("Filter metric names by prefix"),
+	limit: z.coerce.number().int().min(1).optional().describe("Maximum number of names to return")
 }).describe("Arguments for getting metric names");
-const getMetricNamesResponseSchema = z$1.object({ names: z$1.array(z$1.string()).describe("Distinct metric names") });
-const getMetricLabelKeysArgsSchema = z$1.object({ metricName: z$1.string().describe("Metric name to get label keys for") }).describe("Arguments for getting metric label keys");
-const getMetricLabelKeysResponseSchema = z$1.object({ keys: z$1.array(z$1.string()).describe("Distinct label keys for the metric") });
-const getMetricLabelValuesArgsSchema = z$1.object({
-	metricName: z$1.string().describe("Metric name"),
-	labelKey: z$1.string().describe("Label key to get values for"),
-	prefix: z$1.string().optional().describe("Filter values by prefix"),
-	limit: z$1.coerce.number().int().min(1).optional().describe("Maximum number of values to return")
+const getMetricNamesResponseSchema = z.object({ names: z.array(z.string()).describe("Distinct metric names") });
+const getMetricLabelKeysArgsSchema = z.object({ metricName: z.string().describe("Metric name to get label keys for") }).describe("Arguments for getting metric label keys");
+const getMetricLabelKeysResponseSchema = z.object({ keys: z.array(z.string()).describe("Distinct label keys for the metric") });
+const getMetricLabelValuesArgsSchema = z.object({
+	metricName: z.string().describe("Metric name"),
+	labelKey: z.string().describe("Label key to get values for"),
+	prefix: z.string().optional().describe("Filter values by prefix"),
+	limit: z.coerce.number().int().min(1).optional().describe("Maximum number of values to return")
 }).describe("Arguments for getting label values");
-const getMetricLabelValuesResponseSchema = z$1.object({ values: z$1.array(z$1.string()).describe("Distinct label values") });
-z$1.object({}).describe("Arguments for getting entity types");
-const getEntityTypesResponseSchema = z$1.object({ entityTypes: z$1.array(entityTypeField).describe("Distinct entity types") });
-const getEntityNamesArgsSchema = z$1.object({ entityType: entityTypeField.optional().describe("Optional entity type filter") }).describe("Arguments for getting entity names");
-const getEntityNamesResponseSchema = z$1.object({ names: z$1.array(z$1.string()).describe("Distinct entity names") });
-z$1.object({}).describe("Arguments for getting service names");
-const getServiceNamesResponseSchema = z$1.object({ serviceNames: z$1.array(z$1.string()).describe("Distinct service names") });
-z$1.object({}).describe("Arguments for getting environments");
-const getEnvironmentsResponseSchema = z$1.object({ environments: z$1.array(z$1.string()).describe("Distinct environments") });
-const getTagsArgsSchema = z$1.object({ entityType: entityTypeField.optional().describe("Optional entity type filter") }).describe("Arguments for getting tags");
-const getTagsResponseSchema = z$1.object({ tags: z$1.array(z$1.string()).describe("Distinct tags") });
+const getMetricLabelValuesResponseSchema = z.object({ values: z.array(z.string()).describe("Distinct label values") });
+z.object({}).describe("Arguments for getting entity types");
+const getEntityTypesResponseSchema = z.object({ entityTypes: z.array(entityTypeField).describe("Distinct entity types") });
+const getEntityNamesArgsSchema = z.object({ entityType: entityTypeField.optional().describe("Optional entity type filter") }).describe("Arguments for getting entity names");
+const getEntityNamesResponseSchema = z.object({ names: z.array(z.string()).describe("Distinct entity names") });
+z.object({}).describe("Arguments for getting service names");
+const getServiceNamesResponseSchema = z.object({ serviceNames: z.array(z.string()).describe("Distinct service names") });
+z.object({}).describe("Arguments for getting environments");
+const getEnvironmentsResponseSchema = z.object({ environments: z.array(z.string()).describe("Distinct environments") });
+const getTagsArgsSchema = z.object({ entityType: entityTypeField.optional().describe("Optional entity type filter") }).describe("Arguments for getting tags");
+const getTagsResponseSchema = z.object({ tags: z.array(z.string()).describe("Distinct tags") });
 //#endregion
 //#region src/server/schemas/feedback.ts
-const listFeedbackResponseSchema = listFeedbackResponseSchema$1.extend({ feedback: z$1.array(feedbackRecordSchema.extend({ author: z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional(),
-	email: z$1.string().optional(),
-	avatarUrl: z$1.string().optional()
+const listFeedbackResponseSchema = listFeedbackResponseSchema$1.extend({ feedback: z.array(feedbackRecordSchema.extend({ author: z.object({
+	id: z.string(),
+	name: z.string().optional(),
+	email: z.string().optional(),
+	avatarUrl: z.string().optional()
 }).optional() })) });
 //#endregion
 //#region src/server/handlers/observability-new-endpoints.ts
@@ -30262,39 +30555,39 @@ function createNewRoute(def, config) {
 		})
 	});
 }
-const traceQueryMalformedBodyErrorSchema = z$1.object({
-	error: z$1.literal("Invalid request body"),
-	issues: z$1.array(z$1.object({
-		field: z$1.literal("body"),
-		message: z$1.string()
+const traceQueryMalformedBodyErrorSchema = z.object({
+	error: z.literal("Invalid request body"),
+	issues: z.array(z.object({
+		field: z.literal("body"),
+		message: z.string()
 	}).strict())
 }).strict();
-const traceQueryBodyTooLargeErrorSchema = z$1.object({ error: z$1.literal("Request body too large") }).strict();
-const traceQueryMalformedCursorErrorSchema = z$1.object({
-	code: z$1.literal("TRACE_QUERY_CURSOR_MALFORMED"),
-	message: z$1.string()
+const traceQueryBodyTooLargeErrorSchema = z.object({ error: z.literal("Request body too large") }).strict();
+const traceQueryMalformedCursorErrorSchema = z.object({
+	code: z.literal("TRACE_QUERY_CURSOR_MALFORMED"),
+	message: z.string()
 }).strict();
-const traceQueryCursorConflictErrorSchema = z$1.object({
-	code: z$1.literal("TRACE_QUERY_CURSOR_CONFLICT"),
-	message: z$1.string()
+const traceQueryCursorConflictErrorSchema = z.object({
+	code: z.literal("TRACE_QUERY_CURSOR_CONFLICT"),
+	message: z.string()
 }).strict();
-const traceQueryValidationIssueSchema = z$1.object({
-	code: z$1.string(),
-	path: z$1.array(z$1.union([z$1.string(), z$1.number()])),
-	message: z$1.string()
+const traceQueryValidationIssueSchema = z.object({
+	code: z.string(),
+	path: z.array(z.union([z.string(), z.number()])),
+	message: z.string()
 }).strict();
-const traceQueryValidationResponseSchema = z$1.object({
-	code: z$1.literal("TRACE_QUERY_INVALID"),
-	message: z$1.string(),
-	issues: z$1.array(traceQueryValidationIssueSchema)
+const traceQueryValidationResponseSchema = z.object({
+	code: z.literal("TRACE_QUERY_INVALID"),
+	message: z.string(),
+	issues: z.array(traceQueryValidationIssueSchema)
 }).strict();
-const traceQueryUnsupportedErrorSchema = z$1.object({
-	code: z$1.literal("TRACE_QUERY_UNSUPPORTED"),
-	message: z$1.string()
+const traceQueryUnsupportedErrorSchema = z.object({
+	code: z.literal("TRACE_QUERY_UNSUPPORTED"),
+	message: z.string()
 }).strict();
-const traceQueryTimeoutErrorSchema = z$1.object({
-	code: z$1.literal("TRACE_QUERY_EXECUTION_TIMEOUT"),
-	message: z$1.string()
+const traceQueryTimeoutErrorSchema = z.object({
+	code: z.literal("TRACE_QUERY_EXECUTION_TIMEOUT"),
+	message: z.string()
 }).strict();
 const traceQueryValidationError = (error) => ({
 	status: 422,
@@ -30370,7 +30663,7 @@ const QUERY_TRACES = createNewRoute(NEW_ROUTE_DEFS.QUERY_TRACES, {
 if (QUERY_TRACES.openapi) {
 	QUERY_TRACES.openapi.responses[400] = {
 		description: "Malformed JSON or malformed cursor",
-		content: { "application/json": { schema: z$1.union([traceQueryMalformedBodyErrorSchema, traceQueryMalformedCursorErrorSchema]) } }
+		content: { "application/json": { schema: z.union([traceQueryMalformedBodyErrorSchema, traceQueryMalformedCursorErrorSchema]) } }
 	};
 	QUERY_TRACES.openapi.responses[409] = {
 		description: "Cursor does not match the normalized query",
@@ -30474,8 +30767,8 @@ const DELETE_SCORES = createNewRoute(NEW_ROUTE_DEFS.DELETE_SCORES, {
 	}
 });
 const GET_SCORE = createNewRoute(NEW_ROUTE_DEFS.GET_SCORE, {
-	pathParamSchema: z$1.object({ scoreId: z$1.string() }),
-	responseSchema: z$1.object({ score: scoreRecordSchema.nullable() }),
+	pathParamSchema: z.object({ scoreId: z.string() }),
+	responseSchema: z.object({ score: scoreRecordSchema.nullable() }),
 	handler: async ({ mastra, scoreId }) => {
 		return { score: await (await getObservabilityStore(mastra)).getScoreById(scoreId) ?? null };
 	}
@@ -30576,8 +30869,8 @@ const DELETE_FEEDBACK = createNewRoute(NEW_ROUTE_DEFS.DELETE_FEEDBACK, {
 	}
 });
 const UPDATE_FEEDBACK_REVIEW_STATUS = createNewRoute(NEW_ROUTE_DEFS.UPDATE_FEEDBACK_REVIEW_STATUS, {
-	pathParamSchema: z$1.object({ feedbackId: z$1.string() }),
-	bodySchema: z$1.object({ reviewStatus: feedbackReviewStatusSchema }),
+	pathParamSchema: z.object({ feedbackId: z.string() }),
+	bodySchema: z.object({ reviewStatus: feedbackReviewStatusSchema }),
 	responseSchema: feedbackRecordSchema,
 	handler: async ({ mastra, feedbackId, reviewStatus }) => {
 		return await (await getObservabilityStore(mastra)).updateFeedbackReviewStatus({
@@ -30771,14 +31064,14 @@ const GET_TAGS = createNewRoute(NEW_ROUTE_DEFS.GET_TAGS, {
 * and behaviour is identical to a direct named import.
 */
 const ns = coreStorage;
-const fallbackEmptyObject = z$1.object({});
-const fallbackBranchArgs = z$1.object({
-	traceId: z$1.unknown(),
-	spanId: z$1.unknown(),
-	depth: z$1.unknown()
+const fallbackEmptyObject = z.object({});
+const fallbackBranchArgs = z.object({
+	traceId: z.unknown(),
+	spanId: z.unknown(),
+	depth: z.unknown()
 });
-const fallbackSchema = z$1.unknown();
-const fallbackDeleteTracesArgs = z$1.object({ traceIds: z$1.array(z$1.string()).max(1e3) });
+const fallbackSchema = z.unknown();
+const fallbackDeleteTracesArgs = z.object({ traceIds: z.array(z.string()).max(1e3) });
 const branchesFilterSchema = ns.branchesFilterSchema ?? fallbackEmptyObject;
 const branchesOrderBySchema = ns.branchesOrderBySchema ?? fallbackEmptyObject;
 const getBranchArgsSchema = ns.getBranchArgsSchema ?? fallbackBranchArgs;
@@ -30786,16 +31079,16 @@ const listBranchesResponseSchema = ns.listBranchesResponseSchema ?? fallbackSche
 const getBranchResponseSchema = ns.getBranchResponseSchema ?? fallbackSchema;
 const listTracesLightResponseSchema = ns.listTracesLightResponseSchema ?? fallbackSchema;
 const batchDeleteTracesArgsSchema = ns.batchDeleteTracesArgsSchema ?? fallbackDeleteTracesArgs;
-const batchDeleteTracesResponseSchema = ns.batchDeleteTracesResponseSchema ?? z$1.object({ success: z$1.literal(true) });
+const batchDeleteTracesResponseSchema = ns.batchDeleteTracesResponseSchema ?? z.object({ success: z.literal(true) });
 
 /**
 * Legacy query parameters from the old API (main branch).
 * These are accepted for backward compatibility and transformed to new format.
 */
-const legacyQueryParamsSchema = z$1.object({
+const legacyQueryParamsSchema = z.object({
 	dateRange: dateRangeSchema.optional(),
-	name: z$1.string().optional(),
-	entityType: z$1.preprocess((val) => val === "workflow" ? "workflow_run" : val, z$1.string().optional())
+	name: z.string().optional(),
+	entityType: z.preprocess((val) => val === "workflow" ? "workflow_run" : val, z.string().optional())
 });
 /**
 * Transforms legacy query parameters to the new format.
@@ -30827,7 +31120,7 @@ function transformLegacyParams(params) {
 }
 const listTracesQueryParamSchema = createObservabilityListQuerySchema(tracesFilterSchema.extend({
 	...legacyQueryParamsSchema.shape,
-	entityType: z$1.preprocess((value) => value === "workflow" ? "workflow_run" : value, tracesFilterSchema.shape.entityType)
+	entityType: z.preprocess((value) => value === "workflow" ? "workflow_run" : value, tracesFilterSchema.shape.entityType)
 }), tracesOrderBySchema);
 /** Route: GET /observability/traces - paginated trace listing with filtering and sorting. */
 const LIST_TRACES_ROUTE = createRoute$1({
@@ -30981,7 +31274,7 @@ const GET_TRACE_ROUTE = createRoute$1({
 	path: "/observability/traces/:traceId",
 	responseType: "json",
 	pathParamSchema: getTraceArgsSchema,
-	responseSchema: getTraceResponseSchema.extend({ spans: z$1.array(traceSpanSchema) }),
+	responseSchema: getTraceResponseSchema.extend({ spans: z.array(traceSpanSchema) }),
 	summary: "Get AI trace by ID",
 	description: "Returns a complete AI trace with all spans by trace ID",
 	tags: ["Observability"],
@@ -31050,11 +31343,11 @@ const GET_TRACE_TRAJECTORY_ROUTE = createRoute$1({
 	path: "/observability/traces/:traceId/trajectory",
 	responseType: "json",
 	pathParamSchema: getTraceArgsSchema,
-	responseSchema: z$1.object({
-		steps: z$1.array(z$1.unknown()),
-		totalDurationMs: z$1.number().optional(),
-		rawOutput: z$1.unknown().optional(),
-		rawWorkflowResult: z$1.unknown().optional()
+	responseSchema: z.object({
+		steps: z.array(z.unknown()),
+		totalDurationMs: z.number().optional(),
+		rawOutput: z.unknown().optional(),
+		rawWorkflowResult: z.unknown().optional()
 	}),
 	summary: "Extract trajectory from trace",
 	description: "Extracts a structured trajectory (ordered steps) from a trace by analyzing its spans",
@@ -31761,33 +32054,33 @@ const DELETE_RESPONSE_ROUTE = createRoute$1({
 * Schema for sampling configuration
 * Using passthrough to allow various sampling config shapes
 */
-const scoringSamplingConfigSchema = z$1.object({});
+const scoringSamplingConfigSchema = z.object({});
 /**
 * Schema for MastraScorer config object
 */
-const mastraScorerConfigSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional(),
-	description: z$1.string(),
-	type: z$1.unknown().optional(),
-	judge: z$1.unknown().optional()
+const mastraScorerConfigSchema = z.object({
+	id: z.string(),
+	name: z.string().optional(),
+	description: z.string(),
+	type: z.unknown().optional(),
+	judge: z.unknown().optional()
 });
 /**
 * Schema for MastraScorer
 * Only validates public config property, uses passthrough to allow class instance
 */
-const mastraScorerSchema = z$1.object({ config: mastraScorerConfigSchema });
+const mastraScorerSchema = z.object({ config: mastraScorerConfigSchema });
 /**
 * Schema for scorer entry with associations to agents and workflows
 */
-const scorerEntrySchema = z$1.object({
+const scorerEntrySchema = z.object({
 	scorer: mastraScorerSchema,
 	sampling: scoringSamplingConfigSchema.optional(),
-	agentIds: z$1.array(z$1.string()),
-	agentNames: z$1.array(z$1.string()),
-	workflowIds: z$1.array(z$1.string()),
-	isRegistered: z$1.boolean(),
-	source: z$1.enum([
+	agentIds: z.array(z.string()),
+	agentNames: z.array(z.string()),
+	workflowIds: z.array(z.string()),
+	isRegistered: z.boolean(),
+	source: z.enum([
 		"code",
 		"stored",
 		"fs"
@@ -31797,24 +32090,24 @@ const scorerEntrySchema = z$1.object({
 * Response schema for list scorers endpoint
 * Returns a record of scorer ID to scorer entry with associations
 */
-const listScorersResponseSchema = z$1.record(z$1.string(), scorerEntrySchema);
-const scorerIdPathParams = z$1.object({ scorerId: z$1.string().describe("Unique identifier for the scorer") });
-const entityPathParams = z$1.object({
-	entityType: z$1.string().describe("Type of the entity (AGENT or WORKFLOW)"),
-	entityId: z$1.string().describe("Unique identifier for the entity")
+const listScorersResponseSchema = z.record(z.string(), scorerEntrySchema);
+const scorerIdPathParams = z.object({ scorerId: z.string().describe("Unique identifier for the scorer") });
+const entityPathParams = z.object({
+	entityType: z.string().describe("Type of the entity (AGENT or WORKFLOW)"),
+	entityId: z.string().describe("Unique identifier for the entity")
 });
 const listScoresByRunIdQuerySchema = createPagePaginationSchema(10);
 const listScoresByScorerIdQuerySchema = createPagePaginationSchema(10).extend({
-	entityId: z$1.string().optional(),
-	entityType: z$1.string().optional()
+	entityId: z.string().optional(),
+	entityType: z.string().optional()
 });
 const listScoresByEntityIdQuerySchema = createPagePaginationSchema(10);
-const saveScoreBodySchema = z$1.object({ score: z$1.unknown() });
-const scoresWithPaginationResponseSchema = z$1.object({
+const saveScoreBodySchema = z.object({ score: z.unknown() });
+const scoresWithPaginationResponseSchema = z.object({
 	pagination: paginationInfoSchema$1,
-	scores: z$1.array(z$1.unknown())
+	scores: z.array(z.unknown())
 });
-const saveScoreResponseSchema = z$1.object({ score: z$1.unknown() });
+const saveScoreResponseSchema = z.object({ score: z.unknown() });
 
 async function listScorersFromSystem({ mastra, requestContext }) {
 	const agents = mastra.listAgents();
@@ -33426,51 +33719,51 @@ const WORKSPACE_SKILLS_ROUTES = [
 ];
 
 //#region src/server/schemas/vectors.ts
-const vectorNamePathParams = z$1.object({ vectorName: z$1.string().describe("Name of the vector store") });
-const vectorIndexPathParams = vectorNamePathParams.extend({ indexName: z$1.string().describe("Name of the index") });
-const indexBodyBaseSchema = z$1.object({ indexName: z$1.string() });
+const vectorNamePathParams = z.object({ vectorName: z.string().describe("Name of the vector store") });
+const vectorIndexPathParams = vectorNamePathParams.extend({ indexName: z.string().describe("Name of the index") });
+const indexBodyBaseSchema = z.object({ indexName: z.string() });
 const upsertVectorsBodySchema = indexBodyBaseSchema.extend({
-	vectors: z$1.array(z$1.array(z$1.number())),
-	metadata: z$1.array(z$1.record(z$1.string(), z$1.unknown())).optional(),
-	ids: z$1.array(z$1.string()).optional()
+	vectors: z.array(z.array(z.number())),
+	metadata: z.array(z.record(z.string(), z.unknown())).optional(),
+	ids: z.array(z.string()).optional()
 });
 const createIndexBodySchema = indexBodyBaseSchema.extend({
-	dimension: z$1.number(),
-	metric: z$1.enum([
+	dimension: z.number(),
+	metric: z.enum([
 		"cosine",
 		"euclidean",
 		"dotproduct"
 	]).optional()
 });
 const queryVectorsBodySchema = indexBodyBaseSchema.extend({
-	queryVector: z$1.array(z$1.number()),
-	topK: z$1.number().optional(),
-	filter: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	includeVector: z$1.boolean().optional()
+	queryVector: z.array(z.number()),
+	topK: z.number().optional(),
+	filter: z.record(z.string(), z.unknown()).optional(),
+	includeVector: z.boolean().optional()
 });
-const upsertVectorsResponseSchema = z$1.object({ ids: z$1.array(z$1.string()) });
+const upsertVectorsResponseSchema = z.object({ ids: z.array(z.string()) });
 const createIndexResponseSchema = successResponseSchema;
-const queryVectorsResponseSchema = z$1.array(z$1.unknown());
-const listIndexesResponseSchema = z$1.array(z$1.string());
-const describeIndexResponseSchema = z$1.object({
-	dimension: z$1.number(),
-	count: z$1.number(),
-	metric: z$1.string().optional()
+const queryVectorsResponseSchema = z.array(z.unknown());
+const listIndexesResponseSchema = z.array(z.string());
+const describeIndexResponseSchema = z.object({
+	dimension: z.number(),
+	count: z.number(),
+	metric: z.string().optional()
 });
 const deleteIndexResponseSchema = successResponseSchema;
-const listVectorsResponseSchema = z$1.object({ vectors: z$1.array(z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	type: z$1.string(),
-	description: z$1.string().optional()
+const listVectorsResponseSchema = z.object({ vectors: z.array(z.object({
+	id: z.string(),
+	name: z.string(),
+	type: z.string(),
+	description: z.string().optional()
 })) });
-const listEmbeddersResponseSchema = z$1.object({ embedders: z$1.array(z$1.object({
-	id: z$1.string(),
-	provider: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string(),
-	dimensions: z$1.number(),
-	maxInputTokens: z$1.number()
+const listEmbeddersResponseSchema = z.object({ embedders: z.array(z.object({
+	id: z.string(),
+	provider: z.string(),
+	name: z.string(),
+	description: z.string(),
+	dimensions: z.number(),
+	maxInputTokens: z.number()
 })) });
 
 function getVector(mastra, vectorName) {
@@ -33682,28 +33975,28 @@ const TRANSCRIBE_SPEECH_DEPRECATED_ROUTE = TRANSCRIBE_SPEECH_DEPRECATED_ROUTE$1;
 const GET_LISTENER_ROUTE = GET_LISTENER_ROUTE$1;
 
 //#region src/server/schemas/dynamic-workflows.ts
-const stepOptionsSchema = z$1.object({
-	retries: z$1.number().int().nonnegative().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const stepOptionsSchema = z.object({
+	retries: z.number().int().nonnegative().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 }).optional();
 const entryDisplayFields = {
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 };
 const containerIdentityFields = {
-	id: z$1.string().optional(),
+	id: z.string().optional(),
 	...entryDisplayFields
 };
-const literalScalar = z$1.union([
-	z$1.string(),
-	z$1.number(),
-	z$1.boolean(),
-	z$1.null()
+const literalScalar = z.union([
+	z.string(),
+	z.number(),
+	z.boolean(),
+	z.null()
 ]);
-const pathOrLiteral = z$1.union([z$1.object({ path: z$1.string().min(1) }).strict(), z$1.object({ literal: literalScalar }).strict()]);
-const predicateSchema = z$1.lazy(() => z$1.union([
-	z$1.object({
-		op: z$1.enum([
+const pathOrLiteral = z.union([z.object({ path: z.string().min(1) }).strict(), z.object({ literal: literalScalar }).strict()]);
+const predicateSchema = z.lazy(() => z.union([
+	z.object({
+		op: z.enum([
 			"eq",
 			"ne",
 			"lt",
@@ -33714,166 +34007,166 @@ const predicateSchema = z$1.lazy(() => z$1.union([
 		left: pathOrLiteral,
 		right: pathOrLiteral
 	}).strict(),
-	z$1.object({
-		op: z$1.enum(["in", "notIn"]),
+	z.object({
+		op: z.enum(["in", "notIn"]),
 		value: pathOrLiteral,
-		set: z$1.array(literalScalar).min(1)
+		set: z.array(literalScalar).min(1)
 	}).strict(),
-	z$1.object({
-		op: z$1.enum(["exists", "notExists"]),
-		path: z$1.string().min(1)
+	z.object({
+		op: z.enum(["exists", "notExists"]),
+		path: z.string().min(1)
 	}).strict(),
-	z$1.object({
-		op: z$1.enum(["truthy", "falsy"]),
+	z.object({
+		op: z.enum(["truthy", "falsy"]),
 		value: pathOrLiteral
 	}).strict(),
-	z$1.object({
-		op: z$1.enum(["and", "or"]),
-		args: z$1.array(predicateSchema).min(1)
+	z.object({
+		op: z.enum(["and", "or"]),
+		args: z.array(predicateSchema).min(1)
 	}).strict(),
-	z$1.object({
-		op: z$1.literal("not"),
+	z.object({
+		op: z.literal("not"),
 		arg: predicateSchema
 	}).strict()
 ]));
-const agentEntrySchema = z$1.object({
-	type: z$1.literal("agent"),
-	id: z$1.string(),
-	agentId: z$1.string(),
-	description: z$1.string().optional(),
-	outputSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
+const agentEntrySchema = z.object({
+	type: z.literal("agent"),
+	id: z.string(),
+	agentId: z.string(),
+	description: z.string().optional(),
+	outputSchema: z.record(z.string(), z.unknown()).optional(),
 	options: stepOptionsSchema
 });
-const toolEntrySchema = z$1.object({
-	type: z$1.literal("tool"),
-	id: z$1.string(),
-	toolId: z$1.string(),
-	description: z$1.string().optional(),
+const toolEntrySchema = z.object({
+	type: z.literal("tool"),
+	id: z.string(),
+	toolId: z.string(),
+	description: z.string().optional(),
 	options: stepOptionsSchema
 });
-const mappingEntrySchema = z$1.object({
-	type: z$1.literal("mapping"),
-	id: z$1.string(),
+const mappingEntrySchema = z.object({
+	type: z.literal("mapping"),
+	id: z.string(),
 	...entryDisplayFields,
-	mapConfig: z$1.string()
+	mapConfig: z.string()
 });
-const workflowEntrySchema = z$1.object({
-	type: z$1.literal("workflow"),
-	id: z$1.string(),
-	workflowId: z$1.string(),
-	description: z$1.string().optional()
+const workflowEntrySchema = z.object({
+	type: z.literal("workflow"),
+	id: z.string(),
+	workflowId: z.string(),
+	description: z.string().optional()
 });
-const singleStepEntrySchema = z$1.discriminatedUnion("type", [
+const singleStepEntrySchema = z.discriminatedUnion("type", [
 	agentEntrySchema,
 	toolEntrySchema,
 	mappingEntrySchema,
 	workflowEntrySchema
 ]);
-const foreachInnerStepSchema = z$1.discriminatedUnion("type", [
+const foreachInnerStepSchema = z.discriminatedUnion("type", [
 	agentEntrySchema,
 	toolEntrySchema,
 	workflowEntrySchema
 ]);
-const graphEntrySchema = z$1.discriminatedUnion("type", [
+const graphEntrySchema = z.discriminatedUnion("type", [
 	agentEntrySchema,
 	toolEntrySchema,
 	mappingEntrySchema,
 	workflowEntrySchema,
-	z$1.object({
-		type: z$1.literal("parallel"),
+	z.object({
+		type: z.literal("parallel"),
 		...containerIdentityFields,
-		steps: z$1.array(singleStepEntrySchema)
+		steps: z.array(singleStepEntrySchema)
 	}),
-	z$1.object({
-		type: z$1.literal("foreach"),
+	z.object({
+		type: z.literal("foreach"),
 		...containerIdentityFields,
 		step: foreachInnerStepSchema,
-		opts: z$1.object({ concurrency: z$1.number().int().positive() }).optional()
+		opts: z.object({ concurrency: z.number().int().positive() }).optional()
 	}),
-	z$1.object({
-		type: z$1.literal("sleep"),
-		id: z$1.string(),
+	z.object({
+		type: z.literal("sleep"),
+		id: z.string(),
 		...entryDisplayFields,
-		duration: z$1.number()
+		duration: z.number()
 	}),
-	z$1.object({
-		type: z$1.literal("sleepUntil"),
-		id: z$1.string(),
+	z.object({
+		type: z.literal("sleepUntil"),
+		id: z.string(),
 		...entryDisplayFields,
-		date: z$1.string()
+		date: z.string()
 	}),
-	z$1.object({
-		type: z$1.literal("conditional"),
+	z.object({
+		type: z.literal("conditional"),
 		...containerIdentityFields,
-		steps: z$1.array(singleStepEntrySchema),
-		predicates: z$1.array(predicateSchema)
+		steps: z.array(singleStepEntrySchema),
+		predicates: z.array(predicateSchema)
 	}).refine((entry) => entry.predicates.length === entry.steps.length, {
 		message: "conditional entries must have exactly one predicate per branch (`predicates` and `steps` must be the same length)",
 		path: ["predicates"]
 	}),
-	z$1.object({
-		type: z$1.literal("loop"),
+	z.object({
+		type: z.literal("loop"),
 		...containerIdentityFields,
 		step: singleStepEntrySchema,
-		loopType: z$1.enum(["dowhile", "dountil"]),
+		loopType: z.enum(["dowhile", "dountil"]),
 		predicate: predicateSchema
 	})
 ]);
-const dynamicWorkflowIdPathParams = z$1.object({ dynamicWorkflowId: z$1.string().describe("Unique identifier for the dynamic workflow definition") });
-const listDynamicWorkflowsQuerySchema = z$1.object({
-	status: z$1.enum(["active", "archived"]).optional().describe("Filter dynamic workflows by status (defaults to active when omitted by the handler)"),
-	authorId: z$1.string().optional().describe("Filter dynamic workflows by author identifier")
+const dynamicWorkflowIdPathParams = z.object({ dynamicWorkflowId: z.string().describe("Unique identifier for the dynamic workflow definition") });
+const listDynamicWorkflowsQuerySchema = z.object({
+	status: z.enum(["active", "archived"]).optional().describe("Filter dynamic workflows by status (defaults to active when omitted by the handler)"),
+	authorId: z.string().optional().describe("Filter dynamic workflows by author identifier")
 });
 /**
 * One static workflow definition on the wire. Matches the input shape of
 * `mastra.addDynamicWorkflow()`.
 */
-const dynamicWorkflowDefinitionBodySchema = z$1.object({
-	id: z$1.string().describe("Workflow id — kebab-case, descriptive"),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	inputSchema: z$1.record(z$1.string(), z$1.unknown()).describe("JSON Schema (Draft 2020-12) for the workflow input"),
-	outputSchema: z$1.record(z$1.string(), z$1.unknown()).describe("JSON Schema (Draft 2020-12) for the workflow output"),
-	stateSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	graph: z$1.array(graphEntrySchema).describe("Static workflow graph — ordered array of serialized step entries with all refs as ids.")
+const dynamicWorkflowDefinitionBodySchema = z.object({
+	id: z.string().describe("Workflow id — kebab-case, descriptive"),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	inputSchema: z.record(z.string(), z.unknown()).describe("JSON Schema (Draft 2020-12) for the workflow input"),
+	outputSchema: z.record(z.string(), z.unknown()).describe("JSON Schema (Draft 2020-12) for the workflow output"),
+	stateSchema: z.record(z.string(), z.unknown()).optional(),
+	requestContextSchema: z.record(z.string(), z.unknown()).optional(),
+	graph: z.array(graphEntrySchema).describe("Static workflow graph — ordered array of serialized step entries with all refs as ids.")
 });
 /**
 * Body for `POST /stored/workflows` — upsert a static workflow definition,
 * optionally together with the helper workflows it nests.
 */
-const upsertDynamicWorkflowBodySchema = dynamicWorkflowDefinitionBodySchema.extend({ dependencies: z$1.array(dynamicWorkflowDefinitionBodySchema).optional().describe("Helper workflow definitions this workflow nests. Saved with it as one unit — the whole set is validated together, hydrated in derived dependency order, and rejected together, so a failed save never leaves orphaned helpers behind. Each helper becomes an ordinary dynamic workflow in its own right.") });
+const upsertDynamicWorkflowBodySchema = dynamicWorkflowDefinitionBodySchema.extend({ dependencies: z.array(dynamicWorkflowDefinitionBodySchema).optional().describe("Helper workflow definitions this workflow nests. Saved with it as one unit — the whole set is validated together, hydrated in derived dependency order, and rejected together, so a failed save never leaves orphaned helpers behind. Each helper becomes an ordinary dynamic workflow in its own right.") });
 /**
 * Shape returned for any single dynamic workflow row.
 */
-const dynamicWorkflowResponseSchema = z$1.object({
-	id: z$1.string(),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	inputSchema: z$1.unknown(),
-	outputSchema: z$1.unknown(),
-	stateSchema: z$1.unknown().optional(),
-	requestContextSchema: z$1.unknown().optional(),
-	graph: z$1.array(z$1.unknown()),
-	status: z$1.enum(["active", "archived"]),
-	source: z$1.literal("storage"),
-	authorId: z$1.string().optional(),
-	createdAt: z$1.union([z$1.date(), z$1.string()]),
-	updatedAt: z$1.union([z$1.date(), z$1.string()])
+const dynamicWorkflowResponseSchema = z.object({
+	id: z.string(),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	inputSchema: z.unknown(),
+	outputSchema: z.unknown(),
+	stateSchema: z.unknown().optional(),
+	requestContextSchema: z.unknown().optional(),
+	graph: z.array(z.unknown()),
+	status: z.enum(["active", "archived"]),
+	source: z.literal("storage"),
+	authorId: z.string().optional(),
+	createdAt: z.union([z.date(), z.string()]),
+	updatedAt: z.union([z.date(), z.string()])
 });
-const listDynamicWorkflowsResponseSchema = z$1.object({
-	workflows: z$1.array(dynamicWorkflowResponseSchema),
-	total: z$1.number()
+const listDynamicWorkflowsResponseSchema = z.object({
+	workflows: z.array(dynamicWorkflowResponseSchema),
+	total: z.number()
 });
 const getDynamicWorkflowResponseSchema = dynamicWorkflowResponseSchema;
-const upsertDynamicWorkflowResponseSchema = z$1.object({
-	ok: z$1.literal(true),
-	id: z$1.string(),
-	dependencyIds: z$1.array(z$1.string()).optional().describe("Ids of the helper workflows saved alongside this one. Present only when dependencies were supplied.")
+const upsertDynamicWorkflowResponseSchema = z.object({
+	ok: z.literal(true),
+	id: z.string(),
+	dependencyIds: z.array(z.string()).optional().describe("Ids of the helper workflows saved alongside this one. Present only when dependencies were supplied.")
 });
-const deleteDynamicWorkflowResponseSchema = z$1.object({
-	success: z$1.literal(true),
-	message: z$1.string()
+const deleteDynamicWorkflowResponseSchema = z.object({
+	success: z.literal(true),
+	message: z.string()
 });
 /**
 * GET /stored/workflows — list stored static workflow definitions.
@@ -34108,10 +34401,10 @@ function ackBackgroundSessionWork({ work, session, mastra, operation }) {
 		} catch {}
 	});
 }
-const controllerIdPathParams = z$1.object({ controllerId: z$1.string() });
-const sessionPathParams = z$1.object({
-	controllerId: z$1.string(),
-	resourceId: z$1.string()
+const controllerIdPathParams = z.object({ controllerId: z.string() });
+const sessionPathParams = z.object({
+	controllerId: z.string(),
+	resourceId: z.string()
 });
 /**
 * Optional session scope (mirrors `AgentController.createSession`'s `scope`):
@@ -34119,13 +34412,13 @@ const sessionPathParams = z$1.object({
 * sessions (e.g. one per git worktree). Sent as a `sessionScope` query param
 * on session routes; named to avoid colliding with the model-switch `scope`.
 */
-const sessionScopeQuerySchema = z$1.object({ sessionScope: z$1.string().optional() });
-const sessionStateQuerySchema = sessionScopeQuerySchema.extend({ threadId: z$1.string().optional() });
-const createSessionBodySchema = z$1.object({
-	resourceId: z$1.string(),
-	tags: z$1.record(z$1.string(), z$1.string()).optional(),
-	threadId: z$1.string().optional(),
-	sessionScope: z$1.string().optional()
+const sessionScopeQuerySchema = z.object({ sessionScope: z.string().optional() });
+const sessionStateQuerySchema = sessionScopeQuerySchema.extend({ threadId: z.string().optional() });
+const createSessionBodySchema = z.object({
+	resourceId: z.string(),
+	tags: z.record(z.string(), z.string()).optional(),
+	threadId: z.string().optional(),
+	sessionScope: z.string().optional()
 });
 const MAX_FILE_DATA_LENGTH = 14 * 1024 * 1024;
 const MAX_TOTAL_FILE_DATA_LENGTH = 28 * 1024 * 1024;
@@ -34135,58 +34428,58 @@ const MAX_TOTAL_FILE_DATA_LENGTH = 28 * 1024 * 1024;
 * server-controlled). Declared on run-triggering body schemas so the OpenAPI
 * spec documents it.
 */
-const bodyRequestContextSchema = z$1.record(z$1.string(), z$1.unknown()).optional();
-const sendMessageBodySchema = z$1.object({
-	message: z$1.string(),
+const bodyRequestContextSchema = z.record(z.string(), z.unknown()).optional();
+const sendMessageBodySchema = z.object({
+	message: z.string(),
 	requestContext: bodyRequestContextSchema,
-	files: z$1.array(z$1.object({
-		data: z$1.string().max(MAX_FILE_DATA_LENGTH),
-		mediaType: z$1.string(),
-		filename: z$1.string().optional()
+	files: z.array(z.object({
+		data: z.string().max(MAX_FILE_DATA_LENGTH),
+		mediaType: z.string(),
+		filename: z.string().optional()
 	})).max(20).refine((files) => files.reduce((total, file) => total + file.data.length, 0) <= MAX_TOTAL_FILE_DATA_LENGTH, { message: "Total attachment size exceeds limit" }).optional()
 });
-const steerBodySchema = z$1.object({
-	message: z$1.string(),
+const steerBodySchema = z.object({
+	message: z.string(),
 	requestContext: bodyRequestContextSchema
 });
-const toolApprovalBodySchema = z$1.object({
-	toolCallId: z$1.string(),
-	approved: z$1.boolean(),
+const toolApprovalBodySchema = z.object({
+	toolCallId: z.string(),
+	approved: z.boolean(),
 	requestContext: bodyRequestContextSchema
 });
-const toolSuspensionBodySchema = z$1.object({
-	toolCallId: z$1.string(),
-	resumeData: z$1.unknown(),
+const toolSuspensionBodySchema = z.object({
+	toolCallId: z.string(),
+	resumeData: z.unknown(),
 	requestContext: bodyRequestContextSchema
 });
-const switchModeBodySchema = z$1.object({ modeId: z$1.string() });
-const switchModelBodySchema = z$1.object({
-	modelId: z$1.string(),
-	scope: z$1.enum(["global", "thread"]).optional(),
-	modeId: z$1.string().optional()
+const switchModeBodySchema = z.object({ modeId: z.string() });
+const switchModelBodySchema = z.object({
+	modelId: z.string(),
+	scope: z.enum(["global", "thread"]).optional(),
+	modeId: z.string().optional()
 });
-const switchThreadBodySchema = z$1.object({ threadId: z$1.string() });
-const createThreadBodySchema = z$1.object({ title: z$1.string().optional() });
-const renameThreadBodySchema = z$1.object({ title: z$1.string() });
-const threadPathParams = z$1.object({
-	controllerId: z$1.string(),
-	resourceId: z$1.string(),
-	threadId: z$1.string()
+const switchThreadBodySchema = z.object({ threadId: z.string() });
+const createThreadBodySchema = z.object({ title: z.string().optional() });
+const renameThreadBodySchema = z.object({ title: z.string() });
+const threadPathParams = z.object({
+	controllerId: z.string(),
+	resourceId: z.string(),
+	threadId: z.string()
 });
-const cloneThreadBodySchema = z$1.object({
-	sourceThreadId: z$1.string().optional(),
-	title: z$1.string().optional()
+const cloneThreadBodySchema = z.object({
+	sourceThreadId: z.string().optional(),
+	title: z.string().optional()
 });
-const controllerPaginationNumber = z$1.coerce.number().int().min(0);
-const listMessagesQuerySchema = z$1.object({
+const controllerPaginationNumber = z.coerce.number().int().min(0);
+const listMessagesQuerySchema = z.object({
 	/** @deprecated Use page and perPage instead. */
 	limit: controllerPaginationNumber.optional(),
 	page: controllerPaginationNumber.optional(),
-	perPage: z$1.preprocess((value) => value === "false" ? false : value, z$1.union([z$1.literal(false), controllerPaginationNumber])).optional(),
+	perPage: z.preprocess((value) => value === "false" ? false : value, z.union([z.literal(false), controllerPaginationNumber])).optional(),
 	orderBy: messageOrderBySchema,
 	include: includeSchema,
 	filter: filterSchema,
-	sessionScope: z$1.string().optional()
+	sessionScope: z.string().optional()
 }).superRefine((value, ctx) => {
 	if (value.limit === void 0) return;
 	for (const field of [
@@ -34206,80 +34499,80 @@ const listMessagesQuerySchema = z$1.object({
 * tag — e.g. `{ projectPath }` so git worktrees sharing a resourceId each see
 * only their own threads. Malformed JSON is treated as "no filter".
 */
-const listThreadsQuerySchema = z$1.object({
-	limit: z$1.coerce.number().optional(),
-	sessionScope: z$1.string().optional(),
-	tags: z$1.preprocess((value) => {
+const listThreadsQuerySchema = z.object({
+	limit: z.coerce.number().optional(),
+	sessionScope: z.string().optional(),
+	tags: z.preprocess((value) => {
 		if (typeof value !== "string" || value.length === 0) return void 0;
 		try {
 			return JSON.parse(value);
 		} catch {
 			return;
 		}
-	}, z$1.record(z$1.string(), z$1.string()).optional()).optional()
+	}, z.record(z.string(), z.string()).optional()).optional()
 });
-const followUpBodySchema = z$1.object({
-	message: z$1.string(),
+const followUpBodySchema = z.object({
+	message: z.string(),
 	requestContext: bodyRequestContextSchema
 });
-const sendNotificationBodySchema = z$1.object({
-	source: z$1.string(),
-	kind: z$1.string(),
-	summary: z$1.string(),
-	priority: z$1.enum([
+const sendNotificationBodySchema = z.object({
+	source: z.string(),
+	kind: z.string(),
+	summary: z.string(),
+	priority: z.enum([
 		"low",
 		"medium",
 		"high",
 		"urgent"
 	]).optional(),
-	payload: z$1.unknown().optional(),
-	sourceId: z$1.string().optional(),
-	dedupeKey: z$1.string().optional(),
-	coalesceKey: z$1.string().optional(),
-	attributes: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	payload: z.unknown().optional(),
+	sourceId: z.string().optional(),
+	dedupeKey: z.string().optional(),
+	coalesceKey: z.string().optional(),
+	attributes: z.record(z.string(), z.unknown()).optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 });
-const listAgentControllersResponseSchema = z$1.object({ agentControllers: z$1.array(z$1.object({ id: z$1.string() })) });
-const createSessionResponseSchema = z$1.object({
-	controllerId: z$1.string(),
-	resourceId: z$1.string(),
-	threadId: z$1.string().optional()
+const listAgentControllersResponseSchema = z.object({ agentControllers: z.array(z.object({ id: z.string() })) });
+const createSessionResponseSchema = z.object({
+	controllerId: z.string(),
+	resourceId: z.string(),
+	threadId: z.string().optional()
 });
-const ackResponseSchema = z$1.object({ ok: z$1.boolean() });
+const ackResponseSchema = z.object({ ok: z.boolean() });
 /**
 * Status-line relevant slice of the session's observational-memory progress.
 * Mirrors the TUI status line: `msg pending/threshold ↓removal` (the active
 * message window before an observation fires) and `mem observed/reflection
 * ↓savings` (accumulated observations before a reflection fires).
 */
-const omProgressSummarySchema = z$1.object({
-	status: z$1.string(),
-	pendingTokens: z$1.number(),
-	threshold: z$1.number(),
-	thresholdPercent: z$1.number(),
-	observationTokens: z$1.number(),
-	reflectionThreshold: z$1.number(),
-	reflectionThresholdPercent: z$1.number(),
+const omProgressSummarySchema = z.object({
+	status: z.string(),
+	pendingTokens: z.number(),
+	threshold: z.number(),
+	thresholdPercent: z.number(),
+	observationTokens: z.number(),
+	reflectionThreshold: z.number(),
+	reflectionThresholdPercent: z.number(),
 	/** Tokens the next observation will remove from the message window. */
-	projectedMessageRemoval: z$1.number(),
+	projectedMessageRemoval: z.number(),
 	/** Tokens the next reflection is projected to save. */
-	projectedReflectionSavings: z$1.number()
+	projectedReflectionSavings: z.number()
 });
-const tokenUsageSchema = z$1.object({
-	promptTokens: z$1.number(),
-	completionTokens: z$1.number(),
-	totalTokens: z$1.number(),
-	reasoningTokens: z$1.number().optional(),
-	cachedInputTokens: z$1.number().optional(),
-	cacheCreationInputTokens: z$1.number().optional(),
-	cacheCreationInputTokens5m: z$1.number().optional(),
-	cacheCreationInputTokens1h: z$1.number().optional(),
-	raw: z$1.unknown().optional()
+const tokenUsageSchema = z.object({
+	promptTokens: z.number(),
+	completionTokens: z.number(),
+	totalTokens: z.number(),
+	reasoningTokens: z.number().optional(),
+	cachedInputTokens: z.number().optional(),
+	cacheCreationInputTokens: z.number().optional(),
+	cacheCreationInputTokens5m: z.number().optional(),
+	cacheCreationInputTokens1h: z.number().optional(),
+	raw: z.unknown().optional()
 });
-const sessionSettingsSchema = z$1.object({
-	yolo: z$1.boolean(),
+const sessionSettingsSchema = z.object({
+	yolo: z.boolean(),
 	/** Session override only — absent when the session inherits a configured default. */
-	thinkingLevel: z$1.enum([
+	thinkingLevel: z.enum([
 		"off",
 		"low",
 		"medium",
@@ -34287,66 +34580,66 @@ const sessionSettingsSchema = z$1.object({
 		"xhigh",
 		"max"
 	]).optional(),
-	notifications: z$1.enum([
+	notifications: z.enum([
 		"off",
 		"bell",
 		"system",
 		"both"
 	]),
-	smartEditing: z$1.boolean()
+	smartEditing: z.boolean()
 });
-const taskSnapshotSchema = z$1.object({
-	id: z$1.string(),
-	content: z$1.string(),
-	status: z$1.enum([
+const taskSnapshotSchema = z.object({
+	id: z.string(),
+	content: z.string(),
+	status: z.enum([
 		"pending",
 		"in_progress",
 		"completed"
 	]),
-	activeForm: z$1.string()
+	activeForm: z.string()
 });
-const sessionStateResponseSchema = z$1.object({
-	controllerId: z$1.string(),
-	resourceId: z$1.string(),
-	threadId: z$1.string().optional(),
-	modeId: z$1.string(),
-	modelId: z$1.string(),
+const sessionStateResponseSchema = z.object({
+	controllerId: z.string(),
+	resourceId: z.string(),
+	threadId: z.string().optional(),
+	modeId: z.string(),
+	modelId: z.string(),
 	/** Whether the agent is currently executing a run (for initial UI hydration). */
-	running: z$1.boolean().optional(),
-	tasks: z$1.array(taskSnapshotSchema).optional(),
+	running: z.boolean().optional(),
+	tasks: z.array(taskSnapshotSchema).optional(),
 	omProgress: omProgressSummarySchema.optional(),
 	tokenUsage: tokenUsageSchema.optional(),
 	settings: sessionSettingsSchema.optional()
 });
-const listModesResponseSchema = z$1.object({ modes: z$1.array(z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional()
+const listModesResponseSchema = z.object({ modes: z.array(z.object({
+	id: z.string(),
+	name: z.string().optional()
 })) });
-const listThreadsResponseSchema = z$1.object({ threads: z$1.array(z$1.object({
-	id: z$1.string(),
-	title: z$1.string().optional(),
-	updatedAt: z$1.string().optional(),
+const listThreadsResponseSchema = z.object({ threads: z.array(z.object({
+	id: z.string(),
+	title: z.string().optional(),
+	updatedAt: z.string().optional(),
 	/** The session scoping tags stamped on this thread (e.g. `{ projectPath }`). */
-	tags: z$1.record(z$1.string(), z$1.string()).optional(),
+	tags: z.record(z.string(), z.string()).optional(),
 	/** Whether a run is currently executing on this thread ('active') or not ('idle'). */
-	state: z$1.enum(["active", "idle"]).optional()
+	state: z.enum(["active", "idle"]).optional()
 })) });
-const threadResponseSchema = z$1.object({
-	id: z$1.string(),
-	title: z$1.string().optional(),
-	resourceId: z$1.string().optional(),
-	createdAt: z$1.string().optional(),
-	updatedAt: z$1.string().optional()
+const threadResponseSchema = z.object({
+	id: z.string(),
+	title: z.string().optional(),
+	resourceId: z.string().optional(),
+	createdAt: z.string().optional(),
+	updatedAt: z.string().optional()
 });
-const messagePartSchema = z$1.object({ type: z$1.string() }).passthrough();
-const messageContentV2Schema = z$1.object({
-	format: z$1.literal(2),
-	parts: z$1.array(messagePartSchema)
+const messagePartSchema = z.object({ type: z.string() }).passthrough();
+const messageContentV2Schema = z.object({
+	format: z.literal(2),
+	parts: z.array(messagePartSchema)
 }).passthrough();
-const listMessagesResponseSchema = z$1.object({
-	messages: z$1.array(z$1.object({
-		id: z$1.string(),
-		role: z$1.enum([
+const listMessagesResponseSchema = z.object({
+	messages: z.array(z.object({
+		id: z.string(),
+		role: z.enum([
 			"user",
 			"assistant",
 			"system",
@@ -34354,50 +34647,50 @@ const listMessagesResponseSchema = z$1.object({
 			"signal"
 		]),
 		content: messageContentV2Schema,
-		createdAt: z$1.string().optional(),
-		threadId: z$1.string().optional(),
-		resourceId: z$1.string().optional(),
-		type: z$1.string().optional()
+		createdAt: z.string().optional(),
+		threadId: z.string().optional(),
+		resourceId: z.string().optional(),
+		type: z.string().optional()
 	})),
-	total: z$1.number(),
-	page: z$1.number(),
-	perPage: z$1.union([z$1.number(), z$1.literal(false)]),
-	hasMore: z$1.boolean()
+	total: z.number(),
+	page: z.number(),
+	perPage: z.union([z.number(), z.literal(false)]),
+	hasMore: z.boolean()
 });
-const listModelsResponseSchema = z$1.object({ models: z$1.array(z$1.object({
-	id: z$1.string(),
-	provider: z$1.string(),
-	modelName: z$1.string(),
-	hasApiKey: z$1.boolean(),
-	useCount: z$1.number()
+const listModelsResponseSchema = z.object({ models: z.array(z.object({
+	id: z.string(),
+	provider: z.string(),
+	modelName: z.string(),
+	hasApiKey: z.boolean(),
+	useCount: z.number()
 })) });
-const workspaceStatusResponseSchema = z$1.object({
-	hasWorkspace: z$1.boolean(),
-	isReady: z$1.boolean()
+const workspaceStatusResponseSchema = z.object({
+	hasWorkspace: z.boolean(),
+	isReady: z.boolean()
 });
-const omRecordResponseSchema = z$1.object({ record: z$1.unknown().optional() });
-const permissionPolicyEnum = z$1.enum([
+const omRecordResponseSchema = z.object({ record: z.unknown().optional() });
+const permissionPolicyEnum = z.enum([
 	"allow",
 	"ask",
 	"deny"
 ]);
-const toolCategoryEnum = z$1.enum([
+const toolCategoryEnum = z.enum([
 	"read",
 	"edit",
 	"execute",
 	"mcp",
 	"other"
 ]);
-const permissionRulesResponseSchema = z$1.object({
-	categories: z$1.record(z$1.string(), permissionPolicyEnum).optional(),
-	tools: z$1.record(z$1.string(), permissionPolicyEnum).optional()
+const permissionRulesResponseSchema = z.object({
+	categories: z.record(z.string(), permissionPolicyEnum).optional(),
+	tools: z.record(z.string(), permissionPolicyEnum).optional()
 });
-const setCategoryPermissionBodySchema = z$1.object({
+const setCategoryPermissionBodySchema = z.object({
 	category: toolCategoryEnum,
 	policy: permissionPolicyEnum
 });
-const setToolPermissionBodySchema = z$1.object({
-	toolName: z$1.string(),
+const setToolPermissionBodySchema = z.object({
+	toolName: z.string(),
 	policy: permissionPolicyEnum
 });
 const LIST_AGENT_CONTROLLERS_ROUTE = createRoute$1({
@@ -34879,10 +35172,10 @@ const LIST_AGENT_CONTROLLER_ACTIVE_RUNS_ROUTE = createRoute$1({
 	path: "/agent-controller/:controllerId/active-runs",
 	responseType: "json",
 	pathParamSchema: controllerIdPathParams,
-	responseSchema: z$1.object({ runs: z$1.array(z$1.object({
-		runId: z$1.string(),
-		resourceId: z$1.string().optional(),
-		threadId: z$1.string()
+	responseSchema: z.object({ runs: z.array(z.object({
+		runId: z.string(),
+		resourceId: z.string().optional(),
+		threadId: z.string()
 	})) }),
 	summary: "List active controller runs",
 	description: "Lists the runs in flight on the controller across all resources, without creating or touching a session.",
@@ -34951,11 +35244,11 @@ const SEND_AGENT_CONTROLLER_NOTIFICATION_ROUTE = createRoute$1({
 	pathParamSchema: sessionPathParams,
 	queryParamSchema: sessionScopeQuerySchema,
 	bodySchema: sendNotificationBodySchema,
-	responseSchema: z$1.object({
-		accepted: z$1.boolean(),
-		notificationId: z$1.string().optional(),
-		decision: z$1.string().optional(),
-		runId: z$1.string().optional()
+	responseSchema: z.object({
+		accepted: z.boolean(),
+		notificationId: z.string().optional(),
+		decision: z.string().optional(),
+		runId: z.string().optional()
 	}),
 	summary: "Send a notification signal to a session",
 	description: "Delivers a notification to the session’s current agent/thread. The agent’s delivery policy determines whether the notification wakes an idle thread, is summarised, or is persisted for later.",
@@ -35263,7 +35556,7 @@ const SET_AGENT_CONTROLLER_RESOURCE_ID_ROUTE = createRoute$1({
 	responseType: "json",
 	pathParamSchema: sessionPathParams,
 	queryParamSchema: sessionScopeQuerySchema,
-	bodySchema: z$1.object({ newResourceId: z$1.string() }),
+	bodySchema: z.object({ newResourceId: z.string() }),
 	responseSchema: ackResponseSchema,
 	summary: "Change the session resource ID",
 	description: "Updates the session’s resource identity (e.g. when a user logs in).",
@@ -35287,7 +35580,7 @@ const GET_AGENT_CONTROLLER_RESOURCE_IDS_ROUTE = createRoute$1({
 	responseType: "json",
 	pathParamSchema: sessionPathParams,
 	queryParamSchema: sessionScopeQuerySchema,
-	responseSchema: z$1.object({ resourceIds: z$1.array(z$1.string()) }),
+	responseSchema: z.object({ resourceIds: z.array(z.string()) }),
 	summary: "Get known resource IDs",
 	description: "Lists the resource IDs known to this session (from threads).",
 	tags: ["AgentController"],
@@ -35303,36 +35596,36 @@ const GET_AGENT_CONTROLLER_RESOURCE_IDS_ROUTE = createRoute$1({
 		}
 	}
 });
-const setGoalBodySchema = z$1.object({
-	objective: z$1.string(),
-	judgeModelId: z$1.string().optional(),
-	maxRuns: z$1.number().optional()
+const setGoalBodySchema = z.object({
+	objective: z.string(),
+	judgeModelId: z.string().optional(),
+	maxRuns: z.number().optional()
 });
-const updateGoalBodySchema = z$1.object({
-	judgeModelId: z$1.string().optional(),
-	maxRuns: z$1.number().optional(),
-	status: z$1.enum([
+const updateGoalBodySchema = z.object({
+	judgeModelId: z.string().optional(),
+	maxRuns: z.number().optional(),
+	status: z.enum([
 		"active",
 		"paused",
 		"done"
 	]).optional()
 });
-const goalRecordSchema = z$1.object({
-	id: z$1.string().optional(),
-	objective: z$1.string(),
-	status: z$1.enum([
+const goalRecordSchema = z.object({
+	id: z.string().optional(),
+	objective: z.string(),
+	status: z.enum([
 		"active",
 		"paused",
 		"done"
 	]),
-	runsUsed: z$1.number(),
-	maxRuns: z$1.number().optional(),
-	judgeModelId: z$1.string().optional(),
-	startedAt: z$1.number(),
-	updatedAt: z$1.number(),
-	pausedReason: z$1.string().optional()
+	runsUsed: z.number(),
+	maxRuns: z.number().optional(),
+	judgeModelId: z.string().optional(),
+	startedAt: z.number(),
+	updatedAt: z.number(),
+	pausedReason: z.string().optional()
 });
-const goalResponseSchema = z$1.object({ goal: goalRecordSchema.optional() });
+const goalResponseSchema = z.object({ goal: goalRecordSchema.optional() });
 function getAgentForSession(controller, session) {
 	return controller.getCurrentAgent(session);
 }
@@ -35525,7 +35818,7 @@ const SET_AGENT_CONTROLLER_SESSION_STATE_ROUTE = createRoute$1({
 	responseType: "json",
 	pathParamSchema: sessionPathParams,
 	queryParamSchema: sessionScopeQuerySchema,
-	bodySchema: z$1.object({ state: z$1.record(z$1.string(), z$1.unknown()) }),
+	bodySchema: z.object({ state: z.record(z.string(), z.unknown()) }),
 	responseSchema: ackResponseSchema,
 	summary: "Set session state",
 	description: "Merges the provided key-value pairs into the session state. Existing keys not in the payload are preserved.",
@@ -35546,9 +35839,9 @@ const SET_AGENT_CONTROLLER_SESSION_STATE_ROUTE = createRoute$1({
 /**
 * Version order by configuration (shared)
 */
-const versionOrderBySchema = z$1.object({
-	field: z$1.enum(["versionNumber", "createdAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const versionOrderBySchema = z.object({
+	field: z.enum(["versionNumber", "createdAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 /**
 * List versions query params (shared)
@@ -35557,94 +35850,94 @@ const listVersionsQuerySchema = createPagePaginationSchema(20).extend({ orderBy:
 /**
 * Compare versions query params (shared)
 */
-const compareVersionsQuerySchema = z$1.object({
-	from: z$1.string().describe("Version ID (UUID) to compare from"),
-	to: z$1.string().describe("Version ID (UUID) to compare to")
+const compareVersionsQuerySchema = z.object({
+	from: z.string().describe("Version ID (UUID) to compare from"),
+	to: z.string().describe("Version ID (UUID) to compare to")
 });
 /**
 * Create version body (shared)
 */
-const createVersionBodySchema = z$1.object({ changeMessage: z$1.string().max(500).optional().describe("Optional message describing the changes") });
+const createVersionBodySchema = z.object({ changeMessage: z.string().max(500).optional().describe("Optional message describing the changes") });
 /**
 * Activate version response (shared)
 */
-const activateVersionResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string(),
-	activeVersionId: z$1.string()
+const activateVersionResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string(),
+	activeVersionId: z.string()
 });
 /**
 * Delete version response (shared)
 */
-const deleteVersionResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteVersionResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 /**
 * Single diff entry for version comparison (shared)
 */
-const versionDiffEntrySchema = z$1.object({
-	field: z$1.string().describe("The field path that changed"),
-	previousValue: z$1.unknown().describe("The value in the \"from\" version"),
-	currentValue: z$1.unknown().describe("The value in the \"to\" version")
+const versionDiffEntrySchema = z.object({
+	field: z.string().describe("The field path that changed"),
+	previousValue: z.unknown().describe("The value in the \"from\" version"),
+	currentValue: z.unknown().describe("The value in the \"to\" version")
 });
 /**
 * Helper to create a list versions response schema for a domain-specific version schema.
 */
 function createListVersionsResponseSchema(versionSchema) {
-	return paginationInfoSchema$1.extend({ versions: z$1.array(versionSchema) });
+	return paginationInfoSchema$1.extend({ versions: z.array(versionSchema) });
 }
 /**
 * Helper to create a compare versions response schema for a domain-specific version schema.
 */
 function createCompareVersionsResponseSchema(versionSchema) {
-	return z$1.object({
-		diffs: z$1.array(versionDiffEntrySchema).describe("List of differences between versions"),
+	return z.object({
+		diffs: z.array(versionDiffEntrySchema).describe("List of differences between versions"),
 		fromVersion: versionSchema.describe("The source version"),
 		toVersion: versionSchema.describe("The target version")
 	});
 }
 
 //#region src/server/schemas/agent-versions.ts
-const mcpClientToolsConfigSchema = z$1.object({ tools: z$1.record(z$1.string(), toolConfigSchema).optional() });
+const mcpClientToolsConfigSchema = z.object({ tools: z.record(z.string(), toolConfigSchema).optional() });
 /**
 * Path parameters for agent version routes
 */
-const agentVersionPathParams = z$1.object({ agentId: z$1.string().describe("Unique identifier for the stored agent") });
+const agentVersionPathParams = z.object({ agentId: z.string().describe("Unique identifier for the stored agent") });
 /**
 * Path parameters for specific version routes
 */
-const versionIdPathParams = z$1.object({
-	agentId: z$1.string().describe("Unique identifier for the stored agent"),
-	versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+const versionIdPathParams = z.object({
+	agentId: z.string().describe("Unique identifier for the stored agent"),
+	versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
 /**
 * Agent version object schema (full response)
 * Config fields are top-level on the version (no nested snapshot object).
 * Extends StorageAgentSnapshotType fields.
 */
-const agentVersionSchema = z$1.object({
-	id: z$1.string().describe("Unique identifier for the version (UUID)"),
-	agentId: z$1.string().describe("ID of the agent this version belongs to"),
-	versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-	name: z$1.string().describe("Name of the agent"),
-	description: z$1.string().optional().describe("Description of the agent"),
+const agentVersionSchema = z.object({
+	id: z.string().describe("Unique identifier for the version (UUID)"),
+	agentId: z.string().describe("ID of the agent this version belongs to"),
+	versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+	name: z.string().describe("Name of the agent"),
+	description: z.string().optional().describe("Description of the agent"),
 	instructions: instructionsSchema,
 	model: conditionalFieldSchema(modelConfigSchema).describe("Model configuration — static value or array of conditional variants"),
 	tools: conditionalFieldSchema(toolsConfigSchema).optional().describe("Tool keys mapped to per-tool config — static or conditional"),
 	defaultOptions: conditionalFieldSchema(defaultOptionsSchema).optional().describe("Default options for generate/stream calls — static or conditional"),
-	workflows: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
-	agents: conditionalFieldSchema(z$1.record(z$1.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
-	integrationTools: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
-	mcpClients: conditionalFieldSchema(z$1.record(z$1.string(), mcpClientToolsConfigSchema)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
+	workflows: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Workflow keys with optional per-workflow config — static or conditional"),
+	agents: conditionalFieldSchema(z.record(z.string(), toolConfigSchema)).optional().describe("Agent keys with optional per-agent config — static or conditional"),
+	integrationTools: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema)).optional().describe("Map of tool provider IDs to their tool configurations — static or conditional"),
+	mcpClients: conditionalFieldSchema(z.record(z.string(), mcpClientToolsConfigSchema)).optional().describe("Map of stored MCP client IDs to their tool configurations — static or conditional"),
 	inputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Input processor graph — static or conditional"),
 	outputProcessors: conditionalFieldSchema(storedProcessorGraphSchema).optional().describe("Output processor graph — static or conditional"),
 	memory: conditionalFieldSchema(serializedMemoryConfigSchema).optional().describe("Memory configuration — static or conditional"),
-	scorers: conditionalFieldSchema(z$1.record(z$1.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining valid request context variables"),
-	changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-	changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-	createdAt: z$1.coerce.date().describe("When this version was created")
+	scorers: conditionalFieldSchema(z.record(z.string(), scorerConfigSchema)).optional().describe("Scorer keys with optional sampling config — static or conditional"),
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining valid request context variables"),
+	changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+	changeMessage: z.string().optional().describe("Optional message describing the changes"),
+	createdAt: z.coerce.date().describe("When this version was created")
 });
 /**
 * Response for GET /stored/agents/:agentId/versions
@@ -35657,11 +35950,11 @@ const getVersionResponseSchema = agentVersionSchema;
 /**
 * Response for POST /stored/agents/:agentId/versions
 */
-const createVersionResponseSchema = agentVersionSchema.partial().merge(z$1.object({
-	id: z$1.string().describe("Unique identifier for the version (UUID)"),
-	agentId: z$1.string().describe("ID of the agent this version belongs to"),
-	versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-	createdAt: z$1.coerce.date().describe("When this version was created")
+const createVersionResponseSchema = agentVersionSchema.partial().merge(z.object({
+	id: z.string().describe("Unique identifier for the version (UUID)"),
+	agentId: z.string().describe("ID of the agent this version belongs to"),
+	versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+	createdAt: z.coerce.date().describe("When this version was created")
 }));
 /**
 * Response for POST /stored/agents/:agentId/versions/:versionId/restore
@@ -36191,7 +36484,7 @@ const COMPARE_AGENT_VERSIONS_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/background-tasks.ts
-const backgroundTaskStatusSchema = z.enum([
+const backgroundTaskStatusSchema = z$1.enum([
 	"pending",
 	"running",
 	"suspended",
@@ -36200,62 +36493,62 @@ const backgroundTaskStatusSchema = z.enum([
 	"cancelled",
 	"timed_out"
 ]);
-const backgroundTaskStreamQuerySchema = z.object({
-	agentId: z.string().optional(),
-	runId: z.string().optional(),
-	threadId: z.string().optional(),
-	resourceId: z.string().optional(),
-	taskId: z.string().optional()
+const backgroundTaskStreamQuerySchema = z$1.object({
+	agentId: z$1.string().optional(),
+	runId: z$1.string().optional(),
+	threadId: z$1.string().optional(),
+	resourceId: z$1.string().optional(),
+	taskId: z$1.string().optional()
 });
-const backgroundTaskDateColumnSchema = z.enum([
+const backgroundTaskDateColumnSchema = z$1.enum([
 	"createdAt",
 	"startedAt",
 	"suspendedAt",
 	"completedAt"
 ]);
-const listBackgroundTasksQuerySchema = z.object({
-	agentId: z.string().optional(),
+const listBackgroundTasksQuerySchema = z$1.object({
+	agentId: z$1.string().optional(),
 	status: backgroundTaskStatusSchema.optional(),
-	runId: z.string().optional(),
-	threadId: z.string().optional(),
-	resourceId: z.string().optional(),
-	toolName: z.string().optional(),
-	toolCallId: z.string().optional(),
-	fromDate: z.coerce.date().optional(),
-	toDate: z.coerce.date().optional(),
+	runId: z$1.string().optional(),
+	threadId: z$1.string().optional(),
+	resourceId: z$1.string().optional(),
+	toolName: z$1.string().optional(),
+	toolCallId: z$1.string().optional(),
+	fromDate: z$1.coerce.date().optional(),
+	toDate: z$1.coerce.date().optional(),
 	dateFilterBy: backgroundTaskDateColumnSchema.optional(),
 	orderBy: backgroundTaskDateColumnSchema.optional(),
-	orderDirection: z.enum(["asc", "desc"]).optional(),
+	orderDirection: z$1.enum(["asc", "desc"]).optional(),
 	page: paginationNumber().optional(),
 	perPage: paginationNumber().optional()
 });
-const backgroundTaskIdPathParams = z.object({ backgroundTaskId: z.string() });
-const backgroundTaskResponseSchema = z.object({
-	id: z.string(),
+const backgroundTaskIdPathParams = z$1.object({ backgroundTaskId: z$1.string() });
+const backgroundTaskResponseSchema = z$1.object({
+	id: z$1.string(),
 	status: backgroundTaskStatusSchema,
-	toolName: z.string(),
-	toolCallId: z.string(),
-	args: z.record(z.string(), z.unknown()),
-	agentId: z.string(),
-	threadId: z.string().optional(),
-	resourceId: z.string().optional(),
-	runId: z.string(),
-	result: z.unknown().optional(),
-	error: z.object({
-		message: z.string(),
-		stack: z.string().optional()
+	toolName: z$1.string(),
+	toolCallId: z$1.string(),
+	args: z$1.record(z$1.string(), z$1.unknown()),
+	agentId: z$1.string(),
+	threadId: z$1.string().optional(),
+	resourceId: z$1.string().optional(),
+	runId: z$1.string(),
+	result: z$1.unknown().optional(),
+	error: z$1.object({
+		message: z$1.string(),
+		stack: z$1.string().optional()
 	}).optional(),
-	createdAt: z.date(),
-	startedAt: z.date().optional(),
-	completedAt: z.date().optional(),
-	retryCount: z.number(),
-	maxRetries: z.number(),
-	timeoutMs: z.number(),
-	suspendPayload: z.unknown().optional()
+	createdAt: z$1.date(),
+	startedAt: z$1.date().optional(),
+	completedAt: z$1.date().optional(),
+	retryCount: z$1.number(),
+	maxRetries: z$1.number(),
+	timeoutMs: z$1.number(),
+	suspendPayload: z$1.unknown().optional()
 });
-const listBackgroundTaskResponseSchema = z.object({
-	tasks: z.array(backgroundTaskResponseSchema),
-	total: z.number()
+const listBackgroundTaskResponseSchema = z$1.object({
+	tasks: z$1.array(backgroundTaskResponseSchema),
+	total: z$1.number()
 });
 //#endregion
 //#region src/server/handlers/background-tasks.ts
@@ -36265,7 +36558,7 @@ const BACKGROUND_TASK_STREAM_ROUTE = createRoute$1({
 	responseType: "stream",
 	streamFormat: "sse",
 	queryParamSchema: backgroundTaskStreamQuerySchema,
-	responseSchema: z.unknown(),
+	responseSchema: z$1.unknown(),
 	summary: "Stream background task events via SSE",
 	description: "Real-time Server-Sent Events stream of background task completion/failure events.",
 	tags: ["Background Tasks"],
@@ -36661,30 +36954,30 @@ async function fetchSkillFiles(owner, repo, skillName) {
 * registry-independent.
 */
 /** Single entry in the registries list. */
-const builderRegistryEntrySchema = z$1.object({
-	id: z$1.literal("skills-sh").describe("Stable registry identifier"),
-	enabled: z$1.boolean().describe("Whether this registry is enabled in the running deployment"),
-	label: z$1.string().describe("Human-readable registry name")
+const builderRegistryEntrySchema = z.object({
+	id: z.literal("skills-sh").describe("Stable registry identifier"),
+	enabled: z.boolean().describe("Whether this registry is enabled in the running deployment"),
+	label: z.string().describe("Human-readable registry name")
 });
 /** Response for `GET /editor/builder/registries`. */
-const builderRegistriesResponseSchema = z$1.object({ registries: z$1.array(builderRegistryEntrySchema) });
+const builderRegistriesResponseSchema = z.object({ registries: z.array(builderRegistryEntrySchema) });
 /** Path params used by every per-registry route. */
-const builderRegistryPathParams = z$1.object({ registryId: z$1.string().describe("Registry identifier (e.g. \"skills-sh\")") });
-const builderRegistrySearchQuerySchema = z$1.object({
-	q: z$1.string().describe("Search query"),
-	limit: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)")
+const builderRegistryPathParams = z.object({ registryId: z.string().describe("Registry identifier (e.g. \"skills-sh\")") });
+const builderRegistrySearchQuerySchema = z.object({
+	q: z.string().describe("Search query"),
+	limit: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)")
 });
-const builderRegistryPopularQuerySchema = z$1.object({
-	limit: z$1.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)"),
-	offset: z$1.coerce.number().int().min(0).optional().default(0).describe("Offset for pagination (must be a multiple of `limit`)")
+const builderRegistryPopularQuerySchema = z.object({
+	limit: z.coerce.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results (1-100)"),
+	offset: z.coerce.number().int().min(0).optional().default(0).describe("Offset for pagination (must be a multiple of `limit`)")
 }).refine((args) => args.offset % args.limit === 0, {
 	message: "offset must be a multiple of limit (the upstream registry pages by `limit`)",
 	path: ["offset"]
 });
-const builderRegistryPreviewQuerySchema = z$1.object({
-	owner: z$1.string().describe("GitHub repository owner"),
-	repo: z$1.string().describe("GitHub repository name"),
-	path: z$1.string().describe("Skill name within repo")
+const builderRegistryPreviewQuerySchema = z.object({
+	owner: z.string().describe("GitHub repository owner"),
+	repo: z.string().describe("GitHub repository name"),
+	path: z.string().describe("Skill name within repo")
 });
 /**
 * Body for `POST /editor/builder/registries/:registryId/install`.
@@ -36692,17 +36985,17 @@ const builderRegistryPreviewQuerySchema = z$1.object({
 * Visibility behaves like the standard stored-skill create flow: optional,
 * defaults to private when the caller is authenticated.
 */
-const builderRegistryInstallBodySchema = z$1.object({
-	owner: z$1.string().describe("GitHub repository owner"),
-	repo: z$1.string().describe("GitHub repository name"),
-	skillName: z$1.string().describe("Skill name from the registry"),
-	visibility: z$1.enum(["private", "public"]).optional().describe("Visibility for the new stored skill")
+const builderRegistryInstallBodySchema = z.object({
+	owner: z.string().describe("GitHub repository owner"),
+	repo: z.string().describe("GitHub repository name"),
+	skillName: z.string().describe("Skill name from the registry"),
+	visibility: z.enum(["private", "public"]).optional().describe("Visibility for the new stored skill")
 });
 /** Response for the install route. Mirrors stored-skill identity fields. */
-const builderRegistryInstallResponseSchema = z$1.object({
-	storedSkillId: z$1.string().describe("Id of the newly created stored skill"),
-	name: z$1.string().describe("Resolved skill name"),
-	filesWritten: z$1.number().describe("Number of files materialized into the skill version snapshot")
+const builderRegistryInstallResponseSchema = z.object({
+	storedSkillId: z.string().describe("Id of the newly created stored skill"),
+	name: z.string().describe("Resolved skill name"),
+	filesWritten: z.number().describe("Number of files materialized into the skill version snapshot")
 });
 //#endregion
 //#region src/server/handlers/builder-registry.ts
@@ -36988,52 +37281,52 @@ const BUILDER_REGISTRY_INSTALL_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/channels.ts
-const channelPlatformPathParams = z$1.object({ platform: z$1.string().describe("Channel platform identifier (e.g., \"slack\")") });
-const channelAgentPathParams = z$1.object({
-	platform: z$1.string().describe("Channel platform identifier (e.g., \"slack\")"),
-	agentId: z$1.string().describe("Agent identifier")
+const channelPlatformPathParams = z.object({ platform: z.string().describe("Channel platform identifier (e.g., \"slack\")") });
+const channelAgentPathParams = z.object({
+	platform: z.string().describe("Channel platform identifier (e.g., \"slack\")"),
+	agentId: z.string().describe("Agent identifier")
 });
-const connectChannelBodySchema = z$1.object({
-	agentId: z$1.string().describe("Agent identifier to connect"),
-	options: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Platform-specific connection options")
+const connectChannelBodySchema = z.object({
+	agentId: z.string().describe("Agent identifier to connect"),
+	options: z.record(z.string(), z.unknown()).optional().describe("Platform-specific connection options")
 });
-const channelPlatformInfoSchema = z$1.object({
-	id: z$1.string().describe("Platform identifier"),
-	name: z$1.string().describe("Human-readable platform name"),
-	isConfigured: z$1.boolean().describe("Whether the platform is ready to connect agents"),
-	connectOptionsSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema for connect options")
+const channelPlatformInfoSchema = z.object({
+	id: z.string().describe("Platform identifier"),
+	name: z.string().describe("Human-readable platform name"),
+	isConfigured: z.boolean().describe("Whether the platform is ready to connect agents"),
+	connectOptionsSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema for connect options")
 });
-const channelInstallationInfoSchema = z$1.object({
-	id: z$1.string().describe("Installation identifier"),
-	platform: z$1.string().describe("Platform identifier"),
-	agentId: z$1.string().describe("Connected agent identifier"),
-	status: z$1.enum(["active", "pending"]).describe("Installation status"),
-	displayName: z$1.string().optional().describe("Platform-specific display name"),
-	installedAt: z$1.coerce.date().optional().describe("Installation timestamp")
+const channelInstallationInfoSchema = z.object({
+	id: z.string().describe("Installation identifier"),
+	platform: z.string().describe("Platform identifier"),
+	agentId: z.string().describe("Connected agent identifier"),
+	status: z.enum(["active", "pending"]).describe("Installation status"),
+	displayName: z.string().optional().describe("Platform-specific display name"),
+	installedAt: z.coerce.date().optional().describe("Installation timestamp")
 });
-const channelConnectOAuthSchema = z$1.object({
-	type: z$1.literal("oauth").describe("OAuth-based connection requiring browser redirect"),
-	authorizationUrl: z$1.string().describe("OAuth authorization URL for user redirect"),
-	installationId: z$1.string().describe("Installation identifier")
+const channelConnectOAuthSchema = z.object({
+	type: z.literal("oauth").describe("OAuth-based connection requiring browser redirect"),
+	authorizationUrl: z.string().describe("OAuth authorization URL for user redirect"),
+	installationId: z.string().describe("Installation identifier")
 });
-const channelConnectDeepLinkSchema = z$1.object({
-	type: z$1.literal("deep_link").describe("Deep-link connection requiring native app interaction"),
-	url: z$1.string().describe("Deep link URL to open in platform app"),
-	installationId: z$1.string().describe("Installation identifier")
+const channelConnectDeepLinkSchema = z.object({
+	type: z.literal("deep_link").describe("Deep-link connection requiring native app interaction"),
+	url: z.string().describe("Deep link URL to open in platform app"),
+	installationId: z.string().describe("Installation identifier")
 });
-const channelConnectImmediateSchema = z$1.object({
-	type: z$1.literal("immediate").describe("Immediate connection with no user interaction needed"),
-	installationId: z$1.string().describe("Installation identifier")
+const channelConnectImmediateSchema = z.object({
+	type: z.literal("immediate").describe("Immediate connection with no user interaction needed"),
+	installationId: z.string().describe("Installation identifier")
 });
-const channelConnectResultSchema = z$1.discriminatedUnion("type", [
+const channelConnectResultSchema = z.discriminatedUnion("type", [
 	channelConnectOAuthSchema,
 	channelConnectDeepLinkSchema,
 	channelConnectImmediateSchema
 ]);
-const listChannelPlatformsResponseSchema = z$1.array(channelPlatformInfoSchema);
-const listChannelInstallationsResponseSchema = z$1.array(channelInstallationInfoSchema);
+const listChannelPlatformsResponseSchema = z.array(channelPlatformInfoSchema);
+const listChannelInstallationsResponseSchema = z.array(channelInstallationInfoSchema);
 const connectChannelResponseSchema = channelConnectResultSchema;
-const disconnectChannelResponseSchema = z$1.object({ success: z$1.boolean() });
+const disconnectChannelResponseSchema = z.object({ success: z.boolean() });
 //#endregion
 //#region src/server/handlers/channels.ts
 function assertChannelsAvailable() {
@@ -37185,95 +37478,95 @@ const DISCONNECT_CHANNEL_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/datasets.ts
-const jsonSchemaObject = z$1.lazy(() => z$1.record(z$1.string(), z$1.unknown()));
-const jsonSchemaField = z$1.union([jsonSchemaObject, z$1.null()]).optional();
+const jsonSchemaObject = z.lazy(() => z.record(z.string(), z.unknown()));
+const jsonSchemaField = z.union([jsonSchemaObject, z.null()]).optional();
 const expectedStepBase = {
-	name: z$1.string().describe("Step name to match"),
-	durationMs: z$1.number().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	children: z$1.unknown().optional().describe("Nested trajectory expectation (untyped at this depth)")
+	name: z.string().describe("Step name to match"),
+	durationMs: z.number().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	children: z.unknown().optional().describe("Nested trajectory expectation (untyped at this depth)")
 };
-const expectedToolCallStepSchema = z$1.object({
+const expectedToolCallStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("tool_call"),
-	toolArgs: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	toolResult: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	success: z$1.boolean().optional()
+	stepType: z.literal("tool_call"),
+	toolArgs: z.record(z.string(), z.unknown()).optional(),
+	toolResult: z.record(z.string(), z.unknown()).optional(),
+	success: z.boolean().optional()
 });
-const expectedMcpToolCallStepSchema = z$1.object({
+const expectedMcpToolCallStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("mcp_tool_call"),
-	toolArgs: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	toolResult: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	mcpServer: z$1.string().optional(),
-	success: z$1.boolean().optional()
+	stepType: z.literal("mcp_tool_call"),
+	toolArgs: z.record(z.string(), z.unknown()).optional(),
+	toolResult: z.record(z.string(), z.unknown()).optional(),
+	mcpServer: z.string().optional(),
+	success: z.boolean().optional()
 });
-const expectedModelGenerationStepSchema = z$1.object({
+const expectedModelGenerationStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("model_generation"),
-	modelId: z$1.string().optional(),
-	promptTokens: z$1.number().optional(),
-	completionTokens: z$1.number().optional(),
-	finishReason: z$1.string().optional()
+	stepType: z.literal("model_generation"),
+	modelId: z.string().optional(),
+	promptTokens: z.number().optional(),
+	completionTokens: z.number().optional(),
+	finishReason: z.string().optional()
 });
-const expectedAgentRunStepSchema = z$1.object({
+const expectedAgentRunStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("agent_run"),
-	agentId: z$1.string().optional()
+	stepType: z.literal("agent_run"),
+	agentId: z.string().optional()
 });
-const expectedWorkflowStepStepSchema = z$1.object({
+const expectedWorkflowStepStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_step"),
-	stepId: z$1.string().optional(),
-	status: z$1.string().optional(),
-	output: z$1.record(z$1.string(), z$1.unknown()).optional()
+	stepType: z.literal("workflow_step"),
+	stepId: z.string().optional(),
+	status: z.string().optional(),
+	output: z.record(z.string(), z.unknown()).optional()
 });
-const expectedWorkflowRunStepSchema = z$1.object({
+const expectedWorkflowRunStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_run"),
-	workflowId: z$1.string().optional(),
-	status: z$1.string().optional()
+	stepType: z.literal("workflow_run"),
+	workflowId: z.string().optional(),
+	status: z.string().optional()
 });
-const expectedWorkflowConditionalStepSchema = z$1.object({
+const expectedWorkflowConditionalStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_conditional"),
-	conditionCount: z$1.number().optional(),
-	selectedSteps: z$1.array(z$1.string()).optional()
+	stepType: z.literal("workflow_conditional"),
+	conditionCount: z.number().optional(),
+	selectedSteps: z.array(z.string()).optional()
 });
-const expectedWorkflowParallelStepSchema = z$1.object({
+const expectedWorkflowParallelStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_parallel"),
-	branchCount: z$1.number().optional(),
-	parallelSteps: z$1.array(z$1.string()).optional()
+	stepType: z.literal("workflow_parallel"),
+	branchCount: z.number().optional(),
+	parallelSteps: z.array(z.string()).optional()
 });
-const expectedWorkflowLoopStepSchema = z$1.object({
+const expectedWorkflowLoopStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_loop"),
-	loopType: z$1.string().optional(),
-	totalIterations: z$1.number().optional()
+	stepType: z.literal("workflow_loop"),
+	loopType: z.string().optional(),
+	totalIterations: z.number().optional()
 });
-const expectedWorkflowSleepStepSchema = z$1.object({
+const expectedWorkflowSleepStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_sleep"),
-	sleepDurationMs: z$1.number().optional(),
-	sleepType: z$1.string().optional()
+	stepType: z.literal("workflow_sleep"),
+	sleepDurationMs: z.number().optional(),
+	sleepType: z.string().optional()
 });
-const expectedWorkflowWaitEventStepSchema = z$1.object({
+const expectedWorkflowWaitEventStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("workflow_wait_event"),
-	eventName: z$1.string().optional(),
-	eventReceived: z$1.boolean().optional()
+	stepType: z.literal("workflow_wait_event"),
+	eventName: z.string().optional(),
+	eventReceived: z.boolean().optional()
 });
-const expectedProcessorRunStepSchema = z$1.object({
+const expectedProcessorRunStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.literal("processor_run"),
-	processorId: z$1.string().optional()
+	stepType: z.literal("processor_run"),
+	processorId: z.string().optional()
 });
-const expectedGenericStepSchema = z$1.object({
+const expectedGenericStepSchema = z.object({
 	...expectedStepBase,
-	stepType: z$1.undefined().optional()
+	stepType: z.undefined().optional()
 });
-const expectedStepSchema = z$1.union([z$1.discriminatedUnion("stepType", [
+const expectedStepSchema = z.union([z.discriminatedUnion("stepType", [
 	expectedToolCallStepSchema,
 	expectedMcpToolCallStepSchema,
 	expectedModelGenerationStepSchema,
@@ -37287,24 +37580,24 @@ const expectedStepSchema = z$1.union([z$1.discriminatedUnion("stepType", [
 	expectedWorkflowWaitEventStepSchema,
 	expectedProcessorRunStepSchema
 ]), expectedGenericStepSchema]);
-const trajectoryExpectationSchema = z$1.object({
-	steps: z$1.array(expectedStepSchema).optional().describe("Expected steps for accuracy checking"),
-	ordering: z$1.enum([
+const trajectoryExpectationSchema = z.object({
+	steps: z.array(expectedStepSchema).optional().describe("Expected steps for accuracy checking"),
+	ordering: z.enum([
 		"strict",
 		"relaxed",
 		"unordered"
 	]).optional().describe("How to compare step ordering (default: relaxed)"),
-	allowRepeatedSteps: z$1.boolean().optional().describe("Whether to allow repeated steps (default: true)"),
-	maxSteps: z$1.number().int().optional().describe("Maximum number of steps allowed"),
-	maxTotalTokens: z$1.number().int().optional().describe("Maximum total tokens across all model_generation steps"),
-	maxTotalDurationMs: z$1.number().optional().describe("Maximum total duration in milliseconds"),
-	noRedundantCalls: z$1.boolean().optional().describe("Whether to penalize redundant calls (same tool + same args consecutively, default: true)"),
-	blacklistedTools: z$1.array(z$1.string()).optional().describe("Tool names that should never appear"),
-	blacklistedSequences: z$1.array(z$1.array(z$1.string())).optional().describe("Tool name sequences that should never appear"),
-	maxRetriesPerTool: z$1.number().int().optional().describe("Maximum retries per tool before penalizing (default: 2)")
+	allowRepeatedSteps: z.boolean().optional().describe("Whether to allow repeated steps (default: true)"),
+	maxSteps: z.number().int().optional().describe("Maximum number of steps allowed"),
+	maxTotalTokens: z.number().int().optional().describe("Maximum total tokens across all model_generation steps"),
+	maxTotalDurationMs: z.number().optional().describe("Maximum total duration in milliseconds"),
+	noRedundantCalls: z.boolean().optional().describe("Whether to penalize redundant calls (same tool + same args consecutively, default: true)"),
+	blacklistedTools: z.array(z.string()).optional().describe("Tool names that should never appear"),
+	blacklistedSequences: z.array(z.array(z.string())).optional().describe("Tool name sequences that should never appear"),
+	maxRetriesPerTool: z.number().int().optional().describe("Maximum retries per tool before penalizing (default: 2)")
 }).optional().nullable().describe("Expected trajectory configuration for trajectory scoring");
-const datasetItemSourceSchema = z$1.object({
-	type: z$1.enum([
+const datasetItemSourceSchema = z.object({
+	type: z.enum([
 		"csv",
 		"json",
 		"trace",
@@ -37312,70 +37605,70 @@ const datasetItemSourceSchema = z$1.object({
 		"experiment-result",
 		"candidate-screener"
 	]).describe("How this item was created"),
-	referenceId: z$1.string().optional().describe("Reference identifier (e.g., trace id, csv filename)")
+	referenceId: z.string().optional().describe("Reference identifier (e.g., trace id, csv filename)")
 }).optional().describe("Source/provenance of this dataset item");
-const itemToolMockSchema = z$1.object({
-	toolName: z$1.string().describe("Name of the tool this mock applies to"),
-	args: z$1.record(z$1.string(), z$1.unknown()).describe("Arguments to match against the tool call"),
-	output: z$1.unknown().describe("Output served to the agent when matched"),
-	matchArgs: z$1.enum(["strict", "ignore"]).optional().describe("Argument matching mode. 'strict' (default) deep-equals args; 'ignore' matches on toolName only")
+const itemToolMockSchema = z.object({
+	toolName: z.string().describe("Name of the tool this mock applies to"),
+	args: z.record(z.string(), z.unknown()).describe("Arguments to match against the tool call"),
+	output: z.unknown().describe("Output served to the agent when matched"),
+	matchArgs: z.enum(["strict", "ignore"]).optional().describe("Argument matching mode. 'strict' (default) deep-equals args; 'ignore' matches on toolName only")
 });
-const toolMocksSchema = z$1.array(itemToolMockSchema).optional().describe("Ordered item-level static tool mocks served in place of executing the real tool");
-const unmockedToolPolicySchema = z$1.enum(["allow", "deny"]).optional().describe("Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item");
-const toolMockReportSchema = z$1.object({
-	served: z$1.array(z$1.object({
-		mockIndex: z$1.number().int(),
-		toolName: z$1.string(),
-		args: z$1.unknown()
+const toolMocksSchema = z.array(itemToolMockSchema).optional().describe("Ordered item-level static tool mocks served in place of executing the real tool");
+const unmockedToolPolicySchema = z.enum(["allow", "deny"]).optional().describe("Policy for undeclared tool calls. 'allow' runs them live; 'deny' fails the experiment item");
+const toolMockReportSchema = z.object({
+	served: z.array(z.object({
+		mockIndex: z.number().int(),
+		toolName: z.string(),
+		args: z.unknown()
 	})),
-	unconsumed: z$1.array(z$1.object({
-		mockIndex: z$1.number().int(),
-		toolName: z$1.string(),
-		args: z$1.unknown()
+	unconsumed: z.array(z.object({
+		mockIndex: z.number().int(),
+		toolName: z.string(),
+		args: z.unknown()
 	})),
-	liveCalls: z$1.array(z$1.object({
-		toolName: z$1.string(),
-		args: z$1.unknown()
+	liveCalls: z.array(z.object({
+		toolName: z.string(),
+		args: z.unknown()
 	})),
-	failure: z$1.object({
-		code: z$1.enum([
+	failure: z.object({
+		code: z.enum([
 			"TOOL_MOCK_MISMATCH",
 			"TOOL_MOCK_EXHAUSTED",
 			"TOOL_MOCK_NOT_DECLARED"
 		]),
-		toolName: z$1.string(),
-		args: z$1.unknown()
+		toolName: z.string(),
+		args: z.unknown()
 	}).optional()
 }).optional().describe("Diagnostic receipt for item-level tool mocks");
-const datasetIdPathParams = z$1.object({ datasetId: z$1.string().describe("Unique identifier for the dataset") });
-const experimentIdPathParams = z$1.object({ experimentId: z$1.string().describe("Unique identifier for the experiment") });
-z$1.object({ itemId: z$1.string().describe("Unique identifier for the dataset item") });
-const datasetAndExperimentIdPathParams = z$1.object({
-	datasetId: z$1.string().describe("Unique identifier for the dataset"),
-	experimentId: z$1.string().describe("Unique identifier for the experiment")
+const datasetIdPathParams = z.object({ datasetId: z.string().describe("Unique identifier for the dataset") });
+const experimentIdPathParams = z.object({ experimentId: z.string().describe("Unique identifier for the experiment") });
+z.object({ itemId: z.string().describe("Unique identifier for the dataset item") });
+const datasetAndExperimentIdPathParams = z.object({
+	datasetId: z.string().describe("Unique identifier for the dataset"),
+	experimentId: z.string().describe("Unique identifier for the experiment")
 });
-const experimentResultIdPathParams = z$1.object({
-	datasetId: z$1.string().describe("Unique identifier for the dataset"),
-	experimentId: z$1.string().describe("Unique identifier for the experiment"),
-	resultId: z$1.string().describe("Unique identifier for the experiment result")
+const experimentResultIdPathParams = z.object({
+	datasetId: z.string().describe("Unique identifier for the dataset"),
+	experimentId: z.string().describe("Unique identifier for the experiment"),
+	resultId: z.string().describe("Unique identifier for the experiment result")
 });
-const datasetExperimentAndItemIdPathParams = z$1.object({
-	datasetId: z$1.string().describe("Unique identifier for the dataset"),
-	experimentId: z$1.string().describe("Unique identifier for the experiment"),
-	itemId: z$1.string().describe("Unique identifier for the dataset item")
+const datasetExperimentAndItemIdPathParams = z.object({
+	datasetId: z.string().describe("Unique identifier for the dataset"),
+	experimentId: z.string().describe("Unique identifier for the experiment"),
+	itemId: z.string().describe("Unique identifier for the dataset item")
 });
-const datasetAndItemIdPathParams = z$1.object({
-	datasetId: z$1.string().describe("Unique identifier for the dataset"),
-	itemId: z$1.string().describe("Unique identifier for the dataset item")
+const datasetAndItemIdPathParams = z.object({
+	datasetId: z.string().describe("Unique identifier for the dataset"),
+	itemId: z.string().describe("Unique identifier for the dataset item")
 });
 const paginationQuerySchema = createPagePaginationSchema(10);
-const listExperimentResultsQuerySchema = paginationQuerySchema.extend({ tags: z$1.preprocess((v) => {
+const listExperimentResultsQuerySchema = paginationQuerySchema.extend({ tags: z.preprocess((v) => {
 	const list = typeof v === "string" ? [v] : v;
 	if (!Array.isArray(list)) return list;
 	const nonBlank = list.filter((tag) => tag !== "");
 	return nonBlank.length > 0 ? nonBlank : void 0;
-}, z$1.array(z$1.string()).optional()).describe("Only return results that have all of these tags") });
-const targetTypeQuerySchema = z$1.enum([
+}, z.array(z.string()).optional()).describe("Only return results that have all of these tags") });
+const targetTypeQuerySchema = z.enum([
 	"agent",
 	"workflow",
 	"scorer",
@@ -37383,450 +37676,450 @@ const targetTypeQuerySchema = z$1.enum([
 ]).optional().describe("Only return records attached to targets of this type");
 const listDatasetsQuerySchema = paginationQuerySchema.extend({
 	targetType: targetTypeQuerySchema,
-	targetIds: z$1.preprocess((v) => {
+	targetIds: z.preprocess((v) => {
 		const list = typeof v === "string" ? [v] : v;
 		if (!Array.isArray(list)) return list;
 		const nonBlank = list.filter((id) => id !== "");
 		return nonBlank.length > 0 ? nonBlank : void 0;
-	}, z$1.array(z$1.string()).optional()).describe("Only return datasets attached to at least one of these target IDs")
+	}, z.array(z.string()).optional()).describe("Only return datasets attached to at least one of these target IDs")
 });
 const listExperimentsQuerySchema = paginationQuerySchema.extend({
-	experimentSetId: z$1.string().optional(),
-	comparisonId: z$1.string().optional(),
-	variantId: z$1.string().optional(),
-	trialIndex: z$1.coerce.number().int().min(0).optional(),
+	experimentSetId: z.string().optional(),
+	comparisonId: z.string().optional(),
+	variantId: z.string().optional(),
+	trialIndex: z.coerce.number().int().min(0).optional(),
 	targetType: targetTypeQuerySchema,
-	targetId: z$1.string().optional().describe("Only return experiments run against this target ID")
+	targetId: z.string().optional().describe("Only return experiments run against this target ID")
 });
-const tenancyQuerySchema = z$1.object({
-	organizationId: z$1.string().optional().describe("Restrict lookup to the given organization"),
-	projectId: z$1.string().optional().describe("Restrict lookup to the given project")
+const tenancyQuerySchema = z.object({
+	organizationId: z.string().optional().describe("Restrict lookup to the given organization"),
+	projectId: z.string().optional().describe("Restrict lookup to the given project")
 });
 const listItemsQuerySchema = createPagePaginationSchema(10).extend({
-	version: z$1.coerce.number().int().optional(),
-	search: z$1.string().optional()
+	version: z.coerce.number().int().optional(),
+	search: z.string().optional()
 });
-const createDatasetBodySchema = z$1.object({
-	name: z$1.string().describe("Name of the dataset"),
-	description: z$1.string().optional().describe("Description of the dataset"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+const createDatasetBodySchema = z.object({
+	name: z.string().describe("Name of the dataset"),
+	description: z.string().optional().describe("Description of the dataset"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
 	inputSchema: jsonSchemaField.describe("JSON Schema for validating item input"),
 	groundTruthSchema: jsonSchemaField.describe("JSON Schema for validating item groundTruth"),
 	requestContextSchema: jsonSchemaField.describe("JSON Schema describing expected request context shape"),
-	targetType: z$1.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
-	targetIds: z$1.array(z$1.string()).optional().describe("IDs of target entities this dataset is attached to"),
-	scorerIds: z$1.array(z$1.string()).optional().describe("IDs of scorers attached to this dataset")
+	targetType: z.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
+	targetIds: z.array(z.string()).optional().describe("IDs of target entities this dataset is attached to"),
+	scorerIds: z.array(z.string()).optional().describe("IDs of scorers attached to this dataset")
 });
-const updateDatasetBodySchema = z$1.object({
-	name: z$1.string().optional().describe("Name of the dataset"),
-	description: z$1.string().optional().describe("Description of the dataset"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+const updateDatasetBodySchema = z.object({
+	name: z.string().optional().describe("Name of the dataset"),
+	description: z.string().optional().describe("Description of the dataset"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
 	inputSchema: jsonSchemaField.describe("JSON Schema for validating item input"),
 	groundTruthSchema: jsonSchemaField.describe("JSON Schema for validating item groundTruth"),
 	requestContextSchema: jsonSchemaField.describe("JSON Schema describing expected request context shape"),
-	tags: z$1.array(z$1.string()).optional().describe("Tag definitions for categorizing experiment results"),
-	targetType: z$1.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
-	targetIds: z$1.array(z$1.string()).optional().describe("IDs of target entities this dataset is attached to"),
-	scorerIds: z$1.array(z$1.string()).optional().nullable().describe("IDs of scorers attached to this dataset")
+	tags: z.array(z.string()).optional().describe("Tag definitions for categorizing experiment results"),
+	targetType: z.string().optional().describe("Target entity type (e.g. agent, workflow, scorer)"),
+	targetIds: z.array(z.string()).optional().describe("IDs of target entities this dataset is attached to"),
+	scorerIds: z.array(z.string()).optional().nullable().describe("IDs of scorers attached to this dataset")
 });
-const addItemBodySchema = z$1.object({
-	externalId: z$1.string().optional().nullable().describe("Caller-defined, dataset-local item identity"),
-	input: z$1.unknown().describe("Input data for the dataset item"),
-	groundTruth: z$1.unknown().optional().describe("Expected output for comparison"),
+const addItemBodySchema = z.object({
+	externalId: z.string().optional().nullable().describe("Caller-defined, dataset-local item identity"),
+	input: z.unknown().describe("Input data for the dataset item"),
+	groundTruth: z.unknown().optional().describe("Expected output for comparison"),
 	expectedTrajectory: trajectoryExpectationSchema,
 	toolMocks: toolMocksSchema,
 	unmockedToolPolicy: unmockedToolPolicySchema,
-	scorerIds: z$1.array(z$1.string()).optional().describe("IDs of scorers selected for this item"),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Request context preset for this item"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+	scorerIds: z.array(z.string()).optional().describe("IDs of scorers selected for this item"),
+	requestContext: z.record(z.string(), z.unknown()).optional().describe("Request context preset for this item"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
 	source: datasetItemSourceSchema
 });
-const updateItemBodySchema = z$1.object({
-	input: z$1.unknown().optional().describe("Input data for the dataset item"),
-	groundTruth: z$1.unknown().optional().describe("Expected output for comparison"),
+const updateItemBodySchema = z.object({
+	input: z.unknown().optional().describe("Input data for the dataset item"),
+	groundTruth: z.unknown().optional().describe("Expected output for comparison"),
 	expectedTrajectory: trajectoryExpectationSchema,
 	toolMocks: toolMocksSchema,
 	unmockedToolPolicy: unmockedToolPolicySchema,
-	scorerIds: z$1.array(z$1.string()).optional().nullable().describe("IDs of scorers selected for this item"),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Request context preset for this item"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
+	scorerIds: z.array(z.string()).optional().nullable().describe("IDs of scorers selected for this item"),
+	requestContext: z.record(z.string(), z.unknown()).optional().describe("Request context preset for this item"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
 	source: datasetItemSourceSchema
 });
-const updateExperimentBodySchema = z$1.object({
-	name: z$1.string().optional().describe("New name of the experiment"),
-	description: z$1.string().optional().describe("New description of the experiment"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Replacement metadata for the experiment")
+const updateExperimentBodySchema = z.object({
+	name: z.string().optional().describe("New name of the experiment"),
+	description: z.string().optional().describe("New description of the experiment"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Replacement metadata for the experiment")
 }).strict();
-const triggerExperimentBodySchema = z$1.object({
-	start: z$1.boolean().optional().describe("When true (default), spawns the in-process runner. When false, creates the experiment without running it: the caller drives the loop via run-item (targeted) or result submission (target-less)."),
-	targetType: z$1.enum([
+const triggerExperimentBodySchema = z.object({
+	start: z.boolean().optional().describe("When true (default), spawns the in-process runner. When false, creates the experiment without running it: the caller drives the loop via run-item (targeted) or result submission (target-less)."),
+	targetType: z.enum([
 		"agent",
 		"workflow",
 		"scorer"
 	]).optional().describe("Type of target to run against. Required when start is true. Optional for create-only experiments."),
-	targetId: z$1.string().optional().describe("ID of the target. Required when targetType is set."),
-	id: z$1.string().optional().describe("Caller-supplied experiment id (e.g. a workflow run id) for idempotent create-only requests. Ignored when start is true."),
-	name: z$1.string().optional().describe("Name of the experiment"),
-	description: z$1.string().optional().describe("Description of the experiment"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata"),
-	scorerIds: z$1.array(z$1.string()).optional().describe("IDs of scorers to apply"),
-	version: z$1.coerce.number().int().optional().describe("Pin to specific dataset version"),
-	agentVersion: z$1.string().optional().describe("Agent version ID to use for experiment"),
-	maxConcurrency: z$1.number().optional().describe("Maximum concurrent executions"),
-	provenance: z$1.object({
-		source: z$1.string().optional(),
-		sourceId: z$1.string().optional(),
-		sourceVersion: z$1.string().optional(),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	targetId: z.string().optional().describe("ID of the target. Required when targetType is set."),
+	id: z.string().optional().describe("Caller-supplied experiment id (e.g. a workflow run id) for idempotent create-only requests. Ignored when start is true."),
+	name: z.string().optional().describe("Name of the experiment"),
+	description: z.string().optional().describe("Description of the experiment"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata"),
+	scorerIds: z.array(z.string()).optional().describe("IDs of scorers to apply"),
+	version: z.coerce.number().int().optional().describe("Pin to specific dataset version"),
+	agentVersion: z.string().optional().describe("Agent version ID to use for experiment"),
+	maxConcurrency: z.number().optional().describe("Maximum concurrent executions"),
+	provenance: z.object({
+		source: z.string().optional(),
+		sourceId: z.string().optional(),
+		sourceVersion: z.string().optional(),
+		metadata: z.record(z.string(), z.unknown()).optional()
 	}).optional().describe("Caller-provided provenance claims for the experiment execution"),
-	grouping: z$1.object({
-		experimentSetId: z$1.string().optional(),
-		comparisonId: z$1.string().optional(),
-		variantId: z$1.string().optional(),
-		trialIndex: z$1.number().int().min(0).optional()
+	grouping: z.object({
+		experimentSetId: z.string().optional(),
+		comparisonId: z.string().optional(),
+		variantId: z.string().optional(),
+		trialIndex: z.number().int().min(0).optional()
 	}).optional().describe("Stable grouping dimensions for comparisons and repeated trials"),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Global request context passed to the target"),
-	versions: z$1.object({
-		agents: z$1.record(z$1.string(), z$1.union([z$1.object({ versionId: z$1.string() }), z$1.object({ status: z$1.enum(["draft", "published"]) })])).optional(),
-		defaultStatus: z$1.enum(["draft", "published"]).optional()
+	requestContext: z.record(z.string(), z.unknown()).optional().describe("Global request context passed to the target"),
+	versions: z.object({
+		agents: z.record(z.string(), z.union([z.object({ versionId: z.string() }), z.object({ status: z.enum(["draft", "published"]) })])).optional(),
+		defaultStatus: z.enum(["draft", "published"]).optional()
 	}).optional().describe("Version overrides for sub-agent delegation during experiment execution")
 });
-const runExperimentItemBodySchema = z$1.object({
-	attempt: z$1.number().int().min(0).optional().describe("Zero-based repetition index. Defaults to 0."),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Request context merged with the item's own request context (item wins)")
+const runExperimentItemBodySchema = z.object({
+	attempt: z.number().int().min(0).optional().describe("Zero-based repetition index. Defaults to 0."),
+	requestContext: z.record(z.string(), z.unknown()).optional().describe("Request context merged with the item's own request context (item wins)")
 });
-const submitExperimentResultBodySchema = z$1.object({
-	itemId: z$1.string().describe("Dataset item this result belongs to"),
-	attempt: z$1.number().int().min(0).optional().describe("Zero-based repetition index. Defaults to 0."),
-	input: z$1.unknown().optional().describe("Input replayed by the external runner. Defaults to the dataset item input."),
-	output: z$1.unknown().optional().describe("Output produced by the external runner"),
-	groundTruth: z$1.unknown().optional().describe("Ground truth. Defaults to the dataset item groundTruth."),
-	error: z$1.object({
-		message: z$1.string(),
-		stack: z$1.string().optional(),
-		code: z$1.string().optional()
+const submitExperimentResultBodySchema = z.object({
+	itemId: z.string().describe("Dataset item this result belongs to"),
+	attempt: z.number().int().min(0).optional().describe("Zero-based repetition index. Defaults to 0."),
+	input: z.unknown().optional().describe("Input replayed by the external runner. Defaults to the dataset item input."),
+	output: z.unknown().optional().describe("Output produced by the external runner"),
+	groundTruth: z.unknown().optional().describe("Ground truth. Defaults to the dataset item groundTruth."),
+	error: z.object({
+		message: z.string(),
+		stack: z.string().optional(),
+		code: z.string().optional()
 	}).nullable().optional().describe("Failure info when the item run failed"),
-	startedAt: z$1.coerce.date().optional(),
-	completedAt: z$1.coerce.date().optional(),
-	traceId: z$1.string().optional(),
-	scores: z$1.array(z$1.object({
-		scorerId: z$1.string(),
-		scorerName: z$1.string().optional(),
-		score: z$1.number(),
-		reason: z$1.string().optional(),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	startedAt: z.coerce.date().optional(),
+	completedAt: z.coerce.date().optional(),
+	traceId: z.string().optional(),
+	scores: z.array(z.object({
+		scorerId: z.string(),
+		scorerName: z.string().optional(),
+		score: z.number(),
+		reason: z.string().optional(),
+		metadata: z.record(z.string(), z.unknown()).optional()
 	})).optional().describe("Externally computed scores, persisted keyed by runId = experimentId")
 });
-const compareExperimentsBodySchema = z$1.object({
-	experimentIdA: z$1.string().describe("ID of baseline experiment"),
-	experimentIdB: z$1.string().describe("ID of candidate experiment")
+const compareExperimentsBodySchema = z.object({
+	experimentIdA: z.string().describe("ID of baseline experiment"),
+	experimentIdB: z.string().describe("ID of candidate experiment")
 });
-const datasetResponseSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional().nullable(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-	inputSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	groundTruthSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	tags: z$1.array(z$1.string()).optional().nullable(),
-	targetType: z$1.string().optional().nullable(),
-	targetIds: z$1.array(z$1.string()).optional().nullable(),
-	scorerIds: z$1.array(z$1.string()).optional().nullable(),
-	version: z$1.number().int(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const datasetResponseSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	description: z.string().optional().nullable(),
+	metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+	inputSchema: z.record(z.string(), z.unknown()).optional(),
+	groundTruthSchema: z.record(z.string(), z.unknown()).optional(),
+	requestContextSchema: z.record(z.string(), z.unknown()).optional(),
+	tags: z.array(z.string()).optional().nullable(),
+	targetType: z.string().optional().nullable(),
+	targetIds: z.array(z.string()).optional().nullable(),
+	scorerIds: z.array(z.string()).optional().nullable(),
+	version: z.number().int(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 });
-const datasetItemResponseSchema = z$1.object({
-	id: z$1.string(),
-	datasetId: z$1.string(),
-	datasetVersion: z$1.number().int(),
-	externalId: z$1.string().optional().nullable(),
-	input: z$1.unknown(),
-	groundTruth: z$1.unknown().optional(),
-	expectedTrajectory: z$1.unknown().optional(),
+const datasetItemResponseSchema = z.object({
+	id: z.string(),
+	datasetId: z.string(),
+	datasetVersion: z.number().int(),
+	externalId: z.string().optional().nullable(),
+	input: z.unknown(),
+	groundTruth: z.unknown().optional(),
+	expectedTrajectory: z.unknown().optional(),
 	toolMocks: toolMocksSchema.nullable(),
 	unmockedToolPolicy: unmockedToolPolicySchema.nullable(),
-	scorerIds: z$1.array(z$1.string()).optional().nullable(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
+	scorerIds: z.array(z.string()).optional().nullable(),
+	requestContext: z.record(z.string(), z.unknown()).optional().nullable(),
+	metadata: z.record(z.string(), z.unknown()).optional().nullable(),
 	source: datasetItemSourceSchema.nullable(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 });
-const experimentResponseSchema = z$1.object({
-	id: z$1.string(),
-	datasetId: z$1.string().nullable(),
-	datasetVersion: z$1.number().int().nullable(),
-	agentVersion: z$1.string().nullable().optional(),
-	targetType: z$1.enum([
+const experimentResponseSchema = z.object({
+	id: z.string(),
+	datasetId: z.string().nullable(),
+	datasetVersion: z.number().int().nullable(),
+	agentVersion: z.string().nullable().optional(),
+	targetType: z.enum([
 		"agent",
 		"workflow",
 		"scorer",
 		"processor"
 	]).nullable(),
-	targetId: z$1.string().nullable(),
-	scorerIds: z$1.array(z$1.string()).nullable().optional(),
-	name: z$1.string().optional(),
-	description: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	provenance: z$1.object({
-		source: z$1.string().optional(),
-		sourceId: z$1.string().optional(),
-		sourceVersion: z$1.string().optional(),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+	targetId: z.string().nullable(),
+	scorerIds: z.array(z.string()).nullable().optional(),
+	name: z.string().optional(),
+	description: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	provenance: z.object({
+		source: z.string().optional(),
+		sourceId: z.string().optional(),
+		sourceVersion: z.string().optional(),
+		metadata: z.record(z.string(), z.unknown()).optional()
 	}).nullable().optional(),
-	runnerAttestation: z$1.object({
-		runnerId: z$1.string(),
-		invocationId: z$1.string(),
-		runnerVersion: z$1.string().optional()
+	runnerAttestation: z.object({
+		runnerId: z.string(),
+		invocationId: z.string(),
+		runnerVersion: z.string().optional()
 	}).nullable().optional(),
-	experimentSetId: z$1.string().nullable().optional(),
-	comparisonId: z$1.string().nullable().optional(),
-	variantId: z$1.string().nullable().optional(),
-	trialIndex: z$1.number().int().nullable().optional(),
-	status: z$1.enum([
+	experimentSetId: z.string().nullable().optional(),
+	comparisonId: z.string().nullable().optional(),
+	variantId: z.string().nullable().optional(),
+	trialIndex: z.number().int().nullable().optional(),
+	status: z.enum([
 		"pending",
 		"running",
 		"completed",
 		"failed"
 	]),
-	totalItems: z$1.number(),
-	succeededCount: z$1.number(),
-	failedCount: z$1.number(),
-	skippedCount: z$1.number(),
-	startedAt: z$1.coerce.date().nullable(),
-	completedAt: z$1.coerce.date().nullable(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+	totalItems: z.number(),
+	succeededCount: z.number(),
+	failedCount: z.number(),
+	skippedCount: z.number(),
+	startedAt: z.coerce.date().nullable(),
+	completedAt: z.coerce.date().nullable(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 });
-z$1.object({
-	scorerId: z$1.string(),
-	scorerName: z$1.string(),
-	score: z$1.number().nullable(),
-	reason: z$1.string().nullable(),
-	error: z$1.string().nullable()
+z.object({
+	scorerId: z.string(),
+	scorerName: z.string(),
+	score: z.number().nullable(),
+	reason: z.string().nullable(),
+	error: z.string().nullable()
 });
-const experimentResultResponseSchema = z$1.object({
-	id: z$1.string(),
-	experimentId: z$1.string(),
-	itemId: z$1.string(),
-	itemDatasetVersion: z$1.number().int().nullable(),
-	input: z$1.unknown(),
-	output: z$1.unknown().nullable(),
-	groundTruth: z$1.unknown().nullable(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-	expectedTrajectory: z$1.unknown().optional(),
-	error: z$1.object({
-		message: z$1.string(),
-		stack: z$1.string().optional(),
-		code: z$1.string().optional()
+const experimentResultResponseSchema = z.object({
+	id: z.string(),
+	experimentId: z.string(),
+	itemId: z.string(),
+	itemDatasetVersion: z.number().int().nullable(),
+	input: z.unknown(),
+	output: z.unknown().nullable(),
+	groundTruth: z.unknown().nullable(),
+	metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+	expectedTrajectory: z.unknown().optional(),
+	error: z.object({
+		message: z.string(),
+		stack: z.string().optional(),
+		code: z.string().optional()
 	}).nullable(),
-	startedAt: z$1.coerce.date(),
-	completedAt: z$1.coerce.date(),
-	retryCount: z$1.number(),
-	attempt: z$1.number().int().optional(),
-	traceId: z$1.string().nullable(),
-	status: z$1.enum([
+	startedAt: z.coerce.date(),
+	completedAt: z.coerce.date(),
+	retryCount: z.number(),
+	attempt: z.number().int().optional(),
+	traceId: z.string().nullable(),
+	status: z.enum([
 		"needs-review",
 		"reviewed",
 		"complete"
 	]).nullable().optional(),
-	tags: z$1.array(z$1.string()).nullable().optional(),
-	comment: z$1.string().nullable().optional(),
+	tags: z.array(z.string()).nullable().optional(),
+	comment: z.string().nullable().optional(),
 	toolMockReport: toolMockReportSchema.nullable(),
-	createdAt: z$1.coerce.date()
+	createdAt: z.coerce.date()
 });
-const runExperimentItemResponseSchema = z$1.object({
+const runExperimentItemResponseSchema = z.object({
 	result: experimentResultResponseSchema,
-	scores: z$1.array(z$1.object({
-		scorerId: z$1.string(),
-		scorerName: z$1.string(),
-		score: z$1.number().nullable(),
-		reason: z$1.string().nullable(),
-		error: z$1.string().nullable(),
-		failedStep: z$1.string().optional(),
-		completedSteps: z$1.array(z$1.string()).optional(),
-		targetScope: z$1.enum(["span", "trajectory"]).optional(),
-		stepId: z$1.string().optional()
+	scores: z.array(z.object({
+		scorerId: z.string(),
+		scorerName: z.string(),
+		score: z.number().nullable(),
+		reason: z.string().nullable(),
+		error: z.string().nullable(),
+		failedStep: z.string().optional(),
+		completedSteps: z.array(z.string()).optional(),
+		targetScope: z.enum(["span", "trajectory"]).optional(),
+		stepId: z.string().optional()
 	}))
 });
-const updateExperimentResultBodySchema = z$1.object({
-	status: z$1.enum([
+const updateExperimentResultBodySchema = z.object({
+	status: z.enum([
 		"needs-review",
 		"reviewed",
 		"complete"
 	]).nullable().optional(),
-	tags: z$1.array(z$1.string()).optional(),
-	comment: z$1.string().nullable().optional()
+	tags: z.array(z.string()).optional(),
+	comment: z.string().nullable().optional()
 });
-const comparisonItemSchema = z$1.object({
-	itemId: z$1.string(),
-	input: z$1.unknown().nullable(),
-	groundTruth: z$1.unknown().nullable(),
-	results: z$1.record(z$1.string(), z$1.object({
-		output: z$1.unknown().nullable(),
-		scores: z$1.record(z$1.string(), z$1.number().nullable())
+const comparisonItemSchema = z.object({
+	itemId: z.string(),
+	input: z.unknown().nullable(),
+	groundTruth: z.unknown().nullable(),
+	results: z.record(z.string(), z.object({
+		output: z.unknown().nullable(),
+		scores: z.record(z.string(), z.number().nullable())
 	}).nullable())
 });
-const comparisonResponseSchema = z$1.object({
-	baselineId: z$1.string(),
-	items: z$1.array(comparisonItemSchema)
+const comparisonResponseSchema = z.object({
+	baselineId: z.string(),
+	items: z.array(comparisonItemSchema)
 });
-const experimentSummaryResponseSchema = z$1.object({
-	experimentId: z$1.string(),
-	status: z$1.enum([
+const experimentSummaryResponseSchema = z.object({
+	experimentId: z.string(),
+	status: z.enum([
 		"pending",
 		"running",
 		"completed",
 		"failed"
 	]),
-	totalItems: z$1.number(),
-	succeededCount: z$1.number(),
-	failedCount: z$1.number(),
-	datasetVersion: z$1.number().int().optional().describe("Dataset version pinned on the experiment (create-only)"),
-	startedAt: z$1.coerce.date().nullable(),
-	completedAt: z$1.coerce.date().nullable(),
-	results: z$1.array(z$1.object({
-		itemId: z$1.string(),
-		itemDatasetVersion: z$1.number().int().nullable(),
-		input: z$1.unknown(),
-		output: z$1.unknown().nullable(),
-		groundTruth: z$1.unknown().nullable(),
-		metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-		error: z$1.string().nullable(),
-		startedAt: z$1.coerce.date(),
-		completedAt: z$1.coerce.date(),
-		retryCount: z$1.number(),
+	totalItems: z.number(),
+	succeededCount: z.number(),
+	failedCount: z.number(),
+	datasetVersion: z.number().int().optional().describe("Dataset version pinned on the experiment (create-only)"),
+	startedAt: z.coerce.date().nullable(),
+	completedAt: z.coerce.date().nullable(),
+	results: z.array(z.object({
+		itemId: z.string(),
+		itemDatasetVersion: z.number().int().nullable(),
+		input: z.unknown(),
+		output: z.unknown().nullable(),
+		groundTruth: z.unknown().nullable(),
+		metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+		error: z.string().nullable(),
+		startedAt: z.coerce.date(),
+		completedAt: z.coerce.date(),
+		retryCount: z.number(),
 		toolMockReport: toolMockReportSchema.nullable(),
-		scores: z$1.array(z$1.object({
-			scorerId: z$1.string(),
-			scorerName: z$1.string(),
-			score: z$1.number().nullable(),
-			reason: z$1.string().nullable(),
-			error: z$1.string().nullable()
+		scores: z.array(z.object({
+			scorerId: z.string(),
+			scorerName: z.string(),
+			score: z.number().nullable(),
+			reason: z.string().nullable(),
+			error: z.string().nullable()
 		}))
 	}))
 });
-const listDatasetsResponseSchema = z$1.object({
-	datasets: z$1.array(datasetResponseSchema),
+const listDatasetsResponseSchema = z.object({
+	datasets: z.array(datasetResponseSchema),
 	pagination: paginationInfoSchema$1
 });
-const listItemsResponseSchema = z$1.object({
-	items: z$1.array(datasetItemResponseSchema),
+const listItemsResponseSchema = z.object({
+	items: z.array(datasetItemResponseSchema),
 	pagination: paginationInfoSchema$1
 });
-const listExperimentsResponseSchema = z$1.object({
-	experiments: z$1.array(experimentResponseSchema),
+const listExperimentsResponseSchema = z.object({
+	experiments: z.array(experimentResponseSchema),
 	pagination: paginationInfoSchema$1
 });
-const listExperimentResultsResponseSchema = z$1.object({
-	results: z$1.array(experimentResultResponseSchema),
+const listExperimentResultsResponseSchema = z.object({
+	results: z.array(experimentResultResponseSchema),
 	pagination: paginationInfoSchema$1
 });
-const experimentReviewCountsSchema = z$1.object({
-	experimentId: z$1.string(),
-	total: z$1.number().int(),
-	needsReview: z$1.number().int(),
-	reviewed: z$1.number().int(),
-	complete: z$1.number().int()
+const experimentReviewCountsSchema = z.object({
+	experimentId: z.string(),
+	total: z.number().int(),
+	needsReview: z.number().int(),
+	reviewed: z.number().int(),
+	complete: z.number().int()
 });
-const reviewSummaryResponseSchema = z$1.object({ counts: z$1.array(experimentReviewCountsSchema) });
-const datasetItemVersionPathParams = z$1.object({
-	datasetId: z$1.string().describe("Unique identifier for the dataset"),
-	itemId: z$1.string().describe("Unique identifier for the dataset item"),
-	datasetVersion: z$1.coerce.number().int().describe("Dataset version number")
+const reviewSummaryResponseSchema = z.object({ counts: z.array(experimentReviewCountsSchema) });
+const datasetItemVersionPathParams = z.object({
+	datasetId: z.string().describe("Unique identifier for the dataset"),
+	itemId: z.string().describe("Unique identifier for the dataset item"),
+	datasetVersion: z.coerce.number().int().describe("Dataset version number")
 });
-const itemVersionResponseSchema = z$1.object({
-	id: z$1.string(),
-	datasetId: z$1.string(),
-	datasetVersion: z$1.number().int(),
-	input: z$1.unknown(),
-	groundTruth: z$1.unknown().optional(),
-	expectedTrajectory: z$1.unknown().optional(),
+const itemVersionResponseSchema = z.object({
+	id: z.string(),
+	datasetId: z.string(),
+	datasetVersion: z.number().int(),
+	input: z.unknown(),
+	groundTruth: z.unknown().optional(),
+	expectedTrajectory: z.unknown().optional(),
 	toolMocks: toolMocksSchema.nullable(),
 	unmockedToolPolicy: unmockedToolPolicySchema.nullable(),
-	scorerIds: z$1.array(z$1.string()).optional().nullable(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().nullable(),
-	validTo: z$1.number().int().nullable(),
-	isDeleted: z$1.boolean(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+	scorerIds: z.array(z.string()).optional().nullable(),
+	requestContext: z.record(z.string(), z.unknown()).optional().nullable(),
+	metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+	validTo: z.number().int().nullable(),
+	isDeleted: z.boolean(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 });
-const listItemVersionsResponseSchema = z$1.object({ history: z$1.array(itemVersionResponseSchema) });
-const datasetVersionResponseSchema = z$1.object({
-	id: z$1.string(),
-	datasetId: z$1.string(),
-	version: z$1.number().int(),
-	createdAt: z$1.coerce.date()
+const listItemVersionsResponseSchema = z.object({ history: z.array(itemVersionResponseSchema) });
+const datasetVersionResponseSchema = z.object({
+	id: z.string(),
+	datasetId: z.string(),
+	version: z.number().int(),
+	createdAt: z.coerce.date()
 });
-const listDatasetVersionsResponseSchema = z$1.object({
-	versions: z$1.array(datasetVersionResponseSchema),
+const listDatasetVersionsResponseSchema = z.object({
+	versions: z.array(datasetVersionResponseSchema),
 	pagination: paginationInfoSchema$1
 });
-const batchInsertItemsBodySchema = z$1.object({ items: z$1.array(z$1.object({
-	externalId: z$1.string().optional().nullable(),
-	input: z$1.unknown(),
-	groundTruth: z$1.unknown().optional(),
+const batchInsertItemsBodySchema = z.object({ items: z.array(z.object({
+	externalId: z.string().optional().nullable(),
+	input: z.unknown(),
+	groundTruth: z.unknown().optional(),
 	expectedTrajectory: trajectoryExpectationSchema,
 	toolMocks: toolMocksSchema,
 	unmockedToolPolicy: unmockedToolPolicySchema,
-	scorerIds: z$1.array(z$1.string()).optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	scorerIds: z.array(z.string()).optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
 	source: datasetItemSourceSchema
 })) });
-const batchInsertItemsResponseSchema = z$1.object({
-	items: z$1.array(datasetItemResponseSchema),
-	count: z$1.number()
+const batchInsertItemsResponseSchema = z.object({
+	items: z.array(datasetItemResponseSchema),
+	count: z.number()
 });
-const batchDeleteItemsBodySchema = z$1.object({ itemIds: z$1.array(z$1.string()) });
-const batchDeleteItemsResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	deletedCount: z$1.number()
+const batchDeleteItemsBodySchema = z.object({ itemIds: z.array(z.string()) });
+const batchDeleteItemsResponseSchema = z.object({
+	success: z.boolean(),
+	deletedCount: z.number()
 });
-const generateItemsBodySchema = z$1.object({
-	modelId: z$1.string().describe("Model identifier in \"provider/model\" format (e.g., \"openai/gpt-4o\")"),
-	prompt: z$1.string().describe("Description of the kind of test data to generate"),
-	count: z$1.number().int().min(1).max(50).default(5).describe("Number of items to generate"),
-	agentContext: z$1.object({
-		description: z$1.string().optional(),
-		instructions: z$1.string().optional(),
-		tools: z$1.array(z$1.string()).optional()
+const generateItemsBodySchema = z.object({
+	modelId: z.string().describe("Model identifier in \"provider/model\" format (e.g., \"openai/gpt-4o\")"),
+	prompt: z.string().describe("Description of the kind of test data to generate"),
+	count: z.number().int().min(1).max(50).default(5).describe("Number of items to generate"),
+	agentContext: z.object({
+		description: z.string().optional(),
+		instructions: z.string().optional(),
+		tools: z.array(z.string()).optional()
 	}).optional().describe("Context about the agent to generate relevant test data")
 });
-const generatedItemSchema = z$1.object({
-	input: z$1.unknown(),
-	groundTruth: z$1.unknown().optional()
+const generatedItemSchema = z.object({
+	input: z.unknown(),
+	groundTruth: z.unknown().optional()
 });
-const generateItemsResponseSchema = z$1.object({ items: z$1.array(generatedItemSchema) });
-const clusterFailuresBodySchema = z$1.object({
-	modelId: z$1.string().describe("Model identifier in \"provider/model\" format (e.g., \"openai/gpt-4o\")"),
-	items: z$1.array(z$1.object({
-		id: z$1.string(),
-		input: z$1.unknown(),
-		output: z$1.unknown().optional(),
-		error: z$1.string().optional(),
-		scores: z$1.record(z$1.string(), z$1.number()).optional(),
-		existingTags: z$1.array(z$1.string()).optional().describe("Tags already applied to this item")
+const generateItemsResponseSchema = z.object({ items: z.array(generatedItemSchema) });
+const clusterFailuresBodySchema = z.object({
+	modelId: z.string().describe("Model identifier in \"provider/model\" format (e.g., \"openai/gpt-4o\")"),
+	items: z.array(z.object({
+		id: z.string(),
+		input: z.unknown(),
+		output: z.unknown().optional(),
+		error: z.string().optional(),
+		scores: z.record(z.string(), z.number()).optional(),
+		existingTags: z.array(z.string()).optional().describe("Tags already applied to this item")
 	})).min(1).max(200).describe("Failure items to cluster"),
-	availableTags: z$1.array(z$1.string()).optional().describe("Existing tag vocabulary from the dataset. The LLM should prefer reusing these tags when applicable."),
-	prompt: z$1.string().optional().describe("Optional user instructions to guide the analysis (e.g., \"focus on tool usage failures\")")
+	availableTags: z.array(z.string()).optional().describe("Existing tag vocabulary from the dataset. The LLM should prefer reusing these tags when applicable."),
+	prompt: z.string().optional().describe("Optional user instructions to guide the analysis (e.g., \"focus on tool usage failures\")")
 });
-const failureClusterSchema = z$1.object({
-	id: z$1.string().describe("A unique cluster identifier"),
-	label: z$1.string().describe("Short label for this failure pattern"),
-	description: z$1.string().describe("Description of the common pattern"),
-	itemIds: z$1.array(z$1.string()).describe("IDs of items belonging to this cluster")
+const failureClusterSchema = z.object({
+	id: z.string().describe("A unique cluster identifier"),
+	label: z.string().describe("Short label for this failure pattern"),
+	description: z.string().describe("Description of the common pattern"),
+	itemIds: z.array(z.string()).describe("IDs of items belonging to this cluster")
 });
-const clusterFailuresResponseSchema = z$1.object({
-	clusters: z$1.array(failureClusterSchema),
+const clusterFailuresResponseSchema = z.object({
+	clusters: z.array(failureClusterSchema),
 	/** Per-item proposed tag assignments. Each entry maps an item ID to the tags the LLM suggests adding. */
-	proposedTags: z$1.array(z$1.object({
-		itemId: z$1.string(),
-		tags: z$1.array(z$1.string()),
-		reason: z$1.string().describe("Brief explanation of why these tags were assigned to this item")
+	proposedTags: z.array(z.object({
+		itemId: z.string(),
+		tags: z.array(z.string()),
+		reason: z.string().describe("Brief explanation of why these tags were assigned to this item")
 	})).optional()
 });
 
@@ -38898,11 +39191,11 @@ const GENERATE_ITEMS_ROUTE = createRoute$1({
 				instructions: GENERATE_ITEMS_SYSTEM_PROMPT,
 				model
 			});
-			const itemSchema = z.object({
-				input: z.string().describe("The input data as a JSON string matching the input schema, or a plain text string if no schema"),
-				groundTruth: z.string().optional().describe("The expected output as a JSON string matching the ground truth schema")
+			const itemSchema = z$1.object({
+				input: z$1.string().describe("The input data as a JSON string matching the input schema, or a plain text string if no schema"),
+				groundTruth: z$1.string().optional().describe("The expected output as a JSON string matching the ground truth schema")
 			});
-			const outputSchema = z.object({ items: z.array(itemSchema).min(1).max(count) });
+			const outputSchema = z$1.object({ items: z$1.array(itemSchema).min(1).max(count) });
 			const agentContextParts = [];
 			if (agentContext?.description) agentContextParts.push(`Agent description: ${agentContext.description}`);
 			if (agentContext?.instructions) agentContextParts.push(`Agent system prompt:\n${agentContext.instructions}`);
@@ -38974,17 +39267,17 @@ const CLUSTER_FAILURES_ROUTE = createRoute$1({
 				instructions: CLUSTER_FAILURES_SYSTEM_PROMPT,
 				model
 			});
-			const outputSchema = z.object({
-				clusters: z.array(z.object({
-					id: z.string(),
-					label: z.string(),
-					description: z.string(),
-					itemIds: z.array(z.string())
+			const outputSchema = z$1.object({
+				clusters: z$1.array(z$1.object({
+					id: z$1.string(),
+					label: z$1.string(),
+					description: z$1.string(),
+					itemIds: z$1.array(z$1.string())
 				})),
-				proposedTags: z.array(z.object({
-					itemId: z.string(),
-					tags: z.array(z.string()),
-					reason: z.string().describe("Brief explanation of why these tags were assigned")
+				proposedTags: z$1.array(z$1.object({
+					itemId: z$1.string(),
+					tags: z$1.array(z$1.string()),
+					reason: z$1.string().describe("Brief explanation of why these tags were assigned")
 				}))
 			});
 			const itemSummaries = items.map((item, i) => {
@@ -39027,23 +39320,23 @@ const CLUSTER_FAILURES_ROUTE = createRoute$1({
 *   provided. Omitted with no config ⇒ silently `false` (no warning).
 *   Explicit `true` with no config ⇒ warns and downgrades to `false`.
 */
-const agentFeaturesSchema = z$1.object({
-	tools: z$1.boolean().optional(),
-	agents: z$1.boolean().optional(),
-	workflows: z$1.boolean().optional(),
-	scorers: z$1.boolean().optional(),
-	skills: z$1.boolean().optional(),
-	memory: z$1.boolean().optional(),
-	variables: z$1.boolean().optional(),
-	favorites: z$1.boolean().optional(),
-	avatarUpload: z$1.boolean().optional(),
-	browser: z$1.boolean().optional(),
+const agentFeaturesSchema = z.object({
+	tools: z.boolean().optional(),
+	agents: z.boolean().optional(),
+	workflows: z.boolean().optional(),
+	scorers: z.boolean().optional(),
+	skills: z.boolean().optional(),
+	memory: z.boolean().optional(),
+	variables: z.boolean().optional(),
+	favorites: z.boolean().optional(),
+	avatarUpload: z.boolean().optional(),
+	browser: z.boolean().optional(),
 	/**
 	* Whether the model picker is visible in the Agent Builder.
 	* Omitted ⇒ picker visible (default-on). Explicit `false` ⇒ picker hidden
 	* (locked mode); `models.default` is required and applied.
 	*/
-	model: z$1.boolean().optional()
+	model: z.boolean().optional()
 });
 /**
 * Allowlist + default-model entries for {@link agentModelsSchema}.
@@ -39054,31 +39347,31 @@ const agentFeaturesSchema = z$1.object({
 *
 * NOTE: `z.union(...).extend()` does not exist; that's why these are separate schemas.
 */
-const knownProviderEntrySchema = z$1.object({
-	provider: z$1.string().min(1),
-	modelId: z$1.string().min(1).optional()
+const knownProviderEntrySchema = z.object({
+	provider: z.string().min(1),
+	modelId: z.string().min(1).optional()
 }).strict();
-const customProviderEntrySchema = z$1.object({
-	kind: z$1.literal("custom"),
-	provider: z$1.string().min(1),
-	modelId: z$1.string().min(1).optional()
+const customProviderEntrySchema = z.object({
+	kind: z.literal("custom"),
+	provider: z.string().min(1),
+	modelId: z.string().min(1).optional()
 }).strict();
-const knownDefaultModelEntrySchema = z$1.object({
-	provider: z$1.string().min(1),
-	modelId: z$1.string().min(1)
+const knownDefaultModelEntrySchema = z.object({
+	provider: z.string().min(1),
+	modelId: z.string().min(1)
 }).strict();
-const customDefaultModelEntrySchema = z$1.object({
-	kind: z$1.literal("custom"),
-	provider: z$1.string().min(1),
-	modelId: z$1.string().min(1)
+const customDefaultModelEntrySchema = z.object({
+	kind: z.literal("custom"),
+	provider: z.string().min(1),
+	modelId: z.string().min(1)
 }).strict();
-const providerModelEntrySchema = z$1.union([customProviderEntrySchema, knownProviderEntrySchema]);
-const defaultModelEntrySchema = z$1.union([customDefaultModelEntrySchema, knownDefaultModelEntrySchema]);
+const providerModelEntrySchema = z.union([customProviderEntrySchema, knownProviderEntrySchema]);
+const defaultModelEntrySchema = z.union([customDefaultModelEntrySchema, knownDefaultModelEntrySchema]);
 /**
 * Admin-controlled model allowlist + default for the Agent Builder.
 */
-const agentModelsSchema = z$1.object({
-	allowed: z$1.array(providerModelEntrySchema).optional(),
+const agentModelsSchema = z.object({
+	allowed: z.array(providerModelEntrySchema).optional(),
 	default: defaultModelEntrySchema.optional()
 });
 /**
@@ -39089,19 +39382,19 @@ const agentModelsSchema = z$1.object({
 * - `allowed: []` ⇒ empty picker (explicit lockdown).
 * - `allowed: [...ids]` ⇒ only the listed IDs are shown.
 */
-const pickerAllowlistSchema = z$1.object({ allowed: z$1.array(z$1.string()).optional() }).strict();
+const pickerAllowlistSchema = z.object({ allowed: z.array(z.string()).optional() }).strict();
 /**
 * Agent configuration (pinned, non-overridable settings).
 *
 * Known structured field: `models` (Phase 1 contracts).
 * Other keys flow through unchanged for forward compatibility.
 */
-const agentConfigurationSchema = z$1.object({
+const agentConfigurationSchema = z.object({
 	models: agentModelsSchema.optional(),
 	tools: pickerAllowlistSchema.optional(),
 	agents: pickerAllowlistSchema.optional(),
 	workflows: pickerAllowlistSchema.optional()
-}).catchall(z$1.unknown());
+}).catchall(z.unknown());
 /**
 * Resolved picker visibility returned in `BuilderSettingsResponse`.
 *
@@ -39109,10 +39402,10 @@ const agentConfigurationSchema = z$1.object({
 * - `null` ⇒ unrestricted (show all registered entries).
 * - `string[]` ⇒ explicit allowlist (may be empty to show none).
 */
-const builderPickerSchema = z$1.object({
-	visibleTools: z$1.array(z$1.string()).nullable(),
-	visibleAgents: z$1.array(z$1.string()).nullable(),
-	visibleWorkflows: z$1.array(z$1.string()).nullable()
+const builderPickerSchema = z.object({
+	visibleTools: z.array(z.string()).nullable(),
+	visibleAgents: z.array(z.string()).nullable(),
+	visibleWorkflows: z.array(z.string()).nullable()
 });
 /**
 * Derived `BuilderModelPolicy`. Server-owned shape so the playground hook is a
@@ -39123,19 +39416,19 @@ const builderPickerSchema = z$1.object({
 * - `active: true` + `pickerVisible: false` (locked) ⇒ `default` set in valid configs.
 * - `allowed`/`default` are passed through verbatim when present.
 */
-const builderModelPolicySchema = z$1.object({
-	active: z$1.boolean(),
-	pickerVisible: z$1.boolean().optional(),
-	allowed: z$1.array(providerModelEntrySchema).optional(),
+const builderModelPolicySchema = z.object({
+	active: z.boolean(),
+	pickerVisible: z.boolean().optional(),
+	allowed: z.array(providerModelEntrySchema).optional(),
 	default: defaultModelEntrySchema.optional()
 });
 /**
 * Response schema for GET /editor/builder/settings
 */
-const builderSettingsResponseSchema = z$1.object({
-	enabled: z$1.boolean(),
-	features: z$1.object({ agent: agentFeaturesSchema.optional() }).optional(),
-	configuration: z$1.object({ agent: agentConfigurationSchema.optional() }).optional(),
+const builderSettingsResponseSchema = z.object({
+	enabled: z.boolean(),
+	features: z.object({ agent: agentFeaturesSchema.optional() }).optional(),
+	configuration: z.object({ agent: agentConfigurationSchema.optional() }).optional(),
 	modelPolicy: builderModelPolicySchema.optional(),
 	/**
 	* Resolved picker visibility for tools/agents/workflows. Always present when
@@ -39148,7 +39441,7 @@ const builderSettingsResponseSchema = z$1.object({
 	* picker allowlist entries that don't match a registered ID). UI surfaces
 	* these as a banner in the Builder admin view.
 	*/
-	modelPolicyWarnings: z$1.array(z$1.string()).optional()
+	modelPolicyWarnings: z.array(z.string()).optional()
 });
 /**
 * Infrastructure status response for Agent Builder admin diagnostics.
@@ -39156,40 +39449,40 @@ const builderSettingsResponseSchema = z$1.object({
 * Reports the Agent Builder-specific primitive configuration plus lightweight
 * runtime resolution state where useful.
 */
-const infrastructureStatusResponseSchema = z$1.object({
-	channels: z$1.object({ providers: z$1.array(z$1.object({
-		id: z$1.string(),
-		name: z$1.string(),
-		isConfigured: z$1.boolean(),
-		routeCount: z$1.number()
+const infrastructureStatusResponseSchema = z.object({
+	channels: z.object({ providers: z.array(z.object({
+		id: z.string(),
+		name: z.string(),
+		isConfigured: z.boolean(),
+		routeCount: z.number()
 	})) }),
-	browser: z$1.object({
-		type: z$1.string().nullable(),
-		provider: z$1.string().nullable(),
-		env: z$1.string().nullable(),
-		registered: z$1.boolean(),
-		availableProviders: z$1.array(z$1.string()),
-		config: z$1.array(z$1.object({
-			key: z$1.string(),
-			value: z$1.string()
+	browser: z.object({
+		type: z.string().nullable(),
+		provider: z.string().nullable(),
+		env: z.string().nullable(),
+		registered: z.boolean(),
+		availableProviders: z.array(z.string()),
+		config: z.array(z.object({
+			key: z.string(),
+			value: z.string()
 		}))
 	}),
-	workspace: z$1.object({
-		type: z$1.string().nullable(),
-		workspaceId: z$1.string().nullable(),
-		name: z$1.string().nullable(),
-		source: z$1.string().nullable(),
-		registered: z$1.boolean(),
-		hasFilesystem: z$1.boolean(),
-		hasSandbox: z$1.boolean(),
-		filesystemProvider: z$1.string().nullable(),
-		sandboxProvider: z$1.string().nullable(),
-		config: z$1.array(z$1.object({
-			key: z$1.string(),
-			value: z$1.string()
+	workspace: z.object({
+		type: z.string().nullable(),
+		workspaceId: z.string().nullable(),
+		name: z.string().nullable(),
+		source: z.string().nullable(),
+		registered: z.boolean(),
+		hasFilesystem: z.boolean(),
+		hasSandbox: z.boolean(),
+		filesystemProvider: z.string().nullable(),
+		sandboxProvider: z.string().nullable(),
+		config: z.array(z.object({
+			key: z.string(),
+			value: z.string()
 		}))
 	}),
-	registries: z$1.object({ skillsSh: z$1.object({ enabled: z$1.boolean() }) })
+	registries: z.object({ skillsSh: z.object({ enabled: z.boolean() }) })
 });
 /**
 * Response schema for GET /editor/builder/models/available.
@@ -39199,7 +39492,7 @@ const infrastructureStatusResponseSchema = z$1.object({
 * the EE allowlist). Providers with no allowed models are omitted entirely so
 * the Studio model picker can render the response verbatim.
 */
-const builderAvailableModelsResponseSchema = z$1.object({ providers: z$1.array(providerSchema) });
+const builderAvailableModelsResponseSchema = z.object({ providers: z.array(providerSchema) });
 
 //#region src/server/utils/resolve-builder-model-policy.ts
 /**
@@ -39534,37 +39827,37 @@ const GET_INFRASTRUCTURE_STATUS_ROUTE = createRoute$1({
 const listMCPClientVersionsQuerySchema = listVersionsQuerySchema;
 const compareMCPClientVersionsQuerySchema = compareVersionsQuerySchema;
 const createMCPClientVersionBodySchema = createVersionBodySchema;
-const mcpClientVersionPathParams = z$1.object({ mcpClientId: z$1.string().describe("Unique identifier for the stored MCP client") });
-const mcpClientVersionIdPathParams = z$1.object({
-	mcpClientId: z$1.string().describe("Unique identifier for the stored MCP client"),
-	versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+const mcpClientVersionPathParams = z.object({ mcpClientId: z.string().describe("Unique identifier for the stored MCP client") });
+const mcpClientVersionIdPathParams = z.object({
+	mcpClientId: z.string().describe("Unique identifier for the stored MCP client"),
+	versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-const mcpServerConfigSchema$1 = z$1.object({
-	type: z$1.enum(["stdio", "http"]),
-	command: z$1.string().optional(),
-	args: z$1.array(z$1.string()).optional(),
-	env: z$1.record(z$1.string(), z$1.string()).optional(),
-	url: z$1.string().optional(),
-	timeout: z$1.number().optional()
+const mcpServerConfigSchema$1 = z.object({
+	type: z.enum(["stdio", "http"]),
+	command: z.string().optional(),
+	args: z.array(z.string()).optional(),
+	env: z.record(z.string(), z.string()).optional(),
+	url: z.string().optional(),
+	timeout: z.number().optional()
 });
-const mcpClientVersionSchema = z$1.object({
-	id: z$1.string().describe("Unique identifier for the version (UUID)"),
-	mcpClientId: z$1.string().describe("ID of the MCP client this version belongs to"),
-	versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-	name: z$1.string().describe("Name of the MCP client"),
-	description: z$1.string().optional().describe("Description of the MCP client"),
-	servers: z$1.record(z$1.string(), mcpServerConfigSchema$1),
-	changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-	changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-	createdAt: z$1.coerce.date().describe("When this version was created")
+const mcpClientVersionSchema = z.object({
+	id: z.string().describe("Unique identifier for the version (UUID)"),
+	mcpClientId: z.string().describe("ID of the MCP client this version belongs to"),
+	versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+	name: z.string().describe("Name of the MCP client"),
+	description: z.string().optional().describe("Description of the MCP client"),
+	servers: z.record(z.string(), mcpServerConfigSchema$1),
+	changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+	changeMessage: z.string().optional().describe("Optional message describing the changes"),
+	createdAt: z.coerce.date().describe("When this version was created")
 });
 const listMCPClientVersionsResponseSchema = createListVersionsResponseSchema(mcpClientVersionSchema);
 const getMCPClientVersionResponseSchema = mcpClientVersionSchema;
-const createMCPClientVersionResponseSchema = mcpClientVersionSchema.partial().merge(z$1.object({
-	id: z$1.string(),
-	mcpClientId: z$1.string(),
-	versionNumber: z$1.number(),
-	createdAt: z$1.coerce.date()
+const createMCPClientVersionResponseSchema = mcpClientVersionSchema.partial().merge(z.object({
+	id: z.string(),
+	mcpClientId: z.string(),
+	versionNumber: z.number(),
+	createdAt: z.coerce.date()
 }));
 const activateMCPClientVersionResponseSchema = activateVersionResponseSchema;
 const restoreMCPClientVersionResponseSchema = mcpClientVersionSchema;
@@ -39835,8 +40128,8 @@ const COMPARE_MCP_CLIENT_VERSIONS_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/processor-providers.ts
-const processorProviderIdPathParams = z$1.object({ providerId: z$1.string().describe("Unique identifier for the processor provider") });
-const processorPhaseSchema = z$1.enum([
+const processorProviderIdPathParams = z.object({ providerId: z.string().describe("Unique identifier for the processor provider") });
+const processorPhaseSchema = z.enum([
 	"processInput",
 	"processInputStep",
 	"processOutputStream",
@@ -39844,18 +40137,18 @@ const processorPhaseSchema = z$1.enum([
 	"processOutputStep",
 	"processToolResult"
 ]);
-const getProcessorProvidersResponseSchema = z$1.object({ providers: z$1.array(z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	availablePhases: z$1.array(processorPhaseSchema)
+const getProcessorProvidersResponseSchema = z.object({ providers: z.array(z.object({
+	id: z.string(),
+	name: z.string(),
+	description: z.string().optional(),
+	availablePhases: z.array(processorPhaseSchema)
 })) });
-const getProcessorProviderResponseSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string(),
-	description: z$1.string().optional(),
-	availablePhases: z$1.array(processorPhaseSchema),
-	configSchema: z$1.record(z$1.string(), z$1.unknown())
+const getProcessorProviderResponseSchema = z.object({
+	id: z.string(),
+	name: z.string(),
+	description: z.string().optional(),
+	availablePhases: z.array(processorPhaseSchema),
+	configSchema: z.record(z.string(), z.unknown())
 });
 
 //#region src/server/handlers/processor-providers.ts
@@ -39916,30 +40209,30 @@ const GET_PROCESSOR_PROVIDER_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/processors.ts
-const processorIdPathParams = z$1.object({ processorId: z$1.string().describe("Unique identifier for the processor") });
+const processorIdPathParams = z.object({ processorId: z.string().describe("Unique identifier for the processor") });
 /**
 * Schema for processor configuration (how it's attached to an agent)
 */
-const processorConfigurationSchema = z$1.object({
-	agentId: z$1.string(),
-	agentName: z$1.string(),
-	type: z$1.enum(["input", "output"])
+const processorConfigurationSchema = z.object({
+	agentId: z.string(),
+	agentName: z.string(),
+	type: z.enum(["input", "output"])
 });
 /**
 * Schema for processor configuration in list response (simplified)
 */
-const processorListConfigurationSchema = z$1.object({
-	agentId: z$1.string(),
-	type: z$1.enum(["input", "output"])
+const processorListConfigurationSchema = z.object({
+	agentId: z.string(),
+	type: z.enum(["input", "output"])
 });
 /**
 * Schema for processor in list response
 */
-const serializedProcessorSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional(),
-	description: z$1.string().optional(),
-	phases: z$1.array(z$1.enum([
+const serializedProcessorSchema = z.object({
+	id: z.string(),
+	name: z.string().optional(),
+	description: z.string().optional(),
+	phases: z.array(z.enum([
 		"input",
 		"inputStep",
 		"outputStream",
@@ -39947,18 +40240,18 @@ const serializedProcessorSchema = z$1.object({
 		"outputStep",
 		"toolResult"
 	])),
-	agentIds: z$1.array(z$1.string()),
-	configurations: z$1.array(processorListConfigurationSchema),
-	isWorkflow: z$1.boolean()
+	agentIds: z.array(z.string()),
+	configurations: z.array(processorListConfigurationSchema),
+	isWorkflow: z.boolean()
 });
 /**
 * Schema for detailed processor response
 */
-const serializedProcessorDetailSchema = z$1.object({
-	id: z$1.string(),
-	name: z$1.string().optional(),
-	description: z$1.string().optional(),
-	phases: z$1.array(z$1.enum([
+const serializedProcessorDetailSchema = z.object({
+	id: z.string(),
+	name: z.string().optional(),
+	description: z.string().optional(),
+	phases: z.array(z.enum([
 		"input",
 		"inputStep",
 		"outputStream",
@@ -39966,41 +40259,41 @@ const serializedProcessorDetailSchema = z$1.object({
 		"outputStep",
 		"toolResult"
 	])),
-	configurations: z$1.array(processorConfigurationSchema),
-	isWorkflow: z$1.boolean()
+	configurations: z.array(processorConfigurationSchema),
+	isWorkflow: z.boolean()
 });
 /**
 * Schema for list processors endpoint response
 */
-const listProcessorsResponseSchema = z$1.record(z$1.string(), serializedProcessorSchema);
+const listProcessorsResponseSchema = z.record(z.string(), serializedProcessorSchema);
 /**
 * Schema for message content in processor execution
 */
-const messageContentSchema = z$1.object({
-	format: z$1.literal(2).optional(),
-	parts: z$1.array(z$1.unknown()).optional(),
-	content: z$1.string().optional()
+const messageContentSchema = z.object({
+	format: z.literal(2).optional(),
+	parts: z.array(z.unknown()).optional(),
+	content: z.string().optional()
 }).passthrough();
 /**
 * Schema for a message in processor execution
 */
-const processorMessageSchema = z$1.object({
-	id: z$1.string(),
-	role: z$1.enum([
+const processorMessageSchema = z.object({
+	id: z.string(),
+	role: z.enum([
 		"user",
 		"assistant",
 		"system",
 		"tool",
 		"signal"
 	]),
-	createdAt: z$1.coerce.date().optional(),
-	content: z$1.union([messageContentSchema, z$1.string()])
+	createdAt: z.coerce.date().optional(),
+	content: z.union([messageContentSchema, z.string()])
 }).passthrough();
 /**
 * Body schema for executing a processor
 */
-const executeProcessorBodySchema = z$1.object({
-	phase: z$1.enum([
+const executeProcessorBodySchema = z.object({
+	phase: z.enum([
 		"input",
 		"inputStep",
 		"outputStream",
@@ -40008,28 +40301,28 @@ const executeProcessorBodySchema = z$1.object({
 		"outputStep",
 		"toolResult"
 	]),
-	messages: z$1.array(processorMessageSchema),
-	agentId: z$1.string().optional(),
-	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional()
+	messages: z.array(processorMessageSchema),
+	agentId: z.string().optional(),
+	requestContext: z.record(z.string(), z.unknown()).optional()
 });
 /**
 * Schema for tripwire result
 */
-const tripwireSchema = z$1.object({
-	triggered: z$1.boolean(),
-	reason: z$1.string().optional(),
-	metadata: z$1.unknown().optional()
+const tripwireSchema = z.object({
+	triggered: z.boolean(),
+	reason: z.string().optional(),
+	metadata: z.unknown().optional()
 });
 /**
 * Response schema for processor execution
 */
-const executeProcessorResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	phase: z$1.string(),
-	messages: z$1.array(processorMessageSchema).optional(),
-	messageList: z$1.object({ messages: z$1.array(processorMessageSchema) }).optional(),
+const executeProcessorResponseSchema = z.object({
+	success: z.boolean(),
+	phase: z.string(),
+	messages: z.array(processorMessageSchema).optional(),
+	messageList: z.object({ messages: z.array(processorMessageSchema) }).optional(),
 	tripwire: tripwireSchema.optional(),
-	error: z$1.string().optional()
+	error: z.string().optional()
 });
 
 //#region src/server/handlers/processors.ts
@@ -40397,31 +40690,31 @@ const EXECUTE_PROCESSOR_ROUTE = createRoute$1({
 const listPromptBlockVersionsQuerySchema = listVersionsQuerySchema;
 const comparePromptBlockVersionsQuerySchema = compareVersionsQuerySchema;
 const createPromptBlockVersionBodySchema = createVersionBodySchema;
-const promptBlockVersionPathParams = z$1.object({ promptBlockId: z$1.string().describe("Unique identifier for the stored prompt block") });
-const promptBlockVersionIdPathParams = z$1.object({
-	promptBlockId: z$1.string().describe("Unique identifier for the stored prompt block"),
-	versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+const promptBlockVersionPathParams = z.object({ promptBlockId: z.string().describe("Unique identifier for the stored prompt block") });
+const promptBlockVersionIdPathParams = z.object({
+	promptBlockId: z.string().describe("Unique identifier for the stored prompt block"),
+	versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-const promptBlockVersionSchema = z$1.object({
-	id: z$1.string().describe("Unique identifier for the version (UUID)"),
-	blockId: z$1.string().describe("ID of the prompt block this version belongs to"),
-	versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-	name: z$1.string().describe("Display name of the prompt block"),
-	description: z$1.string().optional().describe("Purpose description"),
-	content: z$1.string().describe("Template content with {{variable}} interpolation"),
+const promptBlockVersionSchema = z.object({
+	id: z.string().describe("Unique identifier for the version (UUID)"),
+	blockId: z.string().describe("ID of the prompt block this version belongs to"),
+	versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+	name: z.string().describe("Display name of the prompt block"),
+	description: z.string().optional().describe("Purpose description"),
+	content: z.string().describe("Template content with {{variable}} interpolation"),
 	rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions"),
-	changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-	changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-	createdAt: z$1.coerce.date().describe("When this version was created")
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions"),
+	changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+	changeMessage: z.string().optional().describe("Optional message describing the changes"),
+	createdAt: z.coerce.date().describe("When this version was created")
 });
 const listPromptBlockVersionsResponseSchema = createListVersionsResponseSchema(promptBlockVersionSchema);
 const getPromptBlockVersionResponseSchema = promptBlockVersionSchema;
-const createPromptBlockVersionResponseSchema = promptBlockVersionSchema.partial().merge(z$1.object({
-	id: z$1.string(),
-	blockId: z$1.string(),
-	versionNumber: z$1.number(),
-	createdAt: z$1.coerce.date()
+const createPromptBlockVersionResponseSchema = promptBlockVersionSchema.partial().merge(z.object({
+	id: z.string(),
+	blockId: z.string(),
+	versionNumber: z.number(),
+	createdAt: z.coerce.date()
 }));
 const activatePromptBlockVersionResponseSchema = activateVersionResponseSchema;
 const restorePromptBlockVersionResponseSchema = promptBlockVersionSchema;
@@ -40698,9 +40991,9 @@ const COMPARE_PROMPT_BLOCK_VERSIONS_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/schedules.ts
-const scheduleStatusSchema = z.enum(["active", "paused"]);
+const scheduleStatusSchema = z$1.enum(["active", "paused"]);
 /** Mirrors the core `AgentSignalType` union. */
-const signalTypeSchema = z.enum([
+const signalTypeSchema = z$1.enum([
 	"user",
 	"state",
 	"reactive",
@@ -40709,15 +41002,15 @@ const signalTypeSchema = z.enum([
 	"system-reminder"
 ]);
 /** Attributes rendered onto the signal's XML tag. */
-const signalAttributesSchema = z.record(z.string(), z.union([
-	z.string(),
-	z.number(),
-	z.boolean(),
-	z.null()
+const signalAttributesSchema = z$1.record(z$1.string(), z$1.union([
+	z$1.string(),
+	z$1.number(),
+	z$1.boolean(),
+	z$1.null()
 ]).optional());
 /** Behavior + attributes applied when the thread is already streaming. */
-const ifActiveSchema = z.object({
-	behavior: z.enum([
+const ifActiveSchema = z$1.object({
+	behavior: z$1.enum([
 		"deliver",
 		"persist",
 		"discard"
@@ -40728,16 +41021,16 @@ const ifActiveSchema = z.object({
 * Behavior + attributes applied when the thread is idle, plus a serializable
 * subset of stream options forwarded to the woken run.
 */
-const ifIdleSchema = z.object({
-	behavior: z.enum([
+const ifIdleSchema = z$1.object({
+	behavior: z$1.enum([
 		"wake",
 		"persist",
 		"discard"
 	]).optional(),
 	attributes: signalAttributesSchema.optional(),
-	streamOptions: z.object({ requestContext: z.record(z.string(), z.unknown()).optional() }).optional()
+	streamOptions: z$1.object({ requestContext: z$1.record(z$1.string(), z$1.unknown()).optional() }).optional()
 });
-const workflowRunStatusSchema = z.enum([
+const workflowRunStatusSchema = z$1.enum([
 	"running",
 	"success",
 	"failed",
@@ -40750,12 +41043,12 @@ const workflowRunStatusSchema = z.enum([
 	"paused",
 	"skipped"
 ]);
-const scheduleRunSummarySchema = z.object({
+const scheduleRunSummarySchema = z$1.object({
 	status: workflowRunStatusSchema,
-	startedAt: z.number().optional(),
-	completedAt: z.number().optional(),
-	durationMs: z.number().optional(),
-	error: z.string().optional()
+	startedAt: z$1.number().optional(),
+	completedAt: z$1.number().optional(),
+	durationMs: z$1.number().optional(),
+	error: z$1.string().optional()
 });
 /**
 * Flat agent-schedule view. Persisted as a `Schedule` row with a
@@ -40764,59 +41057,59 @@ const scheduleRunSummarySchema = z.object({
 * status, lifecycle) without exposing the schedule plumbing. Discriminate
 * from workflow schedules by the presence of `agentId`.
 */
-const agentScheduleSchema = z.object({
-	id: z.string(),
-	agentId: z.string(),
+const agentScheduleSchema = z$1.object({
+	id: z$1.string(),
+	agentId: z$1.string(),
 	/** Mirror of the workflow-schedule discriminator — always absent on agent schedules. */
-	workflowId: z.undefined().optional(),
+	workflowId: z$1.undefined().optional(),
 	/** Workflow-run summary — never hydrated for agent schedules. */
-	lastRun: z.undefined().optional(),
-	name: z.string().optional(),
-	threadId: z.string().optional(),
-	resourceId: z.string().optional(),
-	prompt: z.string(),
-	cron: z.string(),
-	timezone: z.string().optional(),
+	lastRun: z$1.undefined().optional(),
+	name: z$1.string().optional(),
+	threadId: z$1.string().optional(),
+	resourceId: z$1.string().optional(),
+	prompt: z$1.string(),
+	cron: z$1.string(),
+	timezone: z$1.string().optional(),
 	status: scheduleStatusSchema,
-	nextFireAt: z.number(),
-	lastFireAt: z.number().optional(),
-	lastRunId: z.string().optional(),
+	nextFireAt: z$1.number(),
+	lastFireAt: z$1.number().optional(),
+	lastRunId: z$1.string().optional(),
 	signalType: signalTypeSchema.optional(),
-	tagName: z.string().optional(),
+	tagName: z$1.string().optional(),
 	attributes: signalAttributesSchema.optional(),
 	ifActive: ifActiveSchema.optional(),
 	ifIdle: ifIdleSchema.optional(),
-	providerOptions: z.record(z.string(), z.unknown()).optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
-	createdAt: z.number(),
-	updatedAt: z.number()
+	providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	createdAt: z$1.number(),
+	updatedAt: z$1.number()
 });
 /**
 * Flat workflow-schedule view. Discriminate from agent schedules by the
 * presence of `workflowId`.
 */
-const workflowScheduleSchema = z.object({
-	id: z.string(),
-	workflowId: z.string(),
+const workflowScheduleSchema = z$1.object({
+	id: z$1.string(),
+	workflowId: z$1.string(),
 	/** Mirror of the agent-schedule discriminator — always absent on workflow schedules. */
-	agentId: z.undefined().optional(),
-	cron: z.string(),
-	timezone: z.string().optional(),
+	agentId: z$1.undefined().optional(),
+	cron: z$1.string(),
+	timezone: z$1.string().optional(),
 	status: scheduleStatusSchema,
-	nextFireAt: z.number(),
-	lastFireAt: z.number().optional(),
-	lastRunId: z.string().optional(),
+	nextFireAt: z$1.number(),
+	lastFireAt: z$1.number().optional(),
+	lastRunId: z$1.string().optional(),
 	lastRun: scheduleRunSummarySchema.optional(),
-	inputData: z.unknown().optional(),
-	initialState: z.unknown().optional(),
-	requestContext: z.record(z.string(), z.unknown()).optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
-	createdAt: z.number(),
-	updatedAt: z.number()
+	inputData: z$1.unknown().optional(),
+	initialState: z$1.unknown().optional(),
+	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	createdAt: z$1.number(),
+	updatedAt: z$1.number()
 });
 /** Union of the flat views returned by the unified `/schedules` surface. */
-const scheduleSchema = z.union([agentScheduleSchema, workflowScheduleSchema]);
-const scheduleTriggerOutcomeSchema = z.enum([
+const scheduleSchema = z$1.union([agentScheduleSchema, workflowScheduleSchema]);
+const scheduleTriggerOutcomeSchema = z$1.enum([
 	"published",
 	"succeeded",
 	"delivered",
@@ -40833,74 +41126,74 @@ const scheduleTriggerOutcomeSchema = z.enum([
 	"dropped-superseded",
 	"dropped-busy"
 ]);
-const scheduleTriggerKindSchema = z.enum([
+const scheduleTriggerKindSchema = z$1.enum([
 	"schedule-fire",
 	"queue-drain",
 	"manual"
 ]);
-const scheduleTriggerResponseSchema = z.object({
-	id: z.string().optional(),
-	scheduleId: z.string(),
-	runId: z.string().nullable(),
-	scheduledFireAt: z.number(),
-	actualFireAt: z.number(),
+const scheduleTriggerResponseSchema = z$1.object({
+	id: z$1.string().optional(),
+	scheduleId: z$1.string(),
+	runId: z$1.string().nullable(),
+	scheduledFireAt: z$1.number(),
+	actualFireAt: z$1.number(),
 	outcome: scheduleTriggerOutcomeSchema,
-	error: z.string().optional(),
+	error: z$1.string().optional(),
 	triggerKind: scheduleTriggerKindSchema.optional(),
-	parentTriggerId: z.string().optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
+	parentTriggerId: z$1.string().optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
 	run: scheduleRunSummarySchema.optional()
 });
-const listSchedulesQuerySchema = z.object({
-	agentId: z.string().optional(),
-	workflowId: z.string().optional(),
+const listSchedulesQuerySchema = z$1.object({
+	agentId: z$1.string().optional(),
+	workflowId: z$1.string().optional(),
 	status: scheduleStatusSchema.optional(),
 	/** Agent-schedule only: match the target threadId. */
-	threadId: z.string().optional(),
+	threadId: z$1.string().optional(),
 	/** Agent-schedule only: match the target resourceId. */
-	resourceId: z.string().optional(),
+	resourceId: z$1.string().optional(),
 	/** Agent-schedule only: match the free-form target name. */
-	name: z.string().optional()
+	name: z$1.string().optional()
 });
-const listSchedulesResponseSchema = z.object({ schedules: z.array(scheduleSchema) });
-const scheduleIdPathParams = z.object({ scheduleId: z.string() });
+const listSchedulesResponseSchema = z$1.object({ schedules: z$1.array(scheduleSchema) });
+const scheduleIdPathParams = z$1.object({ scheduleId: z$1.string() });
 /**
 * Agent variant of the create body — targets an agent by `agentId`. Strict so
 * a body carrying both `agentId` and `workflowId` is rejected as ambiguous
 * instead of silently matching the agent branch of the union.
 */
-const createAgentScheduleBodySchema = z.strictObject({
+const createAgentScheduleBodySchema = z$1.strictObject({
 	/** Optional stable id; normalized to `agent_<slug>`. A random id is generated when omitted. */
-	id: z.string().optional(),
-	agentId: z.string().min(1),
-	cron: z.string(),
-	timezone: z.string().optional(),
-	prompt: z.string(),
-	name: z.string().optional(),
-	threadId: z.string().optional(),
-	resourceId: z.string().optional(),
+	id: z$1.string().optional(),
+	agentId: z$1.string().min(1),
+	cron: z$1.string(),
+	timezone: z$1.string().optional(),
+	prompt: z$1.string(),
+	name: z$1.string().optional(),
+	threadId: z$1.string().optional(),
+	resourceId: z$1.string().optional(),
 	signalType: signalTypeSchema.optional(),
-	tagName: z.string().optional(),
+	tagName: z$1.string().optional(),
 	attributes: signalAttributesSchema.optional(),
 	ifActive: ifActiveSchema.optional(),
 	ifIdle: ifIdleSchema.optional(),
-	providerOptions: z.record(z.string(), z.unknown()).optional(),
-	metadata: z.record(z.string(), z.unknown()).optional()
+	providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
 /**
 * Workflow variant of the create body — targets a workflow by `workflowId`.
 * Strict so ambiguous bodies (both ids) are rejected by the union.
 */
-const createWorkflowScheduleBodySchema = z.strictObject({
+const createWorkflowScheduleBodySchema = z$1.strictObject({
 	/** Optional stable id; normalized to `schedule_<slug>`. A random id is generated when omitted. */
-	id: z.string().optional(),
-	workflowId: z.string().min(1),
-	cron: z.string(),
-	timezone: z.string().optional(),
-	inputData: z.unknown().optional(),
-	initialState: z.unknown().optional(),
-	requestContext: z.record(z.string(), z.unknown()).optional(),
-	metadata: z.record(z.string(), z.unknown()).optional()
+	id: z$1.string().optional(),
+	workflowId: z$1.string().min(1),
+	cron: z$1.string(),
+	timezone: z$1.string().optional(),
+	inputData: z$1.unknown().optional(),
+	initialState: z$1.unknown().optional(),
+	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
 /**
 * Body for POST /schedules. Discriminated by which target id is present:
@@ -40908,7 +41201,7 @@ const createWorkflowScheduleBodySchema = z.strictObject({
 * Both variants are strict, so a body carrying both ids (or unknown keys)
 * fails validation instead of silently dropping fields.
 */
-const createScheduleBodySchema = z.union([createAgentScheduleBodySchema, createWorkflowScheduleBodySchema]);
+const createScheduleBodySchema = z$1.union([createAgentScheduleBodySchema, createWorkflowScheduleBodySchema]);
 /**
 * Body for PATCH /schedules/:scheduleId — partial update. Fields apply to
 * the matching target type; agent-only fields on a workflow schedule are
@@ -40916,36 +41209,36 @@ const createScheduleBodySchema = z.union([createAgentScheduleBodySchema, createW
 * editable; they are part of an agent schedule's identity. To re-target,
 * delete and recreate.
 */
-const updateScheduleBodySchema = z.object({
-	cron: z.string().optional(),
-	timezone: z.string().optional(),
+const updateScheduleBodySchema = z$1.object({
+	cron: z$1.string().optional(),
+	timezone: z$1.string().optional(),
 	status: scheduleStatusSchema.optional(),
-	metadata: z.record(z.string(), z.unknown()).optional(),
-	prompt: z.string().optional(),
-	name: z.string().optional(),
+	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	prompt: z$1.string().optional(),
+	name: z$1.string().optional(),
 	signalType: signalTypeSchema.optional(),
-	tagName: z.string().optional(),
+	tagName: z$1.string().optional(),
 	attributes: signalAttributesSchema.optional(),
 	ifActive: ifActiveSchema.optional(),
 	ifIdle: ifIdleSchema.optional(),
-	providerOptions: z.record(z.string(), z.unknown()).optional(),
-	inputData: z.unknown().optional(),
-	initialState: z.unknown().optional(),
-	requestContext: z.record(z.string(), z.unknown()).optional()
+	providerOptions: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	inputData: z$1.unknown().optional(),
+	initialState: z$1.unknown().optional(),
+	requestContext: z$1.record(z$1.string(), z$1.unknown()).optional()
 });
-const deleteScheduleResponseSchema = z.object({ message: z.string() });
+const deleteScheduleResponseSchema = z$1.object({ message: z$1.string() });
 /** Response for POST /schedules/:scheduleId/run. */
-const runScheduleResponseSchema = z.object({
-	scheduleId: z.string(),
-	claimId: z.string(),
-	scheduledFireAt: z.number()
+const runScheduleResponseSchema = z$1.object({
+	scheduleId: z$1.string(),
+	claimId: z$1.string(),
+	scheduledFireAt: z$1.number()
 });
-const listScheduleTriggersQuerySchema = z.object({
-	limit: z.coerce.number().int().positive().optional(),
-	fromActualFireAt: z.coerce.number().int().nonnegative().optional(),
-	toActualFireAt: z.coerce.number().int().nonnegative().optional()
+const listScheduleTriggersQuerySchema = z$1.object({
+	limit: z$1.coerce.number().int().positive().optional(),
+	fromActualFireAt: z$1.coerce.number().int().nonnegative().optional(),
+	toActualFireAt: z$1.coerce.number().int().nonnegative().optional()
 });
-const listScheduleTriggersResponseSchema = z.object({ triggers: z.array(scheduleTriggerResponseSchema) });
+const listScheduleTriggersResponseSchema = z$1.object({ triggers: z$1.array(scheduleTriggerResponseSchema) });
 //#endregion
 //#region src/server/handlers/schedules.ts
 function snapshotToRunSummary(run) {
@@ -41215,16 +41508,16 @@ const LIST_SCHEDULE_TRIGGERS_ROUTE = createRoute$1({
 const listScorerVersionsQuerySchema = listVersionsQuerySchema;
 const compareScorerVersionsQuerySchema = compareVersionsQuerySchema;
 const createScorerVersionBodySchema = createVersionBodySchema;
-const scorerVersionPathParams = z$1.object({ scorerId: z$1.string().describe("Unique identifier for the stored scorer definition") });
-const scorerVersionIdPathParams = z$1.object({
-	scorerId: z$1.string().describe("Unique identifier for the stored scorer definition"),
-	versionId: z$1.string().describe("Unique identifier for the version (UUID)")
+const scorerVersionPathParams = z.object({ scorerId: z.string().describe("Unique identifier for the stored scorer definition") });
+const scorerVersionIdPathParams = z.object({
+	scorerId: z.string().describe("Unique identifier for the stored scorer definition"),
+	versionId: z.string().describe("Unique identifier for the version (UUID)")
 });
-const samplingConfigSchema$1 = z$1.union([z$1.object({ type: z$1.literal("none") }), z$1.object({
-	type: z$1.literal("ratio"),
-	rate: z$1.number().min(0).max(1)
+const samplingConfigSchema$1 = z.union([z.object({ type: z.literal("none") }), z.object({
+	type: z.literal("ratio"),
+	rate: z.number().min(0).max(1)
 })]);
-const scorerTypeEnum$1 = z$1.enum([
+const scorerTypeEnum$1 = z.enum([
 	"llm-judge",
 	"answer-relevancy",
 	"answer-similarity",
@@ -41238,32 +41531,32 @@ const scorerTypeEnum$1 = z$1.enum([
 	"tool-call-accuracy",
 	"toxicity"
 ]);
-const scorerVersionSchema = z$1.object({
-	id: z$1.string().describe("Unique identifier for the version (UUID)"),
-	scorerDefinitionId: z$1.string().describe("ID of the scorer this version belongs to"),
-	versionNumber: z$1.number().describe("Sequential version number (1, 2, 3, ...)"),
-	name: z$1.string().describe("Name of the scorer"),
-	description: z$1.string().optional().describe("Description of the scorer"),
+const scorerVersionSchema = z.object({
+	id: z.string().describe("Unique identifier for the version (UUID)"),
+	scorerDefinitionId: z.string().describe("ID of the scorer this version belongs to"),
+	versionNumber: z.number().describe("Sequential version number (1, 2, 3, ...)"),
+	name: z.string().describe("Name of the scorer"),
+	description: z.string().optional().describe("Description of the scorer"),
 	type: scorerTypeEnum$1,
 	model: modelConfigSchema.optional(),
-	instructions: z$1.string().optional(),
-	scoreRange: z$1.object({
-		min: z$1.number().optional(),
-		max: z$1.number().optional()
+	instructions: z.string().optional(),
+	scoreRange: z.object({
+		min: z.number().optional(),
+		max: z.number().optional()
 	}).optional(),
-	presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	presetConfig: z.record(z.string(), z.unknown()).optional(),
 	defaultSampling: samplingConfigSchema$1.optional(),
-	changedFields: z$1.array(z$1.string()).optional().describe("Array of field names that changed from the previous version"),
-	changeMessage: z$1.string().optional().describe("Optional message describing the changes"),
-	createdAt: z$1.coerce.date().describe("When this version was created")
+	changedFields: z.array(z.string()).optional().describe("Array of field names that changed from the previous version"),
+	changeMessage: z.string().optional().describe("Optional message describing the changes"),
+	createdAt: z.coerce.date().describe("When this version was created")
 });
 const listScorerVersionsResponseSchema = createListVersionsResponseSchema(scorerVersionSchema);
 const getScorerVersionResponseSchema = scorerVersionSchema;
-const createScorerVersionResponseSchema = scorerVersionSchema.partial().merge(z$1.object({
-	id: z$1.string(),
-	scorerDefinitionId: z$1.string(),
-	versionNumber: z$1.number(),
-	createdAt: z$1.coerce.date()
+const createScorerVersionResponseSchema = scorerVersionSchema.partial().merge(z.object({
+	id: z.string(),
+	scorerDefinitionId: z.string(),
+	versionNumber: z.number(),
+	createdAt: z.coerce.date()
 }));
 const activateScorerVersionResponseSchema = activateVersionResponseSchema;
 const restoreScorerVersionResponseSchema = scorerVersionSchema;
@@ -41547,9 +41840,9 @@ const COMPARE_SCORER_VERSIONS_ROUTE = createRoute$1({
 /**
 * Response body for `PUT|DELETE /stored/{type}/:id/favorite` routes.
 */
-const favoriteToggleResponseSchema = z$1.object({
-	favorited: z$1.boolean().describe("Whether the entity is currently favorited by the caller"),
-	favoriteCount: z$1.number().int().nonnegative().describe("Total number of users who have favorited this entity")
+const favoriteToggleResponseSchema = z.object({
+	favorited: z.boolean().describe("Whether the entity is currently favorited by the caller"),
+	favoriteCount: z.number().int().nonnegative().describe("Total number of users who have favorited this entity")
 });
 
 //#region src/server/handlers/stored-agent-favorites.ts
@@ -42484,70 +42777,70 @@ const PREVIEW_INSTRUCTIONS_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/stored-mcp-clients.ts
-const storedMCPClientIdPathParams = z$1.object({ storedMCPClientId: z$1.string().describe("Unique identifier for the stored MCP client") });
-const storageOrderBySchema$3 = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storedMCPClientIdPathParams = z.object({ storedMCPClientId: z.string().describe("Unique identifier for the stored MCP client") });
+const storageOrderBySchema$3 = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 const listStoredMCPClientsQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema$3.optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional().default("published").describe("Filter MCP clients by status (defaults to published)"),
-	authorId: z$1.string().optional().describe("Filter MCP clients by author identifier"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter MCP clients by metadata key-value pairs")
+	authorId: z.string().optional().describe("Filter MCP clients by author identifier"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter MCP clients by metadata key-value pairs")
 });
-const mcpServerConfigSchema = z$1.object({
-	type: z$1.enum(["stdio", "http"]).describe("Transport type: stdio for local processes, http for remote servers"),
-	command: z$1.string().optional().describe("Command to run (stdio only)"),
-	args: z$1.array(z$1.string()).optional().describe("Command arguments (stdio only)"),
-	env: z$1.record(z$1.string(), z$1.string()).optional().describe("Environment variables (stdio only)"),
-	url: z$1.string().optional().describe("Server URL (http only)"),
-	timeout: z$1.number().optional().describe("Connection timeout in milliseconds")
+const mcpServerConfigSchema = z.object({
+	type: z.enum(["stdio", "http"]).describe("Transport type: stdio for local processes, http for remote servers"),
+	command: z.string().optional().describe("Command to run (stdio only)"),
+	args: z.array(z.string()).optional().describe("Command arguments (stdio only)"),
+	env: z.record(z.string(), z.string()).optional().describe("Environment variables (stdio only)"),
+	url: z.string().optional().describe("Server URL (http only)"),
+	timeout: z.number().optional().describe("Connection timeout in milliseconds")
 });
-const snapshotConfigSchema$3 = z$1.object({
-	name: z$1.string().describe("Name of the MCP client"),
-	description: z$1.string().optional().describe("Description of the MCP client"),
-	servers: z$1.record(z$1.string(), mcpServerConfigSchema).describe("Map of server name to server configuration")
+const snapshotConfigSchema$3 = z.object({
+	name: z.string().describe("Name of the MCP client"),
+	description: z.string().optional().describe("Description of the MCP client"),
+	servers: z.record(z.string(), mcpServerConfigSchema).describe("Map of server name to server configuration")
 });
-const createStoredMCPClientBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the MCP client")
+const createStoredMCPClientBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the MCP client")
 }).merge(snapshotConfigSchema$3);
-const updateStoredMCPClientBodySchema = z$1.object({
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const updateStoredMCPClientBodySchema = z.object({
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 }).partial().merge(snapshotConfigSchema$3.partial());
-const storedMCPClientSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("MCP client status: draft, published, or archived"),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Name of the MCP client"),
-	description: z$1.string().optional().describe("Description of the MCP client"),
-	servers: z$1.record(z$1.string(), mcpServerConfigSchema).describe("Map of server name to server configuration")
+const storedMCPClientSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("MCP client status: draft, published, or archived"),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Name of the MCP client"),
+	description: z.string().optional().describe("Description of the MCP client"),
+	servers: z.record(z.string(), mcpServerConfigSchema).describe("Map of server name to server configuration")
 });
-const listStoredMCPClientsResponseSchema = paginationInfoSchema$1.extend({ mcpClients: z$1.array(storedMCPClientSchema) });
+const listStoredMCPClientsResponseSchema = paginationInfoSchema$1.extend({ mcpClients: z.array(storedMCPClientSchema) });
 const getStoredMCPClientResponseSchema = storedMCPClientSchema;
 const createStoredMCPClientResponseSchema = storedMCPClientSchema;
-const updateStoredMCPClientResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredMCPClientResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedMCPClientSchema]);
-const deleteStoredMCPClientResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredMCPClientResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 
 //#region src/server/handlers/stored-mcp-clients.ts
@@ -42733,67 +43026,67 @@ const DELETE_STORED_MCP_CLIENT_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/stored-prompt-blocks.ts
-const storedPromptBlockIdPathParams = z$1.object({ storedPromptBlockId: z$1.string().describe("Unique identifier for the stored prompt block") });
-const storageOrderBySchema$2 = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storedPromptBlockIdPathParams = z.object({ storedPromptBlockId: z.string().describe("Unique identifier for the stored prompt block") });
+const storageOrderBySchema$2 = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 const listStoredPromptBlocksQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema$2.optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional().describe("Filter prompt blocks by status. When omitted, returns all prompt blocks regardless of status"),
-	authorId: z$1.string().optional().describe("Filter prompt blocks by author identifier"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter prompt blocks by metadata key-value pairs")
+	authorId: z.string().optional().describe("Filter prompt blocks by author identifier"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter prompt blocks by metadata key-value pairs")
 });
-const snapshotConfigSchema$2 = z$1.object({
-	name: z$1.string().describe("Display name of the prompt block"),
-	description: z$1.string().optional().describe("Purpose description"),
-	content: z$1.string().describe("Template content with {{variable}} interpolation"),
+const snapshotConfigSchema$2 = z.object({
+	name: z.string().describe("Display name of the prompt block"),
+	description: z.string().optional().describe("Purpose description"),
+	content: z.string().describe("Template content with {{variable}} interpolation"),
 	rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
 });
-const createStoredPromptBlockBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the prompt block")
+const createStoredPromptBlockBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the prompt block")
 }).merge(snapshotConfigSchema$2);
-const updateStoredPromptBlockBodySchema = z$1.object({
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const updateStoredPromptBlockBodySchema = z.object({
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 }).merge(snapshotConfigSchema$2.partial());
-const storedPromptBlockSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("Prompt block status: draft, published, or archived"),
-	activeVersionId: z$1.string().optional(),
-	hasDraft: z$1.boolean().optional().describe("Whether the prompt block has unpublished draft changes"),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Display name of the prompt block"),
-	description: z$1.string().optional().describe("Purpose description"),
-	content: z$1.string().describe("Template content with {{variable}} interpolation"),
+const storedPromptBlockSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("Prompt block status: draft, published, or archived"),
+	activeVersionId: z.string().optional(),
+	hasDraft: z.boolean().optional().describe("Whether the prompt block has unpublished draft changes"),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Display name of the prompt block"),
+	description: z.string().optional().describe("Purpose description"),
+	content: z.string().describe("Template content with {{variable}} interpolation"),
 	rules: ruleGroupSchema.optional().describe("Rules for conditional inclusion"),
-	requestContextSchema: z$1.record(z$1.string(), z$1.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
+	requestContextSchema: z.record(z.string(), z.unknown()).optional().describe("JSON Schema defining available variables for {{variableName}} interpolation and conditions")
 });
-const listStoredPromptBlocksResponseSchema = paginationInfoSchema$1.extend({ promptBlocks: z$1.array(storedPromptBlockSchema) });
+const listStoredPromptBlocksResponseSchema = paginationInfoSchema$1.extend({ promptBlocks: z.array(storedPromptBlockSchema) });
 const getStoredPromptBlockResponseSchema = storedPromptBlockSchema;
 const createStoredPromptBlockResponseSchema = storedPromptBlockSchema;
-const updateStoredPromptBlockResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredPromptBlockResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedPromptBlockSchema]);
-const deleteStoredPromptBlockResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredPromptBlockResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 
 //#region src/server/handlers/stored-prompt-blocks.ts
@@ -43023,26 +43316,26 @@ const DELETE_STORED_PROMPT_BLOCK_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/stored-scorers.ts
-const storedScorerIdPathParams = z$1.object({ storedScorerId: z$1.string().describe("Unique identifier for the stored scorer definition") });
-const storageOrderBySchema$1 = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storedScorerIdPathParams = z.object({ storedScorerId: z.string().describe("Unique identifier for the stored scorer definition") });
+const storageOrderBySchema$1 = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 const listStoredScorersQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema$1.optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional().default("published").describe("Filter scorers by status (defaults to published)"),
-	authorId: z$1.string().optional().describe("Filter scorers by author identifier"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter scorers by metadata key-value pairs")
+	authorId: z.string().optional().describe("Filter scorers by author identifier"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter scorers by metadata key-value pairs")
 });
-const samplingConfigSchema = z$1.union([z$1.object({ type: z$1.literal("none") }), z$1.object({
-	type: z$1.literal("ratio"),
-	rate: z$1.number().min(0).max(1)
+const samplingConfigSchema = z.union([z.object({ type: z.literal("none") }), z.object({
+	type: z.literal("ratio"),
+	rate: z.number().min(0).max(1)
 })]);
-const scorerTypeEnum = z$1.enum([
+const scorerTypeEnum = z.enum([
 	"llm-judge",
 	"answer-relevancy",
 	"answer-similarity",
@@ -43056,63 +43349,63 @@ const scorerTypeEnum = z$1.enum([
 	"tool-call-accuracy",
 	"toxicity"
 ]).describe("Scorer type: llm-judge for custom, or a preset type name");
-const snapshotConfigSchema$1 = z$1.object({
-	name: z$1.string().describe("Name of the scorer"),
-	description: z$1.string().optional().describe("Description of the scorer"),
+const snapshotConfigSchema$1 = z.object({
+	name: z.string().describe("Name of the scorer"),
+	description: z.string().optional().describe("Description of the scorer"),
 	type: scorerTypeEnum,
 	model: modelConfigSchema.optional().describe("Model configuration for LLM judge"),
-	instructions: z$1.string().optional().describe("System instructions for the judge LLM (used when type is llm-judge)"),
-	scoreRange: z$1.object({
-		min: z$1.number().optional().describe("Minimum score value (default: 0)"),
-		max: z$1.number().optional().describe("Maximum score value (default: 1)")
+	instructions: z.string().optional().describe("System instructions for the judge LLM (used when type is llm-judge)"),
+	scoreRange: z.object({
+		min: z.number().optional().describe("Minimum score value (default: 0)"),
+		max: z.number().optional().describe("Maximum score value (default: 1)")
 	}).optional().describe("Score range configuration (used when type is llm-judge)"),
-	presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Serializable config options for preset scorers"),
+	presetConfig: z.record(z.string(), z.unknown()).optional().describe("Serializable config options for preset scorers"),
 	defaultSampling: samplingConfigSchema.optional().describe("Default sampling configuration")
 });
-const createStoredScorerBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the scorer")
+const createStoredScorerBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the scorer")
 }).merge(snapshotConfigSchema$1);
-const updateStoredScorerBodySchema = z$1.object({
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional()
+const updateStoredScorerBodySchema = z.object({
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional()
 }).partial().merge(snapshotConfigSchema$1.partial());
-const storedScorerSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("Scorer status: draft, published, or archived"),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Name of the scorer"),
-	description: z$1.string().optional().describe("Description of the scorer"),
+const storedScorerSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("Scorer status: draft, published, or archived"),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Name of the scorer"),
+	description: z.string().optional().describe("Description of the scorer"),
 	type: scorerTypeEnum,
 	model: modelConfigSchema.optional(),
-	instructions: z$1.string().optional().describe("System instructions for the judge LLM"),
-	scoreRange: z$1.object({
-		min: z$1.number().optional(),
-		max: z$1.number().optional()
+	instructions: z.string().optional().describe("System instructions for the judge LLM"),
+	scoreRange: z.object({
+		min: z.number().optional(),
+		max: z.number().optional()
 	}).optional(),
-	presetConfig: z$1.record(z$1.string(), z$1.unknown()).optional(),
+	presetConfig: z.record(z.string(), z.unknown()).optional(),
 	defaultSampling: samplingConfigSchema.optional()
 });
-const listStoredScorersResponseSchema = paginationInfoSchema$1.extend({ scorerDefinitions: z$1.array(storedScorerSchema) });
+const listStoredScorersResponseSchema = paginationInfoSchema$1.extend({ scorerDefinitions: z.array(storedScorerSchema) });
 const getStoredScorerResponseSchema = storedScorerSchema;
 const createStoredScorerResponseSchema = storedScorerSchema;
-const updateStoredScorerResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredScorerResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	metadata: z.record(z.string(), z.unknown()).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedScorerSchema]);
-const deleteStoredScorerResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredScorerResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
 
 //#region src/server/handlers/stored-scorers.ts
@@ -43328,124 +43621,124 @@ const DELETE_STORED_SCORER_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/stored-skills.ts
-const storedSkillIdPathParams = z$1.object({ storedSkillId: z$1.string().describe("Unique identifier for the stored skill") });
-const storageOrderBySchema = z$1.object({
-	field: z$1.enum(["createdAt", "updatedAt"]).optional(),
-	direction: z$1.enum(["ASC", "DESC"]).optional()
+const storedSkillIdPathParams = z.object({ storedSkillId: z.string().describe("Unique identifier for the stored skill") });
+const storageOrderBySchema = z.object({
+	field: z.enum(["createdAt", "updatedAt"]).optional(),
+	direction: z.enum(["ASC", "DESC"]).optional()
 });
 const listStoredSkillsQuerySchema = createPagePaginationSchema(100).extend({
 	orderBy: storageOrderBySchema.optional(),
-	status: z$1.enum([
+	status: z.enum([
 		"draft",
 		"published",
 		"archived"
 	]).optional().describe("Filter skills by status"),
-	authorId: z$1.string().optional().describe("Filter skills by author identifier"),
-	visibility: z$1.enum(["public"]).optional().describe("Filter to only public skills"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Filter skills by metadata key-value pairs"),
-	favoritedOnly: z$1.stringbool().optional().describe("When true, return only skills favorited by the caller (requires the `favorites` EE feature)"),
-	pinFavoritedFor: z$1.string().optional().describe("When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller")
+	authorId: z.string().optional().describe("Filter skills by author identifier"),
+	visibility: z.enum(["public"]).optional().describe("Filter to only public skills"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Filter skills by metadata key-value pairs"),
+	favoritedOnly: z.stringbool().optional().describe("When true, return only skills favorited by the caller (requires the `favorites` EE feature)"),
+	pinFavoritedFor: z.string().optional().describe("When set, treat the given subject (user/role) as the favoriting principal for `favoritedOnly` instead of the caller")
 });
-const sourceSchema = z$1.discriminatedUnion("type", [
-	z$1.object({
-		type: z$1.literal("external"),
-		packagePath: z$1.string().describe("Package path for external source")
+const sourceSchema = z.discriminatedUnion("type", [
+	z.object({
+		type: z.literal("external"),
+		packagePath: z.string().describe("Package path for external source")
 	}),
-	z$1.object({
-		type: z$1.literal("local"),
-		projectPath: z$1.string().describe("Project path for local source")
+	z.object({
+		type: z.literal("local"),
+		projectPath: z.string().describe("Project path for local source")
 	}),
-	z$1.object({
-		type: z$1.literal("managed"),
-		mastraPath: z$1.string().describe("Mastra path for managed source")
+	z.object({
+		type: z.literal("managed"),
+		mastraPath: z.string().describe("Mastra path for managed source")
 	})
 ]);
-const fileNodeSchema = z$1.object({
-	id: z$1.string().optional(),
-	name: z$1.string(),
-	type: z$1.enum(["file", "folder"]),
-	content: z$1.string().optional(),
-	children: z$1.lazy(() => z$1.array(fileNodeSchema)).optional()
+const fileNodeSchema = z.object({
+	id: z.string().optional(),
+	name: z.string(),
+	type: z.enum(["file", "folder"]),
+	content: z.string().optional(),
+	children: z.lazy(() => z.array(fileNodeSchema)).optional()
 });
 /**
 * Identifies where a stored skill came from.
 * Persisted as `metadata.origin` on the stored skill so that registry-installed
 * skills can be distinguished from skills authored directly in the Builder.
 */
-z$1.discriminatedUnion("type", [z$1.object({
-	type: z$1.literal("skills-sh"),
-	owner: z$1.string().describe("Repository owner on skills.sh"),
-	repo: z$1.string().describe("Repository name on skills.sh"),
-	skillName: z$1.string().describe("Original skill name on skills.sh"),
-	installedAt: z$1.string().describe("ISO-8601 timestamp of the install")
-}), z$1.object({
-	type: z$1.literal("library-copy"),
-	sourceSkillId: z$1.string().describe("ID of the public Library skill this was copied from"),
-	sourceSkillName: z$1.string().describe("Name of the source skill at copy time"),
-	sourceAuthorId: z$1.string().optional().describe("Author of the source skill at copy time, when known"),
-	copiedAt: z$1.string().describe("ISO-8601 timestamp of the copy")
+z.discriminatedUnion("type", [z.object({
+	type: z.literal("skills-sh"),
+	owner: z.string().describe("Repository owner on skills.sh"),
+	repo: z.string().describe("Repository name on skills.sh"),
+	skillName: z.string().describe("Original skill name on skills.sh"),
+	installedAt: z.string().describe("ISO-8601 timestamp of the install")
+}), z.object({
+	type: z.literal("library-copy"),
+	sourceSkillId: z.string().describe("ID of the public Library skill this was copied from"),
+	sourceSkillName: z.string().describe("Name of the source skill at copy time"),
+	sourceAuthorId: z.string().optional().describe("Author of the source skill at copy time, when known"),
+	copiedAt: z.string().describe("ISO-8601 timestamp of the copy")
 })]);
-const snapshotConfigSchema = z$1.object({
-	name: z$1.string().describe("Name of the skill"),
-	description: z$1.string().describe("Description of what the skill does and when to use it"),
-	instructions: z$1.string().describe("Markdown instructions for the skill"),
-	license: z$1.string().optional().describe("License identifier for the skill"),
-	compatibility: z$1.unknown().optional().describe("Compatibility requirements"),
+const snapshotConfigSchema = z.object({
+	name: z.string().describe("Name of the skill"),
+	description: z.string().describe("Description of what the skill does and when to use it"),
+	instructions: z.string().describe("Markdown instructions for the skill"),
+	license: z.string().optional().describe("License identifier for the skill"),
+	compatibility: z.unknown().optional().describe("Compatibility requirements"),
 	source: sourceSchema.optional().describe("Source location of the skill"),
-	references: z$1.array(z$1.string()).optional().describe("List of reference file paths"),
-	scripts: z$1.array(z$1.string()).optional().describe("List of script file paths"),
-	assets: z$1.array(z$1.string()).optional().describe("List of asset file paths"),
-	files: z$1.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the skill")
+	references: z.array(z.string()).optional().describe("List of reference file paths"),
+	scripts: z.array(z.string()).optional().describe("List of script file paths"),
+	assets: z.array(z.string()).optional().describe("List of asset file paths"),
+	files: z.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the skill")
 });
-const createStoredSkillBodySchema = z$1.object({
-	id: z$1.string().optional().describe("Unique identifier. If not provided, derived from name."),
-	authorId: z$1.string().optional().describe("Author identifier for multi-tenant filtering"),
-	visibility: z$1.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
+const createStoredSkillBodySchema = z.object({
+	id: z.string().optional().describe("Unique identifier. If not provided, derived from name."),
+	authorId: z.string().optional().describe("Author identifier for multi-tenant filtering"),
+	visibility: z.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
 }).merge(snapshotConfigSchema);
-const updateStoredSkillBodySchema = z$1.object({
-	authorId: z$1.string().optional(),
-	visibility: z$1.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
+const updateStoredSkillBodySchema = z.object({
+	authorId: z.string().optional(),
+	visibility: z.enum(["private", "public"]).optional().describe("Skill visibility: private (owner/admin only) or public (any reader)")
 }).partial().merge(snapshotConfigSchema.partial());
-const storedSkillSchema = z$1.object({
-	id: z$1.string(),
-	status: z$1.string().describe("Skill status: draft, published, or archived"),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	visibility: z$1.enum(["private", "public"]).optional(),
-	favoriteCount: z$1.number().int().nonnegative().optional().describe("Number of users who have favorited this skill"),
-	isFavorited: z$1.boolean().optional().describe("Whether the requesting user has favorited this skill"),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date(),
-	name: z$1.string().describe("Name of the skill"),
-	description: z$1.string().describe("Description of what the skill does and when to use it"),
-	instructions: z$1.string().describe("Markdown instructions for the skill"),
-	license: z$1.string().optional().describe("License identifier for the skill"),
-	compatibility: z$1.unknown().optional().describe("Compatibility requirements"),
+const storedSkillSchema = z.object({
+	id: z.string(),
+	status: z.string().describe("Skill status: draft, published, or archived"),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	visibility: z.enum(["private", "public"]).optional(),
+	favoriteCount: z.number().int().nonnegative().optional().describe("Number of users who have favorited this skill"),
+	isFavorited: z.boolean().optional().describe("Whether the requesting user has favorited this skill"),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date(),
+	name: z.string().describe("Name of the skill"),
+	description: z.string().describe("Description of what the skill does and when to use it"),
+	instructions: z.string().describe("Markdown instructions for the skill"),
+	license: z.string().optional().describe("License identifier for the skill"),
+	compatibility: z.unknown().optional().describe("Compatibility requirements"),
 	source: sourceSchema.optional().describe("Source location of the skill"),
-	references: z$1.array(z$1.string()).optional().describe("List of reference file paths"),
-	scripts: z$1.array(z$1.string()).optional().describe("List of script file paths"),
-	assets: z$1.array(z$1.string()).optional().describe("List of asset file paths"),
-	files: z$1.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
-	metadata: z$1.record(z$1.string(), z$1.unknown()).optional().describe("Additional metadata for the skill")
+	references: z.array(z.string()).optional().describe("List of reference file paths"),
+	scripts: z.array(z.string()).optional().describe("List of script file paths"),
+	assets: z.array(z.string()).optional().describe("List of asset file paths"),
+	files: z.array(fileNodeSchema).optional().describe("Full file tree structure for the skill"),
+	metadata: z.record(z.string(), z.unknown()).optional().describe("Additional metadata for the skill")
 });
-const listStoredSkillsResponseSchema = paginationInfoSchema$1.extend({ skills: z$1.array(storedSkillSchema) });
+const listStoredSkillsResponseSchema = paginationInfoSchema$1.extend({ skills: z.array(storedSkillSchema) });
 const getStoredSkillResponseSchema = storedSkillSchema;
 const createStoredSkillResponseSchema = storedSkillSchema;
-const updateStoredSkillResponseSchema = z$1.union([z$1.object({
-	id: z$1.string(),
-	status: z$1.string(),
-	activeVersionId: z$1.string().optional(),
-	authorId: z$1.string().optional(),
-	visibility: z$1.enum(["private", "public"]).optional(),
-	createdAt: z$1.coerce.date(),
-	updatedAt: z$1.coerce.date()
+const updateStoredSkillResponseSchema = z.union([z.object({
+	id: z.string(),
+	status: z.string(),
+	activeVersionId: z.string().optional(),
+	authorId: z.string().optional(),
+	visibility: z.enum(["private", "public"]).optional(),
+	createdAt: z.coerce.date(),
+	updatedAt: z.coerce.date()
 }), storedSkillSchema]);
-const deleteStoredSkillResponseSchema = z$1.object({
-	success: z$1.boolean(),
-	message: z$1.string()
+const deleteStoredSkillResponseSchema = z.object({
+	success: z.boolean(),
+	message: z.string()
 });
-const publishStoredSkillBodySchema = z$1.object({ skillPath: z$1.string().describe("Path to the skill directory on the server filesystem (containing SKILL.md)") });
+const publishStoredSkillBodySchema = z.object({ skillPath: z.string().describe("Path to the skill directory on the server filesystem (containing SKILL.md)") });
 const publishStoredSkillResponseSchema = storedSkillSchema;
 
 //#region src/server/handlers/stored-skill-favorites.ts
@@ -44191,43 +44484,43 @@ const DELETE_STORED_WORKSPACE_ROUTE = createRoute$1({
 });
 
 //#region src/server/schemas/system.ts
-const mastraPackageSchema = z$1.object({
-	name: z$1.string(),
-	version: z$1.string()
+const mastraPackageSchema = z.object({
+	name: z.string(),
+	version: z.string()
 });
-const observabilityRuntimeStrategySchema = z$1.enum([
+const observabilityRuntimeStrategySchema = z.enum([
 	"realtime",
 	"batch-with-updates",
 	"insert-only",
 	"event-sourced"
 ]);
-const observabilityStorageCapabilitiesSchema = z$1.object({
-	metrics: z$1.boolean(),
-	logs: z$1.boolean()
+const observabilityStorageCapabilitiesSchema = z.object({
+	metrics: z.boolean(),
+	logs: z.boolean()
 });
-const editorSourceSchema = z$1.enum(["code", "db"]);
-const editorSourceCapabilitiesSchema = z$1.object({
+const editorSourceSchema = z.enum(["code", "db"]);
+const editorSourceCapabilitiesSchema = z.object({
 	source: editorSourceSchema,
-	storage: z$1.enum([
+	storage: z.enum([
 		"database",
 		"filesystem",
 		"source-provider",
 		"unavailable"
 	]),
-	provider: z$1.object({
-		id: z$1.string(),
-		displayName: z$1.string()
+	provider: z.object({
+		id: z.string(),
+		displayName: z.string()
 	}).optional(),
-	canSave: z$1.boolean(),
-	canOpenChangeRequest: z$1.boolean(),
-	unavailableReason: z$1.string().optional()
+	canSave: z.boolean(),
+	canOpenChangeRequest: z.boolean(),
+	unavailableReason: z.string().optional()
 });
-const systemPackagesResponseSchema = z$1.object({
-	packages: z$1.array(mastraPackageSchema),
-	isDev: z$1.boolean(),
-	cmsEnabled: z$1.boolean(),
+const systemPackagesResponseSchema = z.object({
+	packages: z.array(mastraPackageSchema),
+	isDev: z.boolean(),
+	cmsEnabled: z.boolean(),
 	/** Whether the default LiveKit connection-details route is registered — not whether credentials or a worker exist. */
-	liveKitConnectionRouteEnabled: z$1.boolean(),
+	liveKitConnectionRouteEnabled: z.boolean(),
 	/**
 	* The editor's configured source, when set. `'code'` swaps Studio's
 	* Save/Publish UI for Download JSON + Open PR. `'db'` keeps the standard
@@ -44235,37 +44528,37 @@ const systemPackagesResponseSchema = z$1.object({
 	*/
 	editorSource: editorSourceSchema.optional(),
 	editorSourceCapabilities: editorSourceCapabilitiesSchema.optional(),
-	observabilityEnabled: z$1.boolean(),
-	storageType: z$1.string().optional(),
-	observabilityStorageType: z$1.string().optional(),
+	observabilityEnabled: z.boolean(),
+	storageType: z.string().optional(),
+	observabilityStorageType: z.string().optional(),
 	observabilityStorageCapabilities: observabilityStorageCapabilitiesSchema.optional(),
 	observabilityRuntimeStrategy: observabilityRuntimeStrategySchema.optional()
 });
-const jsonSchemaRecordSchema = z$1.record(z$1.string(), z$1.unknown());
-const apiSchemaResponseShapeSchema = z$1.object({
-	kind: z$1.enum([
+const jsonSchemaRecordSchema = z.record(z.string(), z.unknown());
+const apiSchemaResponseShapeSchema = z.object({
+	kind: z.enum([
 		"array",
 		"record",
 		"object-property",
 		"single",
 		"unknown"
 	]),
-	listProperty: z$1.string().optional(),
-	paginationProperty: z$1.string().optional()
+	listProperty: z.string().optional(),
+	paginationProperty: z.string().optional()
 });
-const apiSchemaManifestRouteSchema = z$1.object({
-	method: z$1.string(),
-	path: z$1.string(),
-	responseType: z$1.string(),
+const apiSchemaManifestRouteSchema = z.object({
+	method: z.string(),
+	path: z.string(),
+	responseType: z.string(),
 	pathParamSchema: jsonSchemaRecordSchema.optional(),
 	queryParamSchema: jsonSchemaRecordSchema.optional(),
 	bodySchema: jsonSchemaRecordSchema.optional(),
 	responseSchema: jsonSchemaRecordSchema.optional(),
 	responseShape: apiSchemaResponseShapeSchema
 });
-const apiSchemaManifestResponseSchema = z$1.object({
-	version: z$1.literal(1),
-	routes: z$1.array(apiSchemaManifestRouteSchema)
+const apiSchemaManifestResponseSchema = z.object({
+	version: z.literal(1),
+	routes: z.array(apiSchemaManifestRouteSchema)
 });
 
 //#region src/server/handlers/system.ts
@@ -45014,8 +45307,8 @@ const GET_WORKFLOW_BUILDER_SETTINGS_ROUTE = createRoute$1({
 	method: "GET",
 	path: "/editor/workflow-builder/settings",
 	responseType: "json",
-	responseSchema: z$1.object({
-		enabled: z$1.boolean(),
+	responseSchema: z.object({
+		enabled: z.boolean(),
 		modelPolicy: builderModelPolicySchema.optional()
 	}),
 	summary: "Get persisted workflow builder settings",
@@ -48289,7 +48582,7 @@ function unwrapOptionalNullable(schema) {
 	return inner;
 }
 function parseComplexQueryParams(queryParamSchema, params) {
-	if (!(queryParamSchema instanceof z$1.ZodObject)) return params;
+	if (!(queryParamSchema instanceof z.ZodObject)) return params;
 	const parsedParams = { ...params };
 	const shape = queryParamSchema.shape;
 	for (const [key, fieldSchema] of Object.entries(shape)) {
@@ -51358,7 +51651,7 @@ const tryDecodeURI = (str) => tryDecode(str, decodeURI);
 const serveStatic = (options = { root: "" }) => {
 	const root = options.root || "";
 	const optionPath = options.path;
-	if (root !== "" && !existsSync$1(root)) console.error(`serveStatic: root path '${root}' is not found, are you sure it's correct?`);
+	if (root !== "" && !existsSync(root)) console.error(`serveStatic: root path '${root}' is not found, are you sure it's correct?`);
 	return async (c, next) => {
 		if (c.finalized) return next();
 		let filename;

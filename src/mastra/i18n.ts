@@ -71,7 +71,7 @@ const es: Messages = {
   unknownCommand: 'No conozco ese comando. Puedes usar /start, /demo o /reset, o simplemente escribirme.',
   resetDone: 'He borrado la memoria de este chat. Escríbeme «hola» para empezar de nuevo.',
   demoLoaded: (p) =>
-    `Demo cargada. Ahora eres Marta: día ${p.day} de estimulación, ${p.drug} ${p.dose} a las ${p.time}, ${p.appointmentType} el ${p.appointmentWhen}. Pregúntame lo que quieras; en un minuto te llegará tu primer recordatorio.`,
+    `Demo cargada. Ahora eres Marta: día ${p.day} de estimulación, ${p.drug} ${p.dose} a las ${p.time}, ${p.appointmentType} el ${p.appointmentWhen}. Pregúntame lo que quieras; en unos segundos te llegará tu primer recordatorio.`,
   clinicalAck: (name) => `${name ? `${name}, esto` : 'Esto'} se lo paso a tu enfermera ahora mismo 👩‍⚕️. Te escribo en cuanto me conteste.`,
   urgentReply: (name, videoUrl) =>
     [
@@ -125,7 +125,7 @@ const en: Messages = {
   unknownCommand: "I don't know that command. You can use /start, /demo or /reset, or just write to me.",
   resetDone: 'I have wiped the memory of this chat. Say "hi" to start again.',
   demoLoaded: (p) =>
-    `Demo loaded. You are now Marta: stimulation day ${p.day}, ${p.drug} ${p.dose} at ${p.time}, ${p.appointmentType} on ${p.appointmentWhen}. Ask me anything; your first reminder arrives in about a minute.`,
+    `Demo loaded. You are now Marta: stimulation day ${p.day}, ${p.drug} ${p.dose} at ${p.time}, ${p.appointmentType} on ${p.appointmentWhen}. Ask me anything; your first reminder arrives in a few seconds.`,
   clinicalAck: (name) => `${name ? `${name}, I'm` : "I'm"} passing this to your nurse right now 👩‍⚕️. I'll write back as soon as she answers.`,
   urgentReply: (name, videoUrl) =>
     [

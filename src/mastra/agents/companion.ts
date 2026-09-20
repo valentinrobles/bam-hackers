@@ -192,9 +192,9 @@ async function ensureOnboarded(chatId: string, author: Author, post: (text: stri
   return true;
 }
 
-// Seconds until the first demo reminder. The scheduler ticks once a minute,
-// so the message lands between 45 s and about 1 min 45 s after /demo.
-const DEMO_REMINDER_DELAY_MS = 45 * 1000;
+// Delay of the first demo reminder. The scheduler ticks every 10 s, so the
+// message lands 10 to 20 s after /demo.
+const DEMO_REMINDER_DELAY_MS = 10 * 1000;
 
 // Shared by the Telegram /demo command and POST /demo/seed.
 export async function runDemoSeed(chatId: string, lang?: Lang): Promise<{ message: string; reminderDueAt: string }> {

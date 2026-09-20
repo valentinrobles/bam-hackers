@@ -167,7 +167,7 @@ const es$1 = {
   welcomeBack: "\xA1Hola de nuevo! \xBFEn qu\xE9 te puedo ayudar hoy?",
   unknownCommand: "No conozco ese comando. Puedes usar /start, /demo o /reset, o simplemente escribirme.",
   resetDone: "He borrado la memoria de este chat. Escr\xEDbeme \xABhola\xBB para empezar de nuevo.",
-  demoLoaded: (p) => `Demo cargada. Ahora eres Marta: d\xEDa ${p.day} de estimulaci\xF3n, ${p.drug} ${p.dose} a las ${p.time}, ${p.appointmentType} el ${p.appointmentWhen}. Preg\xFAntame lo que quieras; en un minuto te llegar\xE1 tu primer recordatorio.`,
+  demoLoaded: (p) => `Demo cargada. Ahora eres Marta: d\xEDa ${p.day} de estimulaci\xF3n, ${p.drug} ${p.dose} a las ${p.time}, ${p.appointmentType} el ${p.appointmentWhen}. Preg\xFAntame lo que quieras; en unos segundos te llegar\xE1 tu primer recordatorio.`,
   clinicalAck: (name) => `${name ? `${name}, esto` : "Esto"} se lo paso a tu enfermera ahora mismo \u{1F469}\u200D\u2695\uFE0F. Te escribo en cuanto me conteste.`,
   urgentReply: (name, videoUrl) => [
     `${name ? `${name}, gracias` : "Gracias"} por cont\xE1rmelo; te leo y no est\xE1s sola en esto.`,
@@ -217,7 +217,7 @@ const en = {
   welcomeBack: "Hi again! How can I help you today?",
   unknownCommand: "I don't know that command. You can use /start, /demo or /reset, or just write to me.",
   resetDone: 'I have wiped the memory of this chat. Say "hi" to start again.',
-  demoLoaded: (p) => `Demo loaded. You are now Marta: stimulation day ${p.day}, ${p.drug} ${p.dose} at ${p.time}, ${p.appointmentType} on ${p.appointmentWhen}. Ask me anything; your first reminder arrives in about a minute.`,
+  demoLoaded: (p) => `Demo loaded. You are now Marta: stimulation day ${p.day}, ${p.drug} ${p.dose} at ${p.time}, ${p.appointmentType} on ${p.appointmentWhen}. Ask me anything; your first reminder arrives in a few seconds.`,
   clinicalAck: (name) => `${name ? `${name}, I'm` : "I'm"} passing this to your nurse right now \u{1F469}\u200D\u2695\uFE0F. I'll write back as soon as she answers.`,
   urgentReply: (name, videoUrl) => [
     `${name ? `${name}, thank` : "Thank"} you for telling me; I'm here and you're not alone in this.`,
@@ -818,13 +818,13 @@ function telegramApiBase() {
 function callbackData(actionId, value) {
   return `${CALLBACK_DATA_PREFIX}${JSON.stringify({ a: actionId, v: value })}`;
 }
-async function telegramSendMessage(chatId, text, replyMarkup) {
+async function telegramSendMessage(chatId, text, replyMarkup, parseMode) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not set");
   const res = await fetch(`${telegramApiBase()}/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, ...replyMarkup ? { reply_markup: replyMarkup } : {} }),
+    body: JSON.stringify({ chat_id: chatId, text, ...replyMarkup ? { reply_markup: replyMarkup } : {}, ...parseMode ? { parse_mode: parseMode } : {} }),
     signal: AbortSignal.timeout(8e3)
   });
   const body = await res.json().catch(() => ({}));
@@ -857,57 +857,106 @@ function requireNurseChatId(label) {
   if (!chatId) logger$1.error(`${label}: NURSE_TELEGRAM_CHAT_ID is not set, nothing sent to the nurse`);
   return chatId ?? null;
 }
+const TIER_LABEL = { clinical: "CL\xCDNICO", urgent: "URGENTE", logistic: "LOG\xCDSTICO", routine: "RUTINA" };
 function ticketHeader(ticket) {
   const name = ticket.patientName ?? "paciente sin nombre";
-  return `Ticket ${ticket.id} \xB7 ${ticket.tier.toUpperCase()} \xB7 ${name}`;
+  return `Ticket ${ticket.id} \xB7 ${TIER_LABEL[ticket.tier] ?? ticket.tier.toUpperCase()} \xB7 ${name}`;
+}
+const PHASE_LABEL = {
+  stimulation: "estimulaci\xF3n",
+  trigger: "trigger",
+  retrieval: "punci\xF3n",
+  transfer: "transferencia",
+  two_week_wait: "betaespera"
+};
+function patientLines(patient, excludeText) {
+  if (!patient) return ["Sin ficha todav\xEDa."];
+  const bits = [];
+  if (patient.cycle) bits.push(`d\xEDa ${patient.cycle.day} ${PHASE_LABEL[patient.cycle.phase] ?? patient.cycle.phase}`);
+  if (patient.protocol.length) bits.push(patient.protocol.map((m) => `${m.drug} ${m.dose} ${m.time}`).join(", "));
+  if (patient.nextAppointment) bits.push(`${patient.nextAppointment.type} ${shortDate(patient.nextAppointment.datetime)}`);
+  const lines = [bits.length ? bits.join(" \xB7 ") : "ficha sin datos de tratamiento"];
+  const previous = patient.symptoms.filter((x) => x.text !== excludeText).slice(-1)[0];
+  if (previous) lines.push(`antes: \xAB${previous.text.slice(0, 70)}\xBB`);
+  return lines;
+}
+function shortDate(value) {
+  const m = /^(\w{3})\w*,?\s+(\d{1,2}) de (\w+)(?: de \d{4})?,?\s*(\d{1,2}:\d{2})?/u.exec(value);
+  if (!m) return value;
+  const months = { enero: "01", febrero: "02", marzo: "03", abril: "04", mayo: "05", junio: "06", julio: "07", agosto: "08", septiembre: "09", octubre: "10", noviembre: "11", diciembre: "12" };
+  const mm = months[m[3].toLowerCase()];
+  return mm ? `${m[1]} ${m[2].padStart(2, "0")}/${mm}${m[4] ? ` ${m[4]}` : ""}` : value;
+}
+function nurseCardSections(ticket, patient, suggestedReply) {
+  return [
+    { title: "\u{1F464} Paciente", body: patientLines(patient, ticket.message).join("\n") },
+    { title: "\u{1F4AC} Pregunta", body: ticket.message },
+    { title: "\u270D\uFE0F Respuesta propuesta", body: suggestedReply || "(sin respuesta propuesta todav\xEDa)" }
+  ];
+}
+function escapeHtml$1(value) {
+  return value.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c] ?? c);
+}
+function sectionsAsPlain(sections) {
+  return sections.map((x) => `${x.title}
+${x.body}`).join("\n\n");
+}
+function sectionsAsHtml(header, sections) {
+  return [`<b>${escapeHtml$1(header)}</b>`, ...sections.map((x) => `<b>${escapeHtml$1(x.title)}</b>
+${escapeHtml$1(x.body)}`)].join("\n\n");
 }
 async function postNurseApprovalCard(agent, ticket, suggestedReply) {
   const chatId = requireNurseChatId("nurse card");
   if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
   const patient = await readPatient(ticket.chatId);
-  const summary = summarizePatient(patient);
-  const plain = [ticketHeader(ticket), summary, `Mensaje de la paciente:
-${ticket.message}`, `Respuesta propuesta:
-${suggestedReply}`].join("\n\n");
+  const header = ticketHeader(ticket);
+  const sections = nurseCardSections(ticket, patient, suggestedReply);
   return postWithFallback(
     agent,
     chatId,
     "nurse card",
     (thread) => thread.post(
       Card({
-        title: ticketHeader(ticket),
+        title: header,
         children: [
-          Text(summary),
-          Text(`Mensaje de la paciente:
-${ticket.message}`),
-          Text(`Respuesta propuesta:
-${suggestedReply}`),
-          Actions([
-            Button({ id: NURSE_APPROVE, label: "Aprobar y enviar", value: ticket.id, style: "primary" }),
-            Button({ id: NURSE_DENY, label: "Rechazar y escribir", value: ticket.id, style: "danger" }),
-            Button({ id: NURSE_VIDEO, label: "\u{1F4F9} Videollamada", value: ticket.id })
-          ])
+          Text(sectionsAsPlain(sections)),
+          Actions([Button({ id: NURSE_APPROVE, label: "\u2705 Aprobar y enviar", value: ticket.id, style: "primary" })]),
+          Actions([Button({ id: NURSE_DENY, label: "\u270F\uFE0F Escribir yo", value: ticket.id, style: "danger" })]),
+          Actions([Button({ id: NURSE_VIDEO, label: "\u{1F4F9} Videollamada", value: ticket.id })])
         ]
       })
     ),
-    () => telegramSendMessage(chatId, plain, {
-      inline_keyboard: [
-        [
-          { text: "Aprobar y enviar", callback_data: callbackData(NURSE_APPROVE, ticket.id) },
-          { text: "Rechazar y escribir", callback_data: callbackData(NURSE_DENY, ticket.id) }
-        ],
-        [{ text: "\u{1F4F9} Videollamada", callback_data: callbackData(NURSE_VIDEO, ticket.id) }]
-      ]
-    })
+    () => telegramSendMessage(
+      chatId,
+      sectionsAsHtml(header, sections),
+      {
+        inline_keyboard: [
+          [{ text: "\u2705 Aprobar y enviar", callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
+          [{ text: "\u270F\uFE0F Escribir yo", callback_data: callbackData(NURSE_DENY, ticket.id) }],
+          [{ text: "\u{1F4F9} Videollamada", callback_data: callbackData(NURSE_VIDEO, ticket.id) }]
+        ]
+      },
+      "HTML"
+    )
   );
 }
 async function postNurseAlert(agent, ticket, note) {
   const chatId = requireNurseChatId("nurse alert");
   if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
   const patient = await readPatient(ticket.chatId);
-  const label = ticket.tier === "urgent" ? "\u{1F6A8} URGENTE" : "Ticket sin respuesta propuesta";
-  const text = [`${label} \xB7 ${ticketHeader(ticket)}`, ticket.message, summarizePatient(patient), note].filter(Boolean).join("\n\n");
-  return postWithFallback(agent, chatId, "nurse alert", (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
+  const header = `${ticket.tier === "urgent" ? "\u{1F6A8} " : ""}${ticketHeader(ticket)}`;
+  const sections = [
+    { title: "\u{1F464} Paciente", body: patientLines(patient, ticket.message).join("\n") },
+    { title: "\u{1F4AC} Mensaje", body: ticket.message },
+    ...note ? [{ title: "\u27A1\uFE0F Siguiente paso", body: note }] : []
+  ];
+  return postWithFallback(
+    agent,
+    chatId,
+    "nurse alert",
+    (thread) => thread.post(Card({ title: header, children: [Text(sectionsAsPlain(sections))] })),
+    () => telegramSendMessage(chatId, sectionsAsHtml(header, sections), void 0, "HTML")
+  );
 }
 class NurseCardProcessor {
   id = "nurse-card";
@@ -1288,7 +1337,7 @@ async function ensureOnboarded(chatId, author, post, lang) {
   await writePatient(chatId, { ...patient ?? emptyPatient, name: firstName(author), onboarded: true, language });
   return true;
 }
-const DEMO_REMINDER_DELAY_MS = 45 * 1e3;
+const DEMO_REMINDER_DELAY_MS = 10 * 1e3;
 async function runDemoSeed(chatId, lang) {
   const language = lang ?? await langFor(chatId);
   const marta = martaPatient(/* @__PURE__ */ new Date(), language);
@@ -1932,7 +1981,7 @@ const remindersWorkflow = createWorkflow({
   id: "reminders",
   inputSchema: reminderInput,
   outputSchema: reminderOutput,
-  schedule: { cron: "* * * * *", timezone: TIMEZONE, inputData: { kind: "tick" } }
+  schedule: { cron: "*/10 * * * * *", timezone: TIMEZONE, inputData: { kind: "tick" } }
 }).then(dispatch).commit();
 
 "use strict";

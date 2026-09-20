@@ -1,6 +1,6 @@
 # Lumi — a nurse-in-the-loop companion for IVF patients
 
-**Try it:** Telegram → [@bam_team_bot](https://t.me/bam_team_bot) → send `/demo` and wait a minute. Lumi will message you first.
+**Try it:** Telegram → [@bam_team_bot](https://t.me/bam_team_bot) → send `/demo` and wait ten seconds. Lumi will message you first.
 **Demo video (60 s):** LINK_TO_VIDEO
 
 Built in 24 hours at HackBarna AI Summit 26 (Barcelona, 19–20 Sep 2026).
@@ -78,7 +78,7 @@ We started with GLM-5.3 as the main model. On Nebius it keeps reasoning regardle
      -d '{"url":"<PUBLIC_BASE_URL>/api/agents/companion/channels/telegram/webhook","secret_token":"<TELEGRAM_WEBHOOK_SECRET_TOKEN>"}'
    npm run dev
    ```
-5. Message the bot. `/demo` loads a sample patient (Marta, stimulation day 6) and schedules the first reminder 60 seconds later.
+5. Message the bot. `/demo` loads a sample patient (Marta, stimulation day 6) and schedules the first reminder 10 seconds later.
 
 ## Evaluation
 

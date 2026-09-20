@@ -5,7 +5,7 @@ import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 import { Actions, Button, Card, type TextElement, type Thread } from 'chat';
 import { messages } from '../i18n';
-import { addNurseNote, clinicalThreadId, patchPatient, patientLanguage, readPatient, summarizePatient } from '../memory/patient-memory';
+import { addNurseNote, clinicalThreadId, patchPatient, patientLanguage, readPatient } from '../memory/patient-memory';
 import { getTicket, latestTicketByStatus, updateTicket, type Ticket } from './tickets';
 import { startVideoCall } from './vonage';
 
@@ -56,13 +56,13 @@ function callbackData(actionId: string, value: string): string {
   return `${CALLBACK_DATA_PREFIX}${JSON.stringify({ a: actionId, v: value })}`;
 }
 
-async function telegramSendMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>): Promise<void> {
+async function telegramSendMessage(chatId: string, text: string, replyMarkup?: Record<string, unknown>, parseMode?: 'HTML'): Promise<void> {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set');
   const res = await fetch(`${telegramApiBase()}/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }),
+    body: JSON.stringify({ chat_id: chatId, text, ...(replyMarkup ? { reply_markup: replyMarkup } : {}), ...(parseMode ? { parse_mode: parseMode } : {}) }),
     signal: AbortSignal.timeout(8000),
   });
   const body = (await res.json().catch(() => ({}))) as { ok?: boolean; description?: string };
@@ -108,9 +108,71 @@ function requireNurseChatId(label: string): string | null {
   return chatId ?? null;
 }
 
+const TIER_LABEL: Record<string, string> = { clinical: 'CLÍNICO', urgent: 'URGENTE', logistic: 'LOGÍSTICO', routine: 'RUTINA' };
+
 function ticketHeader(ticket: Ticket): string {
   const name = ticket.patientName ?? 'paciente sin nombre';
-  return `Ticket ${ticket.id} · ${ticket.tier.toUpperCase()} · ${name}`;
+  return `Ticket ${ticket.id} · ${TIER_LABEL[ticket.tier] ?? ticket.tier.toUpperCase()} · ${name}`;
+}
+
+// Short record lines for the card: only what the nurse needs to decide.
+const PHASE_LABEL: Record<string, string> = {
+  stimulation: 'estimulación',
+  trigger: 'trigger',
+  retrieval: 'punción',
+  transfer: 'transferencia',
+  two_week_wait: 'betaespera',
+};
+
+// One glanceable line: "día 6 estimulación · Gonal-f 225 UI 21:00 · eco jue 24/09 10:00".
+function patientLines(patient: Awaited<ReturnType<typeof readPatient>>, excludeText?: string): string[] {
+  if (!patient) return ['Sin ficha todavía.'];
+  const bits: string[] = [];
+  if (patient.cycle) bits.push(`día ${patient.cycle.day} ${PHASE_LABEL[patient.cycle.phase] ?? patient.cycle.phase}`);
+  if (patient.protocol.length) bits.push(patient.protocol.map((m) => `${m.drug} ${m.dose} ${m.time}`).join(', '));
+  if (patient.nextAppointment) bits.push(`${patient.nextAppointment.type} ${shortDate(patient.nextAppointment.datetime)}`);
+  const lines = [bits.length ? bits.join(' · ') : 'ficha sin datos de tratamiento'];
+  // The message that opened this ticket is already logged as a symptom; show only the previous one.
+  const previous = patient.symptoms.filter((x) => x.text !== excludeText).slice(-1)[0];
+  if (previous) lines.push(`antes: «${previous.text.slice(0, 70)}»`);
+  return lines;
+}
+
+// "jueves, 24 de septiembre de 2026, 10:00" → "jue 24/09 10:00"
+function shortDate(value: string): string {
+  const m = /^(\w{3})\w*,?\s+(\d{1,2}) de (\w+)(?: de \d{4})?,?\s*(\d{1,2}:\d{2})?/u.exec(value);
+  if (!m) return value;
+  const months: Record<string, string> = { enero: '01', febrero: '02', marzo: '03', abril: '04', mayo: '05', junio: '06', julio: '07', agosto: '08', septiembre: '09', octubre: '10', noviembre: '11', diciembre: '12' };
+  const mm = months[m[3].toLowerCase()];
+  return mm ? `${m[1]} ${m[2].padStart(2, '0')}/${mm}${m[4] ? ` ${m[4]}` : ''}` : value;
+}
+
+interface CardSection {
+  title: string;
+  body: string;
+}
+
+function nurseCardSections(ticket: Ticket, patient: Awaited<ReturnType<typeof readPatient>>, suggestedReply: string): CardSection[] {
+  return [
+    { title: '👤 Paciente', body: patientLines(patient, ticket.message).join('\n') },
+    { title: '💬 Pregunta', body: ticket.message },
+    { title: '✍️ Respuesta propuesta', body: suggestedReply || '(sin respuesta propuesta todavía)' },
+  ];
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c] ?? c);
+}
+
+// Plain text for the Chat SDK path: the adapter escapes it for Telegram, and
+// markdown markers inside card text came out malformed. Emoji headings carry
+// the structure; the card title is rendered bold by the adapter.
+function sectionsAsPlain(sections: CardSection[]): string {
+  return sections.map((x) => `${x.title}\n${x.body}`).join('\n\n');
+}
+
+function sectionsAsHtml(header: string, sections: CardSection[]): string {
+  return [`<b>${escapeHtml(header)}</b>`, ...sections.map((x) => `<b>${escapeHtml(x.title)}</b>\n${escapeHtml(x.body)}`)].join('\n\n');
 }
 
 // Card with Aprobar / Rechazar, posted to the nurse's private chat with the
@@ -120,8 +182,8 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
   const chatId = requireNurseChatId('nurse card');
   if (!chatId) return { posted: false, reason: 'NURSE_TELEGRAM_CHAT_ID not set' };
   const patient = await readPatient(ticket.chatId);
-  const summary = summarizePatient(patient);
-  const plain = [ticketHeader(ticket), summary, `Mensaje de la paciente:\n${ticket.message}`, `Respuesta propuesta:\n${suggestedReply}`].join('\n\n');
+  const header = ticketHeader(ticket);
+  const sections = nurseCardSections(ticket, patient, suggestedReply);
   return postWithFallback(
     agent,
     chatId,
@@ -129,29 +191,28 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
     (thread) =>
       thread.post(
         Card({
-          title: ticketHeader(ticket),
+          title: header,
           children: [
-            Text(summary),
-            Text(`Mensaje de la paciente:\n${ticket.message}`),
-            Text(`Respuesta propuesta:\n${suggestedReply}`),
-            Actions([
-              Button({ id: NURSE_APPROVE, label: 'Aprobar y enviar', value: ticket.id, style: 'primary' }),
-              Button({ id: NURSE_DENY, label: 'Rechazar y escribir', value: ticket.id, style: 'danger' }),
-              Button({ id: NURSE_VIDEO, label: '📹 Videollamada', value: ticket.id }),
-            ]),
+            Text(sectionsAsPlain(sections)),
+            Actions([Button({ id: NURSE_APPROVE, label: '✅ Aprobar y enviar', value: ticket.id, style: 'primary' })]),
+            Actions([Button({ id: NURSE_DENY, label: '✏️ Escribir yo', value: ticket.id, style: 'danger' })]),
+            Actions([Button({ id: NURSE_VIDEO, label: '📹 Videollamada', value: ticket.id })]),
           ],
         }),
       ),
     () =>
-      telegramSendMessage(chatId, plain, {
-        inline_keyboard: [
-          [
-            { text: 'Aprobar y enviar', callback_data: callbackData(NURSE_APPROVE, ticket.id) },
-            { text: 'Rechazar y escribir', callback_data: callbackData(NURSE_DENY, ticket.id) },
+      telegramSendMessage(
+        chatId,
+        sectionsAsHtml(header, sections),
+        {
+          inline_keyboard: [
+            [{ text: '✅ Aprobar y enviar', callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
+            [{ text: '✏️ Escribir yo', callback_data: callbackData(NURSE_DENY, ticket.id) }],
+            [{ text: '📹 Videollamada', callback_data: callbackData(NURSE_VIDEO, ticket.id) }],
           ],
-          [{ text: '📹 Videollamada', callback_data: callbackData(NURSE_VIDEO, ticket.id) }],
-        ],
-      }),
+        },
+        'HTML',
+      ),
   );
 }
 
@@ -161,9 +222,19 @@ export async function postNurseAlert(agent: AnyAgent | undefined, ticket: Ticket
   const chatId = requireNurseChatId('nurse alert');
   if (!chatId) return { posted: false, reason: 'NURSE_TELEGRAM_CHAT_ID not set' };
   const patient = await readPatient(ticket.chatId);
-  const label = ticket.tier === 'urgent' ? '🚨 URGENTE' : 'Ticket sin respuesta propuesta';
-  const text = [`${label} · ${ticketHeader(ticket)}`, ticket.message, summarizePatient(patient), note].filter(Boolean).join('\n\n');
-  return postWithFallback(agent, chatId, 'nurse alert', (thread) => thread.post(text), () => telegramSendMessage(chatId, text));
+  const header = `${ticket.tier === 'urgent' ? '🚨 ' : ''}${ticketHeader(ticket)}`;
+  const sections: CardSection[] = [
+    { title: '👤 Paciente', body: patientLines(patient, ticket.message).join('\n') },
+    { title: '💬 Mensaje', body: ticket.message },
+    ...(note ? [{ title: '➡️ Siguiente paso', body: note }] : []),
+  ];
+  return postWithFallback(
+    agent,
+    chatId,
+    'nurse alert',
+    (thread) => thread.post(Card({ title: header, children: [Text(sectionsAsPlain(sections))] })),
+    () => telegramSendMessage(chatId, sectionsAsHtml(header, sections), undefined, 'HTML'),
+  );
 }
 
 // Watches the agent's stream: when notify_nurse suspends for approval, store

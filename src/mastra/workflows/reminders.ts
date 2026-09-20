@@ -137,13 +137,13 @@ const dispatch = createStep({
   },
 });
 
-// Runs every minute on Mastra's scheduler (Harness). POST /demo/reminder runs
+// Runs every 10 seconds on Mastra's scheduler (Harness). POST /demo/reminder runs
 // the same workflow by hand with kind=medication|followup.
 export const remindersWorkflow = createWorkflow({
   id: 'reminders',
   inputSchema: reminderInput,
   outputSchema: reminderOutput,
-  schedule: { cron: '* * * * *', timezone: TIMEZONE, inputData: { kind: 'tick' } },
+  schedule: { cron: '*/10 * * * * *', timezone: TIMEZONE, inputData: { kind: 'tick' } },
 })
   .then(dispatch)
   .commit();

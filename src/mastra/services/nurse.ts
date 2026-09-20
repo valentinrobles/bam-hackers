@@ -4,7 +4,7 @@ import { PinoLogger } from '@mastra/loggers';
 import type { RequestContext } from '@mastra/core/request-context';
 import type { ChunkType } from '@mastra/core/stream';
 import { Actions, Button, Card, type TextElement, type Thread } from 'chat';
-import { messages } from '../i18n';
+import { messages, type Lang } from '../i18n';
 import { addNurseNote, clinicalThreadId, patchPatient, patientLanguage, readPatient } from '../memory/patient-memory';
 import { getTicket, latestTicketByStatus, updateTicket, type Ticket } from './tickets';
 import { startVideoCall } from './vonage';
@@ -108,37 +108,27 @@ function requireNurseChatId(label: string): string | null {
   return chatId ?? null;
 }
 
-const TIER_LABEL: Record<string, string> = { clinical: 'CLÍNICO', urgent: 'URGENTE', logistic: 'LOGÍSTICO', routine: 'RUTINA' };
-
-function ticketHeader(ticket: Ticket): string {
-  const name = ticket.patientName ?? 'paciente sin nombre';
-  return `Ticket ${ticket.id} · ${TIER_LABEL[ticket.tier] ?? ticket.tier.toUpperCase()} · ${name}`;
+function ticketHeader(ticket: Ticket, lang: Lang): string {
+  const n = messages(lang).nurse;
+  return `Ticket ${ticket.id} · ${n.tier[ticket.tier] ?? ticket.tier.toUpperCase()} · ${ticket.patientName ?? n.unnamed}`;
 }
 
-// Short record lines for the card: only what the nurse needs to decide.
-const PHASE_LABEL: Record<string, string> = {
-  stimulation: 'estimulación',
-  trigger: 'trigger',
-  retrieval: 'punción',
-  transfer: 'transferencia',
-  two_week_wait: 'betaespera',
-};
-
 // One glanceable line: "día 6 estimulación · Gonal-f 225 UI 21:00 · eco jue 24/09 10:00".
-function patientLines(patient: Awaited<ReturnType<typeof readPatient>>, excludeText?: string): string[] {
-  if (!patient) return ['Sin ficha todavía.'];
+function patientLines(patient: Awaited<ReturnType<typeof readPatient>>, lang: Lang, excludeText?: string): string[] {
+  const n = messages(lang).nurse;
+  if (!patient) return [n.noRecord];
   const bits: string[] = [];
-  if (patient.cycle) bits.push(`día ${patient.cycle.day} ${PHASE_LABEL[patient.cycle.phase] ?? patient.cycle.phase}`);
+  if (patient.cycle) bits.push(n.day(patient.cycle.day, patient.cycle.phase));
   if (patient.protocol.length) bits.push(patient.protocol.map((m) => `${m.drug} ${m.dose} ${m.time}`).join(', '));
   if (patient.nextAppointment) bits.push(`${patient.nextAppointment.type} ${shortDate(patient.nextAppointment.datetime)}`);
-  const lines = [bits.length ? bits.join(' · ') : 'ficha sin datos de tratamiento'];
+  const lines = [bits.length ? bits.join(' · ') : n.noTreatmentData];
   // The message that opened this ticket is already logged as a symptom; show only the previous one.
   const previous = patient.symptoms.filter((x) => x.text !== excludeText).slice(-1)[0];
-  if (previous) lines.push(`antes: «${previous.text.slice(0, 70)}»`);
+  if (previous) lines.push(`${n.before}: «${previous.text.slice(0, 70)}»`);
   return lines;
 }
 
-// "jueves, 24 de septiembre de 2026, 10:00" → "jue 24/09 10:00"
+// "jueves, 24 de septiembre de 2026, 10:00" → "jue 24/09 10:00"; English dates pass through.
 function shortDate(value: string): string {
   const m = /^(\w{3})\w*,?\s+(\d{1,2}) de (\w+)(?: de \d{4})?,?\s*(\d{1,2}:\d{2})?/u.exec(value);
   if (!m) return value;
@@ -152,11 +142,14 @@ interface CardSection {
   body: string;
 }
 
-function nurseCardSections(ticket: Ticket, patient: Awaited<ReturnType<typeof readPatient>>, suggestedReply: string): CardSection[] {
+// The nurse sees the card in the patient's language, so what she approves is
+// exactly what the patient receives.
+function nurseCardSections(ticket: Ticket, patient: Awaited<ReturnType<typeof readPatient>>, suggestedReply: string, lang: Lang): CardSection[] {
+  const n = messages(lang).nurse;
   return [
-    { title: '👤 Paciente', body: patientLines(patient, ticket.message).join('\n') },
-    { title: '💬 Pregunta', body: ticket.message },
-    { title: '✍️ Respuesta propuesta', body: suggestedReply || '(sin respuesta propuesta todavía)' },
+    { title: n.patient, body: patientLines(patient, lang, ticket.message).join('\n') },
+    { title: n.question, body: ticket.message },
+    { title: n.proposedReply, body: suggestedReply || n.noDraft },
   ];
 }
 
@@ -182,8 +175,10 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
   const chatId = requireNurseChatId('nurse card');
   if (!chatId) return { posted: false, reason: 'NURSE_TELEGRAM_CHAT_ID not set' };
   const patient = await readPatient(ticket.chatId);
-  const header = ticketHeader(ticket);
-  const sections = nurseCardSections(ticket, patient, suggestedReply);
+  const lang: Lang = patient?.language ?? 'es';
+  const n = messages(lang).nurse;
+  const header = ticketHeader(ticket, lang);
+  const sections = nurseCardSections(ticket, patient, suggestedReply, lang);
   return postWithFallback(
     agent,
     chatId,
@@ -194,9 +189,9 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
           title: header,
           children: [
             Text(sectionsAsPlain(sections)),
-            Actions([Button({ id: NURSE_APPROVE, label: '✅ Aprobar y enviar', value: ticket.id, style: 'primary' })]),
-            Actions([Button({ id: NURSE_DENY, label: '✏️ Escribir yo', value: ticket.id, style: 'danger' })]),
-            Actions([Button({ id: NURSE_VIDEO, label: '📹 Videollamada', value: ticket.id })]),
+            Actions([Button({ id: NURSE_APPROVE, label: n.approve, value: ticket.id, style: 'primary' })]),
+            Actions([Button({ id: NURSE_DENY, label: n.writeMyself, value: ticket.id, style: 'danger' })]),
+            Actions([Button({ id: NURSE_VIDEO, label: n.video, value: ticket.id })]),
           ],
         }),
       ),
@@ -206,9 +201,9 @@ export async function postNurseApprovalCard(agent: AnyAgent | undefined, ticket:
         sectionsAsHtml(header, sections),
         {
           inline_keyboard: [
-            [{ text: '✅ Aprobar y enviar', callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
-            [{ text: '✏️ Escribir yo', callback_data: callbackData(NURSE_DENY, ticket.id) }],
-            [{ text: '📹 Videollamada', callback_data: callbackData(NURSE_VIDEO, ticket.id) }],
+            [{ text: n.approve, callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
+            [{ text: n.writeMyself, callback_data: callbackData(NURSE_DENY, ticket.id) }],
+            [{ text: n.video, callback_data: callbackData(NURSE_VIDEO, ticket.id) }],
           ],
         },
         'HTML',
@@ -222,11 +217,13 @@ export async function postNurseAlert(agent: AnyAgent | undefined, ticket: Ticket
   const chatId = requireNurseChatId('nurse alert');
   if (!chatId) return { posted: false, reason: 'NURSE_TELEGRAM_CHAT_ID not set' };
   const patient = await readPatient(ticket.chatId);
-  const header = `${ticket.tier === 'urgent' ? '🚨 ' : ''}${ticketHeader(ticket)}`;
+  const lang: Lang = patient?.language ?? 'es';
+  const n = messages(lang).nurse;
+  const header = `${ticket.tier === 'urgent' ? '🚨 ' : ''}${ticketHeader(ticket, lang)}`;
   const sections: CardSection[] = [
-    { title: '👤 Paciente', body: patientLines(patient, ticket.message).join('\n') },
-    { title: '💬 Mensaje', body: ticket.message },
-    ...(note ? [{ title: '➡️ Siguiente paso', body: note }] : []),
+    { title: n.patient, body: patientLines(patient, lang, ticket.message).join('\n') },
+    { title: n.message, body: ticket.message },
+    ...(note ? [{ title: n.nextStep, body: note }] : []),
   ];
   return postWithFallback(
     agent,
@@ -384,15 +381,16 @@ export async function startNurseVideoCall(agent: AnyAgent, ticketId: string): Pr
 }
 
 // After a denial, the nurse's next plain message is forwarded to the patient.
-export async function forwardNurseReply(agent: AnyAgent, text: string): Promise<{ ticket: Ticket | null; delivered: boolean }> {
+export async function forwardNurseReply(agent: AnyAgent, text: string): Promise<{ ticket: Ticket | null; delivered: boolean; lang: Lang }> {
   const ticket = await latestTicketByStatus('awaiting_nurse_reply');
-  if (!ticket) return { ticket: null, delivered: false };
-  const delivered = await postToPatient(agent, ticket.chatId, `${messages(await patientLanguage(ticket.chatId)).nurseSays} ${text}`);
-  if (!delivered) return { ticket, delivered: false };
+  if (!ticket) return { ticket: null, delivered: false, lang: 'es' };
+  const lang = await patientLanguage(ticket.chatId);
+  const delivered = await postToPatient(agent, ticket.chatId, `${messages(lang).nurseSays} ${text}`);
+  if (!delivered) return { ticket, delivered: false, lang };
   await updateTicket(ticket.id, { status: 'answered', suggestedReply: text });
   await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: text }).catch((error: unknown) =>
     logger.warn('could not write nurse note', { ticketId: ticket.id, error: String(error) }),
   );
   await clearOpenTicket(ticket);
-  return { ticket, delivered: true };
+  return { ticket, delivered: true, lang };
 }

@@ -113,7 +113,7 @@ The nurse has ${nurseDecision} the suggested reply for ticket ${ticketId ?? ''} 
     case 'clinical':
       return `## This message
 Triage tier: CLINICAL. Ticket ${ticketId ?? '(already open)'} exists and the patient has already been told you are contacting the nurse. Do not answer the clinical question yourself and do not create another ticket.
-Call notify_nurse exactly once, with ticketId "${ticketId ?? ''}" and a suggestedReply in Spanish written as the nurse would answer: concrete, safe, two or three sentences, addressed to the patient by name if known. Do not write any text before calling the tool.
+Call notify_nurse exactly once, with ticketId "${ticketId ?? ''}" and a suggestedReply written as the nurse would answer, in the language of the record's "language" field (es → Spanish, en → English): concrete, safe, two or three sentences, addressed to the patient by name if known. Do not write any text before calling the tool.
 After notify_nurse returns (approved or declined), the patient has already been told the outcome in a separate message. Reply with a single short sentence and no advice, for example "Aquí sigo para lo que necesites."`;
     case 'urgent':
       return `## This message
@@ -283,7 +283,7 @@ export async function prepareTurn(chatId: string, text: string, requestContext: 
     // The 24 h follow-up is planned now and persisted; the reminders tick sends it.
     await scheduleSend({ chatId, kind: 'followup', ticketId, dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) }).catch(() => undefined);
     if (ticket) {
-      void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`)
+      void postNurseAlert(companion, ticket, messages(lang).nurse.joinCall(nurseUrl))
         .then((o) => console.info('[companion] nurse alert', { ticketId, ...o }))
         .catch((error: unknown) => console.warn('[companion] nurse alert not posted', { ticketId, error: String(error) }));
     }
@@ -360,9 +360,10 @@ const onDirectMessage: ChannelHandler = async (thread, message, defaultHandler, 
   // The nurse's chat is never onboarded and never reaches the model.
   if (chatId === nurseChatId()) {
     try {
-      const { ticket, delivered } = await forwardNurseReply(companion, text);
+      const { ticket, delivered, lang } = await forwardNurseReply(companion, text);
+      const n = messages(lang).nurse;
       if (!ticket) await thread.post('No hay ningún ticket esperando tu respuesta ahora mismo.');
-      else if (delivered) await thread.post(`Enviado a ${ticket.patientName ?? 'la paciente'} (ticket ${ticket.id}).`);
+      else if (delivered) await thread.post(n.sentTo(ticket.patientName ?? n.thePatient, ticket.id));
       else await thread.post(`No he podido reenviarlo (ticket ${ticket.id}). Inténtalo de nuevo.`);
     } catch (error) {
       logger?.error('nurse reply forwarding failed', { error });
@@ -456,14 +457,16 @@ const onAction: ActionChannelHandler = async (event, defaultHandler, ctx) => {
   const { kind, ticketId } = parsed;
   const approved = kind === 'approve';
   const reply = (t: string) => event.thread?.post(t).catch(() => undefined);
+  const ticketForLang = await getTicket(ticketId).catch(() => null);
+  const n = messages(ticketForLang ? await langFor(ticketForLang.chatId) : 'es').nurse;
   if (kind === 'video') {
     try {
       const { ticket, nurseUrl, patientNotified } = await startNurseVideoCall(companion, ticketId);
-      if (!ticket) await reply(`No encuentro el ticket ${ticketId}.`);
-      else await reply(`${patientNotified ? 'Le he enviado el enlace a' : 'No he podido avisar a'} ${ticket.patientName ?? 'la paciente'}. Tu enlace: ${nurseUrl}`);
+      if (!ticket) await reply(n.notFound(ticketId));
+      else await reply((patientNotified ? n.videoSent : n.videoNotSent)(ticket.patientName ?? n.thePatient, nurseUrl ?? ''));
     } catch (error) {
       logger?.error('video call start failed', { ticketId, error });
-      await reply(`No he podido abrir la videollamada del ticket ${ticketId}.`);
+      await reply(n.videoFailed(ticketId));
     }
     return;
   }
@@ -471,24 +474,20 @@ const onAction: ActionChannelHandler = async (event, defaultHandler, ctx) => {
     const result = await handleNurseDecision(companion, ticketId, approved, ctx.requestContext);
     switch (result.outcome) {
       case 'resumed':
-        await reply(
-          approved
-            ? `Enviado a ${result.ticket.patientName ?? 'la paciente'} (ticket ${result.ticket.id}).`
-            : `Ticket ${result.ticket.id} rechazado. Escribe aquí tu respuesta para ${result.ticket.patientName ?? 'la paciente'} y se la reenvío tal cual.`,
-        );
+        await reply(approved ? n.sentTo(result.ticket.patientName ?? n.thePatient, result.ticket.id) : n.rejected(result.ticket.id, result.ticket.patientName ?? n.thePatient));
         return;
       case 'already_handled':
-        await reply(`El ticket ${result.ticket.id} ya se gestionó.`);
+        await reply(n.alreadyHandled(result.ticket.id));
         return;
       case 'not_suspended':
-        await reply(`El ticket ${result.ticket.id} no está esperando aprobación.`);
+        await reply(n.notAwaiting(result.ticket.id));
         return;
       case 'not_found':
-        await reply(`No encuentro el ticket ${ticketId}.`);
+        await reply(n.notFound(ticketId));
     }
   } catch (error) {
     logger?.error('nurse decision failed', { ticketId, approved, error });
-    await reply(`No he podido aplicar la decisión del ticket ${ticketId}. Inténtalo de nuevo.`);
+    await reply(n.decisionFailed(ticketId));
   }
 };
 

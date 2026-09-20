@@ -188,6 +188,35 @@ const es$1 = {
   doseTaken: (item) => item ? `Anotado \u{1F489} ${item.drug} ${item.dose} a las ${item.time}. \xA1Bien hecho!` : "Anotado. \xA1Bien hecho!",
   doseQuestion: "Cu\xE9ntame, te leo. Si es algo sobre la dosis o c\xF3mo te sientes, se lo paso a tu enfermera.",
   followUp: (name, about) => `\u{1F469}\u200D\u2695\uFE0F ${name ? `${name}, ` : ""}\xBFc\xF3mo est\xE1s hoy?${about ? ` Ayer avisamos a tu enfermera por lo que me contaste (\xAB${about}\xBB).` : ""} Si algo ha empeorado o no mejora, llama a la cl\xEDnica al ${PHONE}.`,
+  nurse: {
+    tier: { clinical: "CL\xCDNICO", urgent: "URGENTE", logistic: "LOG\xCDSTICO", routine: "RUTINA" },
+    patient: "\u{1F464} Paciente",
+    question: "\u{1F4AC} Pregunta",
+    message: "\u{1F4AC} Mensaje",
+    proposedReply: "\u270D\uFE0F Respuesta propuesta",
+    noDraft: "(sin respuesta propuesta todav\xEDa)",
+    nextStep: "\u27A1\uFE0F Siguiente paso",
+    noRecord: "Sin ficha todav\xEDa.",
+    noTreatmentData: "ficha sin datos de tratamiento",
+    before: "antes",
+    day: (day, phase) => `d\xEDa ${day} ${{ stimulation: "estimulaci\xF3n", trigger: "trigger", retrieval: "punci\xF3n", transfer: "transferencia", two_week_wait: "betaespera" }[phase] ?? phase}`,
+    at: "a las",
+    approve: "\u2705 Aprobar y enviar",
+    writeMyself: "\u270F\uFE0F Escribir yo",
+    video: "\u{1F4F9} Videollamada",
+    joinCall: (url) => `Entra en la videollamada con la paciente: ${url}`,
+    sentTo: (name, ticketId) => `Enviado a ${name} (ticket ${ticketId}).`,
+    rejected: (ticketId, name) => `Ticket ${ticketId} rechazado. Escribe aqu\xED tu respuesta para ${name} y se la reenv\xEDo tal cual.`,
+    alreadyHandled: (ticketId) => `El ticket ${ticketId} ya se gestion\xF3.`,
+    notAwaiting: (ticketId) => `El ticket ${ticketId} no est\xE1 esperando aprobaci\xF3n.`,
+    notFound: (ticketId) => `No encuentro el ticket ${ticketId}.`,
+    decisionFailed: (ticketId) => `No he podido aplicar la decisi\xF3n del ticket ${ticketId}. Int\xE9ntalo de nuevo.`,
+    videoSent: (name, url) => `Le he enviado el enlace a ${name}. Tu enlace: ${url}`,
+    videoNotSent: (name, url) => `No he podido avisar a ${name}. Tu enlace: ${url}`,
+    videoFailed: (ticketId) => `No he podido abrir la videollamada del ticket ${ticketId}.`,
+    thePatient: "la paciente",
+    unnamed: "paciente sin nombre"
+  },
   call: {
     title: "Videollamada",
     patient: "Paciente",
@@ -238,6 +267,35 @@ const en = {
   doseTaken: (item) => item ? `Noted \u{1F489} ${item.drug} ${item.dose} at ${item.time}. Well done!` : "Noted. Well done!",
   doseQuestion: "Tell me, I'm listening. If it's about the dose or how you feel, I'll pass it to your nurse.",
   followUp: (name, about) => `\u{1F469}\u200D\u2695\uFE0F ${name ? `${name}, ` : ""}how are you today?${about ? ` Yesterday we alerted your nurse about what you told me ("${about}").` : ""} If anything got worse or isn't improving, call the clinic at ${PHONE}.`,
+  nurse: {
+    tier: { clinical: "CLINICAL", urgent: "URGENT", logistic: "LOGISTIC", routine: "ROUTINE" },
+    patient: "\u{1F464} Patient",
+    question: "\u{1F4AC} Question",
+    message: "\u{1F4AC} Message",
+    proposedReply: "\u270D\uFE0F Suggested reply",
+    noDraft: "(no suggested reply yet)",
+    nextStep: "\u27A1\uFE0F Next step",
+    noRecord: "No record yet.",
+    noTreatmentData: "no treatment data on record",
+    before: "earlier",
+    day: (day, phase) => `day ${day} ${{ stimulation: "stimulation", trigger: "trigger", retrieval: "retrieval", transfer: "transfer", two_week_wait: "two-week wait" }[phase] ?? phase}`,
+    at: "at",
+    approve: "\u2705 Approve and send",
+    writeMyself: "\u270F\uFE0F Write my own",
+    video: "\u{1F4F9} Video call",
+    joinCall: (url) => `Join the video call with the patient: ${url}`,
+    sentTo: (name, ticketId) => `Sent to ${name} (ticket ${ticketId}).`,
+    rejected: (ticketId, name) => `Ticket ${ticketId} rejected. Type your reply for ${name} here and I will forward it as is.`,
+    alreadyHandled: (ticketId) => `Ticket ${ticketId} was already handled.`,
+    notAwaiting: (ticketId) => `Ticket ${ticketId} is not waiting for approval.`,
+    notFound: (ticketId) => `I can't find ticket ${ticketId}.`,
+    decisionFailed: (ticketId) => `I could not apply the decision for ticket ${ticketId}. Please try again.`,
+    videoSent: (name, url) => `I sent the link to ${name}. Your link: ${url}`,
+    videoNotSent: (name, url) => `I could not reach ${name}. Your link: ${url}`,
+    videoFailed: (ticketId) => `I could not open the video call for ticket ${ticketId}.`,
+    thePatient: "the patient",
+    unnamed: "unnamed patient"
+  },
   call: {
     title: "Video call",
     patient: "Patient",
@@ -857,27 +915,20 @@ function requireNurseChatId(label) {
   if (!chatId) logger$1.error(`${label}: NURSE_TELEGRAM_CHAT_ID is not set, nothing sent to the nurse`);
   return chatId ?? null;
 }
-const TIER_LABEL = { clinical: "CL\xCDNICO", urgent: "URGENTE", logistic: "LOG\xCDSTICO", routine: "RUTINA" };
-function ticketHeader(ticket) {
-  const name = ticket.patientName ?? "paciente sin nombre";
-  return `Ticket ${ticket.id} \xB7 ${TIER_LABEL[ticket.tier] ?? ticket.tier.toUpperCase()} \xB7 ${name}`;
+function ticketHeader(ticket, lang) {
+  const n = messages(lang).nurse;
+  return `Ticket ${ticket.id} \xB7 ${n.tier[ticket.tier] ?? ticket.tier.toUpperCase()} \xB7 ${ticket.patientName ?? n.unnamed}`;
 }
-const PHASE_LABEL = {
-  stimulation: "estimulaci\xF3n",
-  trigger: "trigger",
-  retrieval: "punci\xF3n",
-  transfer: "transferencia",
-  two_week_wait: "betaespera"
-};
-function patientLines(patient, excludeText) {
-  if (!patient) return ["Sin ficha todav\xEDa."];
+function patientLines(patient, lang, excludeText) {
+  const n = messages(lang).nurse;
+  if (!patient) return [n.noRecord];
   const bits = [];
-  if (patient.cycle) bits.push(`d\xEDa ${patient.cycle.day} ${PHASE_LABEL[patient.cycle.phase] ?? patient.cycle.phase}`);
+  if (patient.cycle) bits.push(n.day(patient.cycle.day, patient.cycle.phase));
   if (patient.protocol.length) bits.push(patient.protocol.map((m) => `${m.drug} ${m.dose} ${m.time}`).join(", "));
   if (patient.nextAppointment) bits.push(`${patient.nextAppointment.type} ${shortDate(patient.nextAppointment.datetime)}`);
-  const lines = [bits.length ? bits.join(" \xB7 ") : "ficha sin datos de tratamiento"];
+  const lines = [bits.length ? bits.join(" \xB7 ") : n.noTreatmentData];
   const previous = patient.symptoms.filter((x) => x.text !== excludeText).slice(-1)[0];
-  if (previous) lines.push(`antes: \xAB${previous.text.slice(0, 70)}\xBB`);
+  if (previous) lines.push(`${n.before}: \xAB${previous.text.slice(0, 70)}\xBB`);
   return lines;
 }
 function shortDate(value) {
@@ -887,11 +938,12 @@ function shortDate(value) {
   const mm = months[m[3].toLowerCase()];
   return mm ? `${m[1]} ${m[2].padStart(2, "0")}/${mm}${m[4] ? ` ${m[4]}` : ""}` : value;
 }
-function nurseCardSections(ticket, patient, suggestedReply) {
+function nurseCardSections(ticket, patient, suggestedReply, lang) {
+  const n = messages(lang).nurse;
   return [
-    { title: "\u{1F464} Paciente", body: patientLines(patient, ticket.message).join("\n") },
-    { title: "\u{1F4AC} Pregunta", body: ticket.message },
-    { title: "\u270D\uFE0F Respuesta propuesta", body: suggestedReply || "(sin respuesta propuesta todav\xEDa)" }
+    { title: n.patient, body: patientLines(patient, lang, ticket.message).join("\n") },
+    { title: n.question, body: ticket.message },
+    { title: n.proposedReply, body: suggestedReply || n.noDraft }
   ];
 }
 function escapeHtml$1(value) {
@@ -909,8 +961,10 @@ async function postNurseApprovalCard(agent, ticket, suggestedReply) {
   const chatId = requireNurseChatId("nurse card");
   if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
   const patient = await readPatient(ticket.chatId);
-  const header = ticketHeader(ticket);
-  const sections = nurseCardSections(ticket, patient, suggestedReply);
+  const lang = patient?.language ?? "es";
+  const n = messages(lang).nurse;
+  const header = ticketHeader(ticket, lang);
+  const sections = nurseCardSections(ticket, patient, suggestedReply, lang);
   return postWithFallback(
     agent,
     chatId,
@@ -920,9 +974,9 @@ async function postNurseApprovalCard(agent, ticket, suggestedReply) {
         title: header,
         children: [
           Text(sectionsAsPlain(sections)),
-          Actions([Button({ id: NURSE_APPROVE, label: "\u2705 Aprobar y enviar", value: ticket.id, style: "primary" })]),
-          Actions([Button({ id: NURSE_DENY, label: "\u270F\uFE0F Escribir yo", value: ticket.id, style: "danger" })]),
-          Actions([Button({ id: NURSE_VIDEO, label: "\u{1F4F9} Videollamada", value: ticket.id })])
+          Actions([Button({ id: NURSE_APPROVE, label: n.approve, value: ticket.id, style: "primary" })]),
+          Actions([Button({ id: NURSE_DENY, label: n.writeMyself, value: ticket.id, style: "danger" })]),
+          Actions([Button({ id: NURSE_VIDEO, label: n.video, value: ticket.id })])
         ]
       })
     ),
@@ -931,9 +985,9 @@ async function postNurseApprovalCard(agent, ticket, suggestedReply) {
       sectionsAsHtml(header, sections),
       {
         inline_keyboard: [
-          [{ text: "\u2705 Aprobar y enviar", callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
-          [{ text: "\u270F\uFE0F Escribir yo", callback_data: callbackData(NURSE_DENY, ticket.id) }],
-          [{ text: "\u{1F4F9} Videollamada", callback_data: callbackData(NURSE_VIDEO, ticket.id) }]
+          [{ text: n.approve, callback_data: callbackData(NURSE_APPROVE, ticket.id) }],
+          [{ text: n.writeMyself, callback_data: callbackData(NURSE_DENY, ticket.id) }],
+          [{ text: n.video, callback_data: callbackData(NURSE_VIDEO, ticket.id) }]
         ]
       },
       "HTML"
@@ -944,11 +998,13 @@ async function postNurseAlert(agent, ticket, note) {
   const chatId = requireNurseChatId("nurse alert");
   if (!chatId) return { posted: false, reason: "NURSE_TELEGRAM_CHAT_ID not set" };
   const patient = await readPatient(ticket.chatId);
-  const header = `${ticket.tier === "urgent" ? "\u{1F6A8} " : ""}${ticketHeader(ticket)}`;
+  const lang = patient?.language ?? "es";
+  const n = messages(lang).nurse;
+  const header = `${ticket.tier === "urgent" ? "\u{1F6A8} " : ""}${ticketHeader(ticket, lang)}`;
   const sections = [
-    { title: "\u{1F464} Paciente", body: patientLines(patient, ticket.message).join("\n") },
-    { title: "\u{1F4AC} Mensaje", body: ticket.message },
-    ...note ? [{ title: "\u27A1\uFE0F Siguiente paso", body: note }] : []
+    { title: n.patient, body: patientLines(patient, lang, ticket.message).join("\n") },
+    { title: n.message, body: ticket.message },
+    ...note ? [{ title: n.nextStep, body: note }] : []
   ];
   return postWithFallback(
     agent,
@@ -1057,15 +1113,16 @@ async function startNurseVideoCall(agent, ticketId) {
 }
 async function forwardNurseReply(agent, text) {
   const ticket = await latestTicketByStatus("awaiting_nurse_reply");
-  if (!ticket) return { ticket: null, delivered: false };
-  const delivered = await postToPatient(agent, ticket.chatId, `${messages(await patientLanguage(ticket.chatId)).nurseSays} ${text}`);
-  if (!delivered) return { ticket, delivered: false };
+  if (!ticket) return { ticket: null, delivered: false, lang: "es" };
+  const lang = await patientLanguage(ticket.chatId);
+  const delivered = await postToPatient(agent, ticket.chatId, `${messages(lang).nurseSays} ${text}`);
+  if (!delivered) return { ticket, delivered: false, lang };
   await updateTicket(ticket.id, { status: "answered", suggestedReply: text });
   await addNurseNote(ticket.chatId, { ticketId: ticket.id, question: ticket.message, reply: text }).catch(
     (error) => logger$1.warn("could not write nurse note", { ticketId: ticket.id, error: String(error) })
   );
   await clearOpenTicket(ticket);
-  return { ticket, delivered: true };
+  return { ticket, delivered: true, lang };
 }
 
 "use strict";
@@ -1272,7 +1329,7 @@ The nurse has ${nurseDecision} the suggested reply for ticket ${ticketId ?? ""} 
     case "clinical":
       return `## This message
 Triage tier: CLINICAL. Ticket ${ticketId ?? "(already open)"} exists and the patient has already been told you are contacting the nurse. Do not answer the clinical question yourself and do not create another ticket.
-Call notify_nurse exactly once, with ticketId "${ticketId ?? ""}" and a suggestedReply in Spanish written as the nurse would answer: concrete, safe, two or three sentences, addressed to the patient by name if known. Do not write any text before calling the tool.
+Call notify_nurse exactly once, with ticketId "${ticketId ?? ""}" and a suggestedReply written as the nurse would answer, in the language of the record's "language" field (es \u2192 Spanish, en \u2192 English): concrete, safe, two or three sentences, addressed to the patient by name if known. Do not write any text before calling the tool.
 After notify_nurse returns (approved or declined), the patient has already been told the outcome in a separate message. Reply with a single short sentence and no advice, for example "Aqu\xED sigo para lo que necesites."`;
     case "urgent":
       return `## This message
@@ -1399,7 +1456,7 @@ async function prepareTurn(chatId, text, requestContext) {
     await addNurseNote(chatId, { ticketId, question: text, reply: messages(lang).urgentNote(patientUrl) }).catch(() => void 0);
     await scheduleSend({ chatId, kind: "followup", ticketId, dueAt: new Date(Date.now() + 24 * 60 * 60 * 1e3) }).catch(() => void 0);
     if (ticket) {
-      void postNurseAlert(companion, ticket, `Entra en la videollamada con la paciente: ${nurseUrl}`).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
+      void postNurseAlert(companion, ticket, messages(lang).nurse.joinCall(nurseUrl)).then((o) => console.info("[companion] nurse alert", { ticketId, ...o })).catch((error) => console.warn("[companion] nurse alert not posted", { ticketId, error: String(error) }));
     }
     return { tier, reason, ticketId, ticket, directReply: messages(lang).urgentReply(patient?.name, patientUrl) };
   }
@@ -1454,9 +1511,10 @@ const onDirectMessage = async (thread, message, defaultHandler, ctx) => {
   logger?.info("telegram inbound", { chatId, userId: message.author.userId, userName: message.author.userName, threadId: thread.id });
   if (chatId === nurseChatId()) {
     try {
-      const { ticket, delivered } = await forwardNurseReply(companion, text);
+      const { ticket, delivered, lang } = await forwardNurseReply(companion, text);
+      const n = messages(lang).nurse;
       if (!ticket) await thread.post("No hay ning\xFAn ticket esperando tu respuesta ahora mismo.");
-      else if (delivered) await thread.post(`Enviado a ${ticket.patientName ?? "la paciente"} (ticket ${ticket.id}).`);
+      else if (delivered) await thread.post(n.sentTo(ticket.patientName ?? n.thePatient, ticket.id));
       else await thread.post(`No he podido reenviarlo (ticket ${ticket.id}). Int\xE9ntalo de nuevo.`);
     } catch (error) {
       logger?.error("nurse reply forwarding failed", { error });
@@ -1540,14 +1598,16 @@ const onAction = async (event, defaultHandler, ctx) => {
   const { kind, ticketId } = parsed;
   const approved = kind === "approve";
   const reply = (t) => event.thread?.post(t).catch(() => void 0);
+  const ticketForLang = await getTicket(ticketId).catch(() => null);
+  const n = messages(ticketForLang ? await langFor(ticketForLang.chatId) : "es").nurse;
   if (kind === "video") {
     try {
       const { ticket, nurseUrl, patientNotified } = await startNurseVideoCall(companion, ticketId);
-      if (!ticket) await reply(`No encuentro el ticket ${ticketId}.`);
-      else await reply(`${patientNotified ? "Le he enviado el enlace a" : "No he podido avisar a"} ${ticket.patientName ?? "la paciente"}. Tu enlace: ${nurseUrl}`);
+      if (!ticket) await reply(n.notFound(ticketId));
+      else await reply((patientNotified ? n.videoSent : n.videoNotSent)(ticket.patientName ?? n.thePatient, nurseUrl ?? ""));
     } catch (error) {
       logger?.error("video call start failed", { ticketId, error });
-      await reply(`No he podido abrir la videollamada del ticket ${ticketId}.`);
+      await reply(n.videoFailed(ticketId));
     }
     return;
   }
@@ -1555,22 +1615,20 @@ const onAction = async (event, defaultHandler, ctx) => {
     const result = await handleNurseDecision(companion, ticketId, approved, ctx.requestContext);
     switch (result.outcome) {
       case "resumed":
-        await reply(
-          approved ? `Enviado a ${result.ticket.patientName ?? "la paciente"} (ticket ${result.ticket.id}).` : `Ticket ${result.ticket.id} rechazado. Escribe aqu\xED tu respuesta para ${result.ticket.patientName ?? "la paciente"} y se la reenv\xEDo tal cual.`
-        );
+        await reply(approved ? n.sentTo(result.ticket.patientName ?? n.thePatient, result.ticket.id) : n.rejected(result.ticket.id, result.ticket.patientName ?? n.thePatient));
         return;
       case "already_handled":
-        await reply(`El ticket ${result.ticket.id} ya se gestion\xF3.`);
+        await reply(n.alreadyHandled(result.ticket.id));
         return;
       case "not_suspended":
-        await reply(`El ticket ${result.ticket.id} no est\xE1 esperando aprobaci\xF3n.`);
+        await reply(n.notAwaiting(result.ticket.id));
         return;
       case "not_found":
-        await reply(`No encuentro el ticket ${ticketId}.`);
+        await reply(n.notFound(ticketId));
     }
   } catch (error) {
     logger?.error("nurse decision failed", { ticketId, approved, error });
-    await reply(`No he podido aplicar la decisi\xF3n del ticket ${ticketId}. Int\xE9ntalo de nuevo.`);
+    await reply(n.decisionFailed(ticketId));
   }
 };
 function telegramMode() {

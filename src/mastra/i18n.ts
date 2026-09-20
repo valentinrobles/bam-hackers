@@ -40,6 +40,35 @@ export interface Messages {
   doseTaken: (item?: ProtocolItem) => string;
   doseQuestion: string;
   followUp: (name: string | undefined, about?: string | null) => string;
+  nurse: {
+    tier: Record<string, string>;
+    patient: string;
+    question: string;
+    message: string;
+    proposedReply: string;
+    noDraft: string;
+    nextStep: string;
+    noRecord: string;
+    noTreatmentData: string;
+    before: string;
+    day: (day: number, phase: string) => string;
+    at: string;
+    approve: string;
+    writeMyself: string;
+    video: string;
+    joinCall: (url: string) => string;
+    sentTo: (name: string, ticketId: string) => string;
+    rejected: (ticketId: string, name: string) => string;
+    alreadyHandled: (ticketId: string) => string;
+    notAwaiting: (ticketId: string) => string;
+    notFound: (ticketId: string) => string;
+    decisionFailed: (ticketId: string) => string;
+    videoSent: (name: string, url: string) => string;
+    videoNotSent: (name: string, url: string) => string;
+    videoFailed: (ticketId: string) => string;
+    thePatient: string;
+    unnamed: string;
+  };
   call: {
     title: string;
     patient: string;
@@ -94,6 +123,35 @@ const es: Messages = {
   doseQuestion: 'Cuéntame, te leo. Si es algo sobre la dosis o cómo te sientes, se lo paso a tu enfermera.',
   followUp: (name, about) =>
     `👩‍⚕️ ${name ? `${name}, ` : ''}¿cómo estás hoy?${about ? ` Ayer avisamos a tu enfermera por lo que me contaste («${about}»).` : ''} Si algo ha empeorado o no mejora, llama a la clínica al ${PHONE}.`,
+  nurse: {
+    tier: { clinical: 'CLÍNICO', urgent: 'URGENTE', logistic: 'LOGÍSTICO', routine: 'RUTINA' },
+    patient: '👤 Paciente',
+    question: '💬 Pregunta',
+    message: '💬 Mensaje',
+    proposedReply: '✍️ Respuesta propuesta',
+    noDraft: '(sin respuesta propuesta todavía)',
+    nextStep: '➡️ Siguiente paso',
+    noRecord: 'Sin ficha todavía.',
+    noTreatmentData: 'ficha sin datos de tratamiento',
+    before: 'antes',
+    day: (day, phase) => `día ${day} ${{ stimulation: 'estimulación', trigger: 'trigger', retrieval: 'punción', transfer: 'transferencia', two_week_wait: 'betaespera' }[phase] ?? phase}`,
+    at: 'a las',
+    approve: '✅ Aprobar y enviar',
+    writeMyself: '✏️ Escribir yo',
+    video: '📹 Videollamada',
+    joinCall: (url) => `Entra en la videollamada con la paciente: ${url}`,
+    sentTo: (name, ticketId) => `Enviado a ${name} (ticket ${ticketId}).`,
+    rejected: (ticketId, name) => `Ticket ${ticketId} rechazado. Escribe aquí tu respuesta para ${name} y se la reenvío tal cual.`,
+    alreadyHandled: (ticketId) => `El ticket ${ticketId} ya se gestionó.`,
+    notAwaiting: (ticketId) => `El ticket ${ticketId} no está esperando aprobación.`,
+    notFound: (ticketId) => `No encuentro el ticket ${ticketId}.`,
+    decisionFailed: (ticketId) => `No he podido aplicar la decisión del ticket ${ticketId}. Inténtalo de nuevo.`,
+    videoSent: (name, url) => `Le he enviado el enlace a ${name}. Tu enlace: ${url}`,
+    videoNotSent: (name, url) => `No he podido avisar a ${name}. Tu enlace: ${url}`,
+    videoFailed: (ticketId) => `No he podido abrir la videollamada del ticket ${ticketId}.`,
+    thePatient: 'la paciente',
+    unnamed: 'paciente sin nombre',
+  },
   call: {
     title: 'Videollamada',
     patient: 'Paciente',
@@ -148,6 +206,35 @@ const en: Messages = {
   doseQuestion: "Tell me, I'm listening. If it's about the dose or how you feel, I'll pass it to your nurse.",
   followUp: (name, about) =>
     `👩‍⚕️ ${name ? `${name}, ` : ''}how are you today?${about ? ` Yesterday we alerted your nurse about what you told me ("${about}").` : ''} If anything got worse or isn't improving, call the clinic at ${PHONE}.`,
+  nurse: {
+    tier: { clinical: 'CLINICAL', urgent: 'URGENT', logistic: 'LOGISTIC', routine: 'ROUTINE' },
+    patient: '👤 Patient',
+    question: '💬 Question',
+    message: '💬 Message',
+    proposedReply: '✍️ Suggested reply',
+    noDraft: '(no suggested reply yet)',
+    nextStep: '➡️ Next step',
+    noRecord: 'No record yet.',
+    noTreatmentData: 'no treatment data on record',
+    before: 'earlier',
+    day: (day, phase) => `day ${day} ${{ stimulation: 'stimulation', trigger: 'trigger', retrieval: 'retrieval', transfer: 'transfer', two_week_wait: 'two-week wait' }[phase] ?? phase}`,
+    at: 'at',
+    approve: '✅ Approve and send',
+    writeMyself: '✏️ Write my own',
+    video: '📹 Video call',
+    joinCall: (url) => `Join the video call with the patient: ${url}`,
+    sentTo: (name, ticketId) => `Sent to ${name} (ticket ${ticketId}).`,
+    rejected: (ticketId, name) => `Ticket ${ticketId} rejected. Type your reply for ${name} here and I will forward it as is.`,
+    alreadyHandled: (ticketId) => `Ticket ${ticketId} was already handled.`,
+    notAwaiting: (ticketId) => `Ticket ${ticketId} is not waiting for approval.`,
+    notFound: (ticketId) => `I can't find ticket ${ticketId}.`,
+    decisionFailed: (ticketId) => `I could not apply the decision for ticket ${ticketId}. Please try again.`,
+    videoSent: (name, url) => `I sent the link to ${name}. Your link: ${url}`,
+    videoNotSent: (name, url) => `I could not reach ${name}. Your link: ${url}`,
+    videoFailed: (ticketId) => `I could not open the video call for ticket ${ticketId}.`,
+    thePatient: 'the patient',
+    unnamed: 'unnamed patient',
+  },
   call: {
     title: 'Video call',
     patient: 'Patient',

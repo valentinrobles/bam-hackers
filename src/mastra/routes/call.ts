@@ -37,9 +37,12 @@ function callPage(ticketId: string, role: CallRole, lang: Lang): string {
   header { padding: 12px 16px; font-size: 14px; color: #a9b4bb; display: flex; justify-content: space-between; align-items: center; }
   header strong { color: #eef2f4; }
   main { position: relative; flex: 1; min-height: 0; margin: 0 12px; border-radius: 14px; overflow: hidden; background: #000; }
-  #remote, #remote > * { width: 100%; height: 100%; }
-  #local { position: absolute; right: 12px; top: 12px; width: 30%; max-width: 160px; aspect-ratio: 3 / 4; border-radius: 10px; overflow: hidden; background: #1c2429; border: 2px solid rgba(255,255,255,.25); }
+  #remote { position: absolute; inset: 0; }
+  #remote > * { width: 100% !important; height: 100% !important; }
+  #local { position: absolute; right: 12px; top: 12px; width: 120px; height: 160px; border-radius: 10px; overflow: hidden; background: #1c2429; border: 2px solid rgba(255,255,255,.25); z-index: 2; }
   #local > * { width: 100% !important; height: 100% !important; }
+  @media (min-width: 900px) { #local { width: 180px; height: 240px; } }
+  @media (max-width: 480px) { #local { width: 28vw; height: 37vw; } }
   #status { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 16px; font-size: 15px; text-align: center; background: linear-gradient(transparent, rgba(0,0,0,.75)); }
   #status.error { background: #7a1f1f; font-weight: 600; }
   footer { padding: 14px 16px calc(14px + env(safe-area-inset-bottom, 0)); display: flex; gap: 12px; justify-content: center; }
@@ -101,16 +104,16 @@ function callPage(ticketId: string, role: CallRole, lang: Lang): string {
 
     session = OT.initSession(creds.applicationId, creds.sessionId);
     session.on('streamCreated', function (event) {
-      session.subscribe(event.stream, 'remote', { insertMode: 'replace', width: '100%', height: '100%' }, function (err) {
+      session.subscribe(event.stream, 'remote', { insertMode: 'append', width: '100%', height: '100%', fitMode: 'contain', showControls: false }, function (err) {
         if (err) setStatus(explain(err), true);
       });
       peerEl.textContent = T.inCall;
       setStatus('', false);
     });
-    session.on('streamDestroyed', function () { peerEl.textContent = T.waiting; });
+    session.on('streamDestroyed', function () { peerEl.textContent = T.waiting; document.getElementById('remote').innerHTML = ''; });
     session.on('sessionDisconnected', function () { if (!ended) setStatus(T.disconnected, true); });
 
-    publisher = OT.initPublisher('local', { insertMode: 'replace', width: '100%', height: '100%', publishAudio: true, publishVideo: true, name: role }, function (err) {
+    publisher = OT.initPublisher('local', { insertMode: 'append', width: '100%', height: '100%', fitMode: 'cover', showControls: false, publishAudio: true, publishVideo: true, name: role }, function (err) {
       if (err) setStatus(explain(err), true);
     });
     publisher.on('accessDenied', function () { setStatus(explain({ name: 'NotAllowedError' }), true); });

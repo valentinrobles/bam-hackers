@@ -15,6 +15,8 @@
   <img src="public/product.png" alt="Lumi product screenshot" width="100%" />
 </div>
 
+**4 million IVF cycles happen every year. 70% fail on the first attempt. Most patients need 2–3 cycles to succeed — but many give up after the first one. Not because medicine failed them. Because they were alone after 6pm with a question and nobody answered.**
+
 Lumi is a Telegram agent built with [Mastra](https://mastra.ai) for **HackBarna AI Summit 26**. It sits between the patient and the clinic — answering routine questions on its own, routing anything clinical to a human nurse for approval, and opening a video call on urgent cases.
 
 ### What Lumi does
@@ -26,6 +28,16 @@ Lumi is a Telegram agent built with [Mastra](https://mastra.ai) for **HackBarna 
 | 📋 **Medical Secretary** | Answers logistic questions, reminds medication times |
 | 📁 **Clinical History** | Keeps a full record of past attempts, nurse notes and symptoms |
 | 🚨 **Urgency Support** | Opens a nurse video call and gives the emergency phone instantly |
+
+---
+
+## Team
+
+Built in 24h at [HackBarna AI Summit 26](https://hackbarna.com) by:
+
+- **Valentín Robles** — Engineering
+- **Marta Conde** — Design & Product
+- **[third teammate]** — [role]
 
 ---
 

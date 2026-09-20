@@ -59,6 +59,10 @@ export interface Messages {
     busy: string;
     generic: (detail: string) => string;
     moduleMissing: string;
+    mute: string;
+    unmute: string;
+    cameraOn: string;
+    cameraOff: string;
   };
 }
 
@@ -113,6 +117,10 @@ const es: Messages = {
     busy: 'Otra aplicación está usando la cámara. Ciérrala y pulsa Reintentar.',
     generic: (detail) => `No se ha podido conectar: ${detail}. Si no funciona, llama a la clínica al ${PHONE}.`,
     moduleMissing: 'No se ha podido cargar el módulo de vídeo. Comprueba la conexión y pulsa Reintentar.',
+    mute: 'Silenciar',
+    unmute: 'Activar micrófono',
+    cameraOn: 'Encender cámara',
+    cameraOff: 'Apagar cámara',
   },
 };
 
@@ -167,6 +175,10 @@ const en: Messages = {
     busy: 'Another app is using the camera. Close it and press Retry.',
     generic: (detail) => `Could not connect: ${detail}. If it keeps failing, call the clinic at ${PHONE}.`,
     moduleMissing: 'The video module could not be loaded. Check your connection and press Retry.',
+    mute: 'Mute',
+    unmute: 'Unmute',
+    cameraOn: 'Turn camera on',
+    cameraOff: 'Turn camera off',
   },
 };
 

@@ -1,4 +1,7 @@
-# Lumi — a nurse-in-the-loop companion for IVF patients
+# Lumi - An AI IVF coordinator
+
+<img width="1033" height="469" alt="image" src="https://github.com/user-attachments/assets/7a875a36-e0e7-4518-8453-fa79f5b593e1" />
+
 
 **Try it:** Telegram → [@bam_team_bot](https://t.me/bam_team_bot) → send `/demo` and wait ten seconds. Lumi will message you first.
 

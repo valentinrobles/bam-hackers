@@ -1,6 +1,7 @@
 # Lumi — a nurse-in-the-loop companion for IVF patients
 
 **Try it:** Telegram → [@bam_team_bot](https://t.me/bam_team_bot) → send `/demo` and wait ten seconds. Lumi will message you first.
+
 **Demo video (60 s):** https://www.youtube.com/watch?v=lffjHbn9BDE
 
 Built in 24 hours at HackBarna AI Summit 26 (Barcelona, 19–20 Sep 2026).

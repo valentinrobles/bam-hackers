@@ -9,7 +9,11 @@ Built in 24 hours at HackBarna AI Summit 26 (Barcelona, 19–20 Sep 2026).
 
 ## The problem
 
-IVF is one of the most personal and stressful treatments a person can go through: daily injections at fixed hours, frequent scans, results that arrive by phone, and a lot of small questions in between. The clinic is only reachable in office hours, and every "is this normal?" either waits until tomorrow or lands on an already overloaded nurse. Patients end up on forums and generic chatbots, which is exactly where they should not be getting medical answers.
+$28B market. 70% failure rate. But medicine isn't the problem.
+
+IVF patients don't fail because the treatment stops working. They quit because of the lack of care between appointments. Emotional burnout is the #1 reason for dropout after the first failed cycle.
+
+Lumi keeps patients in the process with 24/7 support, a personalized protocol, and a nurse when it matters. More cycles completed = higher success rates = clinics retain +€150K/year.
 
 ## What Lumi does
 
